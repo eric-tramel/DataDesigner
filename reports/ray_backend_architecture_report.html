@@ -771,6 +771,130 @@ ray_dataset_out = results.load_dataset()</pre>
   </section>
 
   <section>
+    <h2>Robustness and Correctness Hardening Plan</h2>
+    <p>
+      The next implementation work should treat distributed correctness as a release gate before throughput
+      optimization. The plan below turns the known Ray-specific risks into explicit phases with acceptance criteria.
+      Until each phase passes, benchmark results should be read as functional smoke data rather than production
+      readiness evidence.
+    </p>
+
+    <div class="grid">
+      <div class="card wide">
+        <h3>Phase A: Data Semantics Contract</h3>
+        <ul>
+          <li><strong>Ordering semantics and hidden row ids:</strong> define whether Ray output is stable by default. If stable output is required, inject a reserved internal row id before partitioning, preserve it through every block, and remove or hide it before user-facing results unless diagnostics request it.</li>
+          <li><strong>Schema and dtype preservation:</strong> record the input schema at the interface boundary and validate that pandas, Arrow, and Ray conversions preserve nullable integers, booleans, strings, timestamps, categoricals where supported, nested/list values, nulls, and column order.</li>
+          <li><strong>Deterministic seeding:</strong> derive per-row or per-partition random state from a global seed plus the hidden row id, not from Ray block order, worker process identity, or scheduling timing.</li>
+        </ul>
+      </div>
+      <div class="card wide">
+        <h3>Acceptance Criteria</h3>
+        <ul>
+          <li>Local and Ray runs over the same seeded input can be compared by logical row id, with no duplicate or missing ids.</li>
+          <li>Round trips across pandas, Arrow, Ray Dataset, and Arrow ObjectRefs preserve expected schema, dtypes, null behavior, and column order or fail with a DataDesigner error explaining the unsupported type.</li>
+          <li>Repeated Ray runs with identical config, seed, block count, and input produce identical sampler-derived values independent of worker scheduling.</li>
+        </ul>
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Phase</th>
+          <th>Scope</th>
+          <th>Acceptance Criteria</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Phase B: Worker Boundary</td>
+          <td>
+            Treat the Ray worker payload as a serialization boundary. Seed readers, config builders, model
+            configs, secret resolvers, processors, and resource handles must be classified as serializable data,
+            worker-local runtime state, or explicitly unsupported.
+          </td>
+          <td>
+            Ray execution succeeds after a local seeded run in the same process; seed readers sent to workers contain
+            no live DuckDB connections, file handles, or attached source state; unsupported objects fail during driver
+            preflight before any Ray task is launched.
+          </td>
+        </tr>
+        <tr>
+          <td>Phase C: Processor Policy</td>
+          <td>
+            Define processor side-effect semantics. Pure row/column transforms are safe. Processors that write files,
+            mutate shared state, depend on local artifact paths, or require global ordering need an explicit distributed
+            contract or must be rejected for Ray.
+          </td>
+          <td>
+            Processor metadata or registration declares <code>ray_safe</code>, <code>requires_global_order</code>, and
+            side-effect behavior; unsafe processors raise a normalized DataDesigner error with remediation text; safe
+            processors are covered in partitioned tests.
+          </td>
+        </tr>
+        <tr>
+          <td>Phase D: Error and Metrics Surface</td>
+          <td>
+            Normalize Ray task failures, serialization failures, object store failures, cancellation, and worker
+            exceptions into DataDesigner error types. Aggregate worker metrics into the Ray result object without
+            forcing full dataset materialization on the driver.
+          </td>
+          <td>
+            Users see DataDesigner errors rather than raw Ray stack traces at the public boundary; errors include
+            task/block context when available; model usage, row counts, validation counts, retries, and failed-block
+            summaries are aggregated deterministically and exposed through the result interface.
+          </td>
+        </tr>
+        <tr>
+          <td>Phase E: Optional Extra Guarantees</td>
+          <td>
+            Preserve no-Ray installs. Imports outside <code>data_designer.integrations.ray</code> must not import Ray,
+            require Ray dependencies, or slow normal startup. The <code>data-designer[ray]</code> extra remains the
+            only supported installation path for Ray execution.
+          </td>
+          <td>
+            A clean environment without Ray can import <code>data_designer</code>, build configs, and run local paths;
+            attempting to construct or use <code>RayBackend</code> without the extra gives a targeted installation
+            message; import-time profiling stays within the existing fast-import budget.
+          </td>
+        </tr>
+        <tr>
+          <td>Phase F: Test Matrix</td>
+          <td>
+            Build a correctness-first matrix before expanding performance work: local versus Ray Dataset versus Arrow
+            ObjectRefs, seeded versus from-scratch generation, one block versus many blocks, pandas and Arrow-backed
+            inputs, pure and rejected processors, success and failure paths, Ray installed and Ray absent.
+          </td>
+          <td>
+            Tests assert behavior rather than implementation details: stable logical row ids, dtype fidelity,
+            deterministic seeded values, normalized errors, metrics aggregation, no-Ray import behavior, and
+            local-then-Ray execution in the same Python process.
+          </td>
+        </tr>
+        <tr>
+          <td>Phase G: Performance After Correctness</td>
+          <td>
+            Only after Phases A-F pass should implementation move to actor/callable-class reuse, model client reuse,
+            block-size tuning, distributed profiler work, and cluster scheduling controls.
+          </td>
+          <td>
+            Performance benchmarks run against the same correctness suite, emit machine-readable results, disclose
+            provider/model/cluster settings, and never relax ordering, dtype, error, metrics, or determinism guarantees
+            to improve throughput.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout warning">
+      <strong>Sequence constraint:</strong> performance work should not mask correctness gaps. Worker reuse and block
+      planning are high-value optimizations, but they should follow the row-id, dtype, seed, error, metrics, optional
+      import, and processor-policy gates above.
+    </div>
+  </section>
+
+  <section>
     <h2>Optimization Roadmap</h2>
     <div class="grid">
       <div class="card">

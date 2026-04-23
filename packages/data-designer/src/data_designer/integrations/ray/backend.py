@@ -7,12 +7,14 @@ import copy
 import importlib
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
+from data_designer.config.processors import ProcessorType
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
@@ -22,6 +24,8 @@ from data_designer.engine.resources.resource_provider import create_resource_pro
 from data_designer.engine.resources.seed_reader import SeedReader, SeedReaderRegistry
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
+from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
+from data_designer.integrations.ray.metrics import RayDatasetMetrics
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -52,10 +56,12 @@ class RayDatasetCreationResults:
         *,
         dataset: Any,
         config_builder: DataDesignerConfigBuilder,
+        metrics: RayDatasetMetrics,
         output: Any | None = None,
     ) -> None:
         self.dataset = dataset
         self._config_builder = config_builder
+        self.metrics = metrics
         self._output = output
 
     def load_dataset(self) -> Any:
@@ -66,11 +72,18 @@ class RayDatasetCreationResults:
         """Ray-resident jobs do not produce local profiler artifacts."""
         return None
 
+    def load_metrics(self) -> RayDatasetMetrics:
+        """Return driver-visible Ray execution metrics."""
+        return self.metrics
+
     def to_arrow_refs(self) -> list[Any]:
         """Return Ray ObjectRefs containing PyArrow tables, one per Ray block."""
         if self._output is not None:
             return self._output
-        return self.dataset.to_arrow_refs()
+        try:
+            return self.dataset.to_arrow_refs()
+        except Exception as exc:
+            raise RayDatasetGenerationError("RayBackend failed to materialize Arrow ObjectRefs.") from exc
 
     @property
     def output(self) -> Any:
@@ -96,17 +109,27 @@ class RayBackend:
         auto_init: bool = False,
         zero_copy_batch: bool = True,
         ray_remote_args: dict[str, Any] | None = None,
+        order_column: str | None = None,
+        drop_order_column: bool = False,
+        preserve_order: bool = False,
+        allow_unsafe_processors: bool = False,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
             raise ValueError("RayBackend output must be 'dataset' or 'arrow_refs'.")
         if object_ref_format not in ("arrow", "pandas"):
             raise ValueError("RayBackend object_ref_format must be 'arrow' or 'pandas'.")
+        if order_column is not None and order_column == "":
+            raise ValueError("RayBackend order_column must be a non-empty string when provided.")
         self.batch_size = batch_size
         self.output = output
         self.object_ref_format = object_ref_format
         self.auto_init = auto_init
         self.zero_copy_batch = zero_copy_batch
         self.ray_remote_args = ray_remote_args
+        self.order_column = order_column
+        self.drop_order_column = drop_order_column
+        self.preserve_order = preserve_order
+        self.allow_unsafe_processors = allow_unsafe_processors
 
     def create(
         self,
@@ -118,10 +141,11 @@ class RayBackend:
         input_dataset: Any | None = None,
     ) -> RayDatasetCreationResults:
         del dataset_name
+        start_time = time.perf_counter()
         ray = _import_ray()
         if not ray.is_initialized():
             if not self.auto_init:
-                raise RuntimeError(
+                raise RayBackendConfigurationError(
                     "Ray is not initialized. Call ray.init(...) before using RayBackend, "
                     "or construct RayBackend(auto_init=True)."
                 )
@@ -129,9 +153,19 @@ class RayBackend:
 
         use_input_dataset = input_dataset is not None
         if use_input_dataset and config_builder.get_seed_config() is not None:
-            raise ValueError("RayBackend input_dataset is used as the seed dataset; remove the existing seed config.")
+            raise RayBackendConfigurationError(
+                "RayBackend input_dataset is used as the seed dataset; remove the existing seed config."
+            )
+        if self.preserve_order and self.order_column is None:
+            raise RayBackendConfigurationError(
+                "RayBackend preserve_order=True requires order_column in this experimental backend. "
+                "Automatic hidden row-id injection is tracked as follow-up hardening work."
+            )
+        if not self.allow_unsafe_processors:
+            _validate_ray_safe_processors(config_builder)
 
         dataset = self._resolve_input_dataset(ray, input_dataset=input_dataset, num_records=num_records)
+        input_blocks = _get_num_blocks(dataset)
         batch_size = self.batch_size or data_designer._run_config.buffer_size
         worker_options = _RayWorkerOptions(
             model_providers=list(data_designer._model_providers),
@@ -157,9 +191,22 @@ class RayBackend:
         if self.ray_remote_args is not None:
             map_batches_kwargs.update(self.ray_remote_args)
 
-        mapped = dataset.map_batches(_generate_batch, **map_batches_kwargs)
-        output = mapped.to_arrow_refs() if self.output == "arrow_refs" else None
-        return RayDatasetCreationResults(dataset=mapped, config_builder=config_builder, output=output)
+        try:
+            mapped = dataset.map_batches(_generate_batch, **map_batches_kwargs)
+            mapped = self._apply_ordering(mapped)
+            output = mapped.to_arrow_refs() if self.output == "arrow_refs" else None
+        except RayDatasetGenerationError:
+            raise
+        except Exception as exc:
+            raise RayDatasetGenerationError("RayBackend failed while constructing the Ray execution plan.") from exc
+
+        output_blocks = len(output) if output is not None else _get_num_blocks(mapped)
+        metrics = RayDatasetMetrics(
+            total_rows=num_records if input_dataset is None else 0,
+            blocks=output_blocks or input_blocks or 0,
+            elapsed_seconds=time.perf_counter() - start_time,
+        )
+        return RayDatasetCreationResults(dataset=mapped, config_builder=config_builder, metrics=metrics, output=output)
 
     def _resolve_input_dataset(self, ray: Any, *, input_dataset: Any | None, num_records: int) -> Any:
         if input_dataset is None:
@@ -175,6 +222,43 @@ class RayBackend:
             "RayBackend input_dataset must be a ray.data.Dataset or a sequence of Ray ObjectRefs "
             "containing PyArrow tables or pandas DataFrames."
         )
+
+    def _apply_ordering(self, dataset: Any) -> Any:
+        if self.order_column is None:
+            return dataset
+        ordered = dataset.sort(self.order_column)
+        if self.drop_order_column:
+            return ordered.drop_columns([self.order_column])
+        return ordered
+
+
+def _validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> None:
+    unsafe_processors = [
+        processor
+        for processor in config_builder.get_processor_configs()
+        if processor.processor_type != ProcessorType.DROP_COLUMNS
+    ]
+    if not unsafe_processors:
+        return
+    processor_names = ", ".join(
+        f"{processor.name} ({processor.processor_type})" for processor in unsafe_processors
+    )
+    raise RayBackendConfigurationError(
+        "RayBackend currently supports only distributed-safe processors. "
+        f"Unsupported processor(s): {processor_names}. "
+        "Pass allow_unsafe_processors=True to bypass this experimental guard."
+    )
+
+
+def _get_num_blocks(dataset: Any) -> int | None:
+    num_blocks = getattr(dataset, "num_blocks", None)
+    if not callable(num_blocks):
+        return None
+    try:
+        value = num_blocks()
+    except Exception:
+        return None
+    return int(value) if value is not None else None
 
 
 def _clone_seed_readers_for_worker(readers: Iterable[SeedReader]) -> list[SeedReader]:
