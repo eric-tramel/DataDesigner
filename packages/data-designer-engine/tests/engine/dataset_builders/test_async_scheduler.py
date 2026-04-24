@@ -240,6 +240,67 @@ async def test_scheduler_dispatches_seeds_first() -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_scheduler_dispatches_root_cell_columns_per_row() -> None:
+    """Root cell-by-cell columns must run as row tasks, not from-scratch tasks."""
+    provider = _mock_provider()
+    configs = [LLMTextColumnConfig(name="cell_out", prompt="Write a constant.", model_alias=MODEL_ALIAS)]
+    strategies = {"cell_out": GenerationStrategy.CELL_BY_CELL}
+    generators = {"cell_out": MockCellGenerator(config=_expr_config("cell_out"), resource_provider=provider)}
+    graph = ExecutionGraph.create(configs, strategies)
+    row_groups = [(0, 2)]
+    tracker = CompletionTracker.with_graph(graph, row_groups)
+    scheduler = AsyncTaskScheduler(
+        generators=generators,
+        graph=graph,
+        tracker=tracker,
+        row_groups=row_groups,
+        trace=True,
+    )
+
+    await scheduler.run()
+
+    traces = sorted(scheduler.traces, key=lambda trace: trace.row_index if trace.row_index is not None else -1)
+    assert [(trace.task_type, trace.row_index, trace.status) for trace in traces] == [
+        ("cell", 0, "ok"),
+        ("cell", 1, "ok"),
+    ]
+    assert tracker.is_row_group_complete(0, 2, ["cell_out"])
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_scheduler_dispatches_root_full_column_without_from_scratch_support() -> None:
+    """Root full-column generators that are not from-scratch receive the row-group dataframe."""
+    storage = MagicMock()
+    buffer_mgr = RowGroupBufferManager(storage)
+    provider = _mock_provider()
+    configs = [ExpressionColumnConfig(name="batch_out", expr="constant")]
+    strategies = {"batch_out": GenerationStrategy.FULL_COLUMN}
+    generators = {
+        "batch_out": MockFullColumnGenerator(config=_expr_config("batch_out"), resource_provider=provider),
+    }
+    graph = ExecutionGraph.create(configs, strategies)
+    row_groups = [(0, 2)]
+    tracker = CompletionTracker.with_graph(graph, row_groups)
+    scheduler = AsyncTaskScheduler(
+        generators=generators,
+        graph=graph,
+        tracker=tracker,
+        row_groups=row_groups,
+        buffer_manager=buffer_mgr,
+        trace=True,
+    )
+
+    await scheduler.run()
+
+    assert [(trace.task_type, trace.row_index, trace.status) for trace in scheduler.traces] == [("batch", None, "ok")]
+    assert buffer_mgr.get_dataframe(0).to_dict(orient="records") == [
+        {"batch_out": "batch_val"},
+        {"batch_out": "batch_val"},
+    ]
+    assert tracker.is_row_group_complete(0, 2, ["batch_out"])
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_scheduler_with_buffer_manager() -> None:
     """Scheduler writes results to buffer manager and checkpoints."""
     storage = MagicMock()
