@@ -7,6 +7,7 @@ import fnmatch
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from pydantic import model_validator
 from pygments import highlight
@@ -270,7 +271,7 @@ class DataDesignerConfigBuilder:
         *,
         name: str | None = None,
         column_type: DataDesignerColumnType | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> Self:
         """Add a Data Designer column configuration to the current Data Designer configuration.
 
@@ -312,7 +313,7 @@ class DataDesignerConfigBuilder:
         constraint: ColumnConstraintT | None = None,
         *,
         constraint_type: ConstraintType | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> Self:
         """Add a constraint to the current Data Designer configuration.
 
@@ -364,7 +365,7 @@ class DataDesignerConfigBuilder:
         processor_config: ProcessorConfigT | None = None,
         *,
         processor_type: ProcessorType | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> Self:
         """Add a processor to the current Data Designer configuration.
 
@@ -661,7 +662,7 @@ class DataDesignerConfigBuilder:
         )
         return self
 
-    def write_config(self, path: str | Path, indent: int | None = 2, **kwargs) -> None:
+    def write_config(self, path: str | Path, indent: int | None = 2, **kwargs: Any) -> None:
         """Write the current configuration to a file.
 
         Args:

@@ -112,7 +112,7 @@ Image columns require a model configured with `ImageInferenceParams`. Model-spec
 Image columns also support `multi_modal_context` for autoregressive models that accept image inputs, enabling image-to-image generation workflows.
 
 !!! tip "Tutorials"
-    The image tutorials cover three workflows: [Providing Images as Context](../notebooks/4-providing-images-as-context.ipynb) (image → text), [Generating Images](../notebooks/5-generating-images.ipynb) (text → image), and [Editing Images with Image Context](../notebooks/6-editing-images-with-image-context.ipynb) (image → image).
+    The image tutorials cover three workflows: [Providing Images as Context](../colab_notebooks/4-providing-images-as-context.ipynb) (image → text), [Generating Images](../colab_notebooks/5-generating-images.ipynb) (text → image), and [Editing Images with Image Context](../colab_notebooks/6-editing-images-with-image-context.ipynb) (image → image).
 
 ### 🧬 Embedding Columns
 

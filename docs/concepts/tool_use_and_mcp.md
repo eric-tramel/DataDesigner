@@ -4,7 +4,7 @@ Tool use lets LLM columns call external tools during generation (e.g., lookups, 
 
 ## Quick Start
 
-1. Configure an MCP provider ([Local](mcp/mcp-providers.md#localstdiomcpprovider-subprocess) or [Remote](mcp/mcp-providers.md#mcpprovider-remote-sse))
+1. Configure an MCP provider ([Local](mcp/mcp-providers.md#localstdiomcpprovider-subprocess) or [Remote](mcp/mcp-providers.md#mcpprovider-remote))
 2. Create a [ToolConfig](mcp/tool-configs.md) referencing your provider
 3. Add `tool_alias` to your [LLM column](mcp/enabling-tools.md)
 
