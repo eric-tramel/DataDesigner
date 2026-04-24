@@ -187,6 +187,12 @@ class RayBackend:
             raise RayBackendConfigurationError(
                 "RayBackend input_dataset is used as the seed dataset; remove the existing seed config."
             )
+        if not use_input_dataset and config_builder.get_seed_config() is not None:
+            raise RayBackendConfigurationError(
+                "RayBackend does not yet support seed configs without input_dataset because partition offsets "
+                "are not available. Pass seed data as input_dataset, or use the local backend until "
+                "RayBackend partition-offset support exists."
+            )
         if self.preserve_order and self.order_column is None:
             raise RayBackendConfigurationError(
                 "RayBackend preserve_order=True requires order_column in this experimental backend. "
@@ -228,6 +234,7 @@ class RayBackend:
             mapped = dataset.map_batches(_generate_batch, **map_batches_kwargs)
             mapped = self._apply_ordering(mapped)
             output = mapped.to_arrow_refs() if self.output == "arrow_refs" else None
+            result_dataset = _dataset_from_arrow_refs(ray, output) if output is not None else mapped
         except RayDatasetGenerationError:
             raise
         except Exception as exc:
@@ -240,7 +247,7 @@ class RayBackend:
             elapsed_seconds=time.perf_counter() - start_time,
         )
         return RayDatasetCreationResults(
-            dataset=mapped,
+            dataset=result_dataset,
             config_builder=config_builder,
             metrics=metrics,
             ray=ray,
@@ -299,6 +306,16 @@ def _get_num_blocks(dataset: Any) -> int | None:
     return int(value) if value is not None else None
 
 
+def _dataset_from_arrow_refs(ray: Any, refs: list[Any]) -> Any:
+    from_arrow_refs = getattr(ray.data, "from_arrow_refs", None)
+    if not callable(from_arrow_refs):
+        raise RayDatasetGenerationError(
+            "RayBackend output='arrow_refs' requires ray.data.from_arrow_refs to expose a dataset "
+            "backed by the materialized Arrow ObjectRefs."
+        )
+    return from_arrow_refs(refs)
+
+
 class _RayMetricsCollector:
     def __init__(self) -> None:
         self._payloads: list[dict[str, Any]] = []
@@ -321,10 +338,10 @@ def _merge_driver_and_worker_metrics(
     driver_metrics: RayDatasetMetrics, worker_metrics: RayDatasetMetrics
 ) -> RayDatasetMetrics:
     return RayDatasetMetrics(
-        total_rows=worker_metrics.total_rows or driver_metrics.total_rows,
-        blocks=worker_metrics.blocks or driver_metrics.blocks,
+        total_rows=worker_metrics.total_rows,
+        blocks=worker_metrics.blocks,
         failed_blocks=worker_metrics.failed_blocks,
-        elapsed_seconds=worker_metrics.elapsed_seconds or driver_metrics.elapsed_seconds,
+        elapsed_seconds=worker_metrics.elapsed_seconds,
         model_usage=worker_metrics.model_usage or driver_metrics.model_usage,
     )
 

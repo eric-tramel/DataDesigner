@@ -159,6 +159,28 @@ def test_ray_results_load_metrics_exposes_worker_aggregate(
     assert results.load_metrics().to_dict()["total_rows"] == 5
 
 
+def test_ray_results_load_metrics_preserves_zero_worker_total_rows(
+    stub_sampler_only_config_builder: DataDesignerConfigBuilder,
+) -> None:
+    ray = types.SimpleNamespace(get=lambda ref: ref.value)
+    metrics_collector = FakeActorHandle(
+        types.SimpleNamespace(snapshot=lambda: [{"total_rows": 0, "blocks": 1, "elapsed_seconds": 0.25}])
+    )
+    results = RayDatasetCreationResults(
+        dataset=FakeMetricDataset([lazy.pd.DataFrame({"id": [0, 1, 2, 3, 4]})]),
+        config_builder=stub_sampler_only_config_builder,
+        metrics=RayDatasetMetrics(total_rows=5, blocks=1, elapsed_seconds=10.0),
+        ray=ray,
+        metrics_collector=metrics_collector,
+    )
+
+    metrics = results.load_metrics()
+
+    assert metrics.total_rows == 0
+    assert metrics.blocks == 1
+    assert metrics.elapsed_seconds == 0.25
+
+
 def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

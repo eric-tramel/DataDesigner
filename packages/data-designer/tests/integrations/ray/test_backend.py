@@ -69,9 +69,77 @@ class FakeRayDataModule:
         return FakeRayDataset(list(refs))
 
 
+class CountingRayDataset:
+    def __init__(
+        self,
+        blocks: list[lazy.pd.DataFrame],
+        data_module: CountingRayDataModule,
+        *,
+        parent: CountingRayDataset | None = None,
+        map_fn: Any | None = None,
+        map_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        self.blocks = blocks
+        self.data_module = data_module
+        self.parent = parent
+        self.map_fn = map_fn
+        self.map_kwargs = map_kwargs
+
+    def map_batches(self, fn: Any, **kwargs: Any) -> CountingRayDataset:
+        return CountingRayDataset([], self.data_module, parent=self, map_fn=fn, map_kwargs=kwargs)
+
+    def to_arrow_refs(self) -> list[str]:
+        refs: list[str] = []
+        for block in self._evaluate():
+            ref = f"arrow-ref-{len(self.data_module.ref_blocks)}"
+            self.data_module.ref_blocks[ref] = block
+            refs.append(ref)
+        return refs
+
+    def to_pandas(self) -> lazy.pd.DataFrame:
+        return lazy.pd.concat(self._evaluate(), ignore_index=True)
+
+    def num_blocks(self) -> int:
+        if self.parent is None:
+            return len(self.blocks)
+        return self.parent.num_blocks()
+
+    def _evaluate(self) -> list[lazy.pd.DataFrame]:
+        if self.parent is None:
+            return self.blocks
+        if self.map_fn is None:
+            return self.parent._evaluate()
+        fn_kwargs = (self.map_kwargs or {}).get("fn_kwargs") or {}
+        return [self.map_fn(block, **fn_kwargs) for block in self.parent._evaluate()]
+
+
+class CountingRayDataModule:
+    Dataset = CountingRayDataset
+
+    def __init__(self) -> None:
+        self.from_arrow_refs_input: list[Any] | None = None
+        self.ref_blocks: dict[str, lazy.pd.DataFrame] = {}
+
+    def range(self, num_records: int) -> CountingRayDataset:
+        return CountingRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})], self)
+
+    def from_arrow_refs(self, refs: list[Any]) -> CountingRayDataset:
+        self.from_arrow_refs_input = refs
+        return CountingRayDataset([self.ref_blocks[ref] for ref in refs], self)
+
+
 def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     fake_ray = types.ModuleType("ray")
     fake_ray.data = FakeRayDataModule()
+    fake_ray.is_initialized = lambda: True
+    fake_ray.init = lambda: None
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    return fake_ray
+
+
+def _install_counting_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    fake_ray = types.ModuleType("ray")
+    fake_ray.data = CountingRayDataModule()
     fake_ray.is_initialized = lambda: True
     fake_ray.init = lambda: None
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
@@ -319,6 +387,46 @@ def test_ray_backend_can_return_arrow_refs(
     assert results.load_metrics() == RayDatasetMetrics(
         total_rows=2, blocks=1, elapsed_seconds=results.metrics.elapsed_seconds
     )
+
+
+def test_ray_backend_arrow_refs_load_dataset_uses_materialized_refs_without_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = _install_counting_ray(monkeypatch)
+    generate_calls = 0
+
+    def generate_batch(batch: lazy.pd.DataFrame, **_: Any) -> lazy.pd.DataFrame:
+        nonlocal generate_calls
+        generate_calls += 1
+        output = batch.copy()
+        output["generated"] = generate_calls
+        return output
+
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2, output="arrow_refs"),
+    )
+
+    results = designer.create(stub_sampler_only_config_builder, num_records=2)
+
+    assert results.output == ["arrow-ref-0"]
+    assert generate_calls == 1
+
+    dataset = results.load_dataset()
+    output_df = dataset.to_pandas()
+
+    assert fake_ray.data.from_arrow_refs_input == ["arrow-ref-0"]
+    assert output_df.to_dict(orient="records") == [
+        {"id": 0, "generated": 1},
+        {"id": 1, "generated": 1},
+    ]
+    assert generate_calls == 1
 
 
 def test_ray_backend_dataset_output_wraps_dataset_and_delegates_arrow_refs(

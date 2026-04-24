@@ -40,8 +40,12 @@ class BoundaryRayDataset:
 class BoundaryRayDataModule:
     Dataset = BoundaryRayDataset
 
+    def __init__(self) -> None:
+        self.range_dataset: BoundaryRayDataset | None = None
+
     def range(self, num_records: int) -> BoundaryRayDataset:
-        return BoundaryRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
+        self.range_dataset = BoundaryRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
+        return self.range_dataset
 
 
 def _install_boundary_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
@@ -228,3 +232,26 @@ def test_driver_preflight_rejects_input_dataset_with_existing_seed_config(
         designer.create(config_builder, input_dataset=input_dataset)
 
     assert input_dataset.map_batches_called is False
+
+
+def test_driver_preflight_rejects_seed_config_without_input_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = _install_boundary_ray(monkeypatch)
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.with_seed_dataset(DataFrameSeedSource(df=lazy.pd.DataFrame({"x": [99], "label": ["seed"]})))
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1),
+    )
+
+    with pytest.raises(RayBackendConfigurationError):
+        designer.create(config_builder, num_records=2)
+
+    assert fake_ray.data.range_dataset is None
