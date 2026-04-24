@@ -108,10 +108,41 @@ def test_summary_groups_iterations_and_speedups() -> None:
     summary = benchmark._build_summary(results)
 
     assert summary["all_output_valid"] is True
+    assert summary["failed_backends"] == []
     assert summary["per_backend"]["local-sync"]["iterations"] == 2
     assert summary["per_backend"]["local-async"]["rows_per_second"]["mean"] == 22.5
     assert summary["comparisons_vs_local_sync"]["local-async"]["mean"] == 2.0
     assert summary["comparisons_vs_local_sync"]["ray-dataset"]["mean"] == 3.25
+
+
+def test_summary_flags_row_count_mismatch_as_failed_backend() -> None:
+    benchmark = _load_benchmark_module()
+    result = _benchmark_result(
+        backend="ray-dataset",
+        iteration=1,
+        elapsed_seconds=4.0,
+        rows_per_second=25.0,
+    )
+    result["validity"]["row_count_matches"] = False
+    result["validity"]["all_output_valid"] = False
+    result["metrics"] = {"failed_blocks": 0}
+    result["throughput"]["failed_requests"] = 0
+
+    summary = benchmark._build_summary([result])
+
+    assert summary["all_output_valid"] is False
+    assert summary["failed_backends"] == ["ray-dataset"]
+
+
+def test_fail_on_invalid_summary_exits_nonzero_unless_allowed() -> None:
+    benchmark = _load_benchmark_module()
+    summary = {"all_output_valid": False, "failed_backends": ["ray-dataset"]}
+
+    with pytest.raises(SystemExit) as exc_info:
+        benchmark._fail_on_invalid_summary(summary=summary, allow_failures=False)
+
+    assert exc_info.value.code == 1
+    assert benchmark._fail_on_invalid_summary(summary=summary, allow_failures=True) is None
 
 
 def _benchmark_result(

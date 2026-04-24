@@ -624,7 +624,13 @@ class AsyncTaskScheduler:
                 continue
             seen_instances.add(gid)
 
-            task = Task(column=col, row_group=rg_id, row_index=None, task_type="from_scratch")
+            strategy = self._graph.get_strategy(col)
+            if strategy == GenerationStrategy.CELL_BY_CELL:
+                await self._dispatch_root_cell_tasks(column=col, row_group=rg_id, row_group_size=rg_size)
+                continue
+
+            task_type = "from_scratch" if gen.can_generate_from_scratch else "batch"
+            task = Task(column=col, row_group=rg_id, row_index=None, task_type=task_type)
             # Also mark the "batch" variant as dispatched to prevent get_ready_tasks
             # from generating a duplicate for this column
             batch_alias = Task(column=col, row_group=rg_id, row_index=None, task_type="batch")
@@ -633,7 +639,7 @@ class AsyncTaskScheduler:
 
             # Acquire stateful lock *before* submission semaphore to preserve
             # row-group ordering. Held until generation completes (_execute_seed_task).
-            if gid in self._stateful_locks:
+            if task_type == "from_scratch" and gid in self._stateful_locks:
                 await self._stateful_locks[gid].acquire()
 
             await self._submission_semaphore.acquire()
@@ -642,14 +648,28 @@ class AsyncTaskScheduler:
             # Also mark all sibling output columns as dispatched (multi-column dedup)
             for sibling_col in self._gen_instance_to_columns.get(gid, []):
                 if sibling_col != col:
-                    self._dispatched.add(
-                        Task(column=sibling_col, row_group=rg_id, row_index=None, task_type="from_scratch")
-                    )
+                    self._dispatched.add(Task(column=sibling_col, row_group=rg_id, row_index=None, task_type=task_type))
                     self._dispatched.add(Task(column=sibling_col, row_group=rg_id, row_index=None, task_type="batch"))
             self._in_flight.add(task)
             if (s := self._rg_states.get(task.row_group)) is not None:
                 s.in_flight_count += 1
-            self._spawn_worker(self._execute_seed_task(task, gid))
+            if task_type == "from_scratch":
+                self._spawn_worker(self._execute_seed_task(task, gid))
+            else:
+                self._spawn_worker(self._execute_task(task))
+
+    async def _dispatch_root_cell_tasks(self, *, column: str, row_group: int, row_group_size: int) -> None:
+        """Dispatch a root cell-by-cell column once per active row."""
+        for row_index in range(row_group_size):
+            task = Task(column=column, row_group=row_group, row_index=row_index, task_type="cell")
+            if task in self._dispatched:
+                continue
+            await self._submission_semaphore.acquire()
+            self._dispatched.add(task)
+            self._in_flight.add(task)
+            if (state := self._rg_states.get(row_group)) is not None:
+                state.in_flight_count += 1
+            self._spawn_worker(self._execute_task(task))
 
     async def _execute_seed_task(self, task: Task, generator_id: int) -> None:
         """Execute a from_scratch task and release stateful lock if held."""

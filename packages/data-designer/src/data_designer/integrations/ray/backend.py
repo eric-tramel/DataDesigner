@@ -29,7 +29,12 @@ from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
 from data_designer.engine.model_provider import resolve_model_provider_registry
 from data_designer.engine.resources.person_reader import PersonReader, create_person_reader
 from data_designer.engine.resources.resource_provider import create_resource_provider
-from data_designer.engine.resources.seed_reader import SeedReader, SeedReaderRegistry
+from data_designer.engine.resources.seed_reader import (
+    DataFrameSeedReader,
+    FileSystemSeedReader,
+    SeedReader,
+    SeedReaderRegistry,
+)
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage, BatchStage
 from data_designer.engine.storage.media_storage import StorageMode
@@ -368,7 +373,8 @@ class RayBackend:
                 )
             ray.init()
 
-        use_input_dataset = input_dataset is not None
+        external_input_dataset = input_dataset is not None
+        use_input_dataset = external_input_dataset
         seed_config = config_builder.get_seed_config()
         if use_input_dataset and seed_config is not None:
             raise RayBackendConfigurationError(
@@ -380,11 +386,23 @@ class RayBackend:
                 "range dataset. Remove override_num_blocks, target_block_size, min_blocks, max_blocks, "
                 "and read_concurrency when passing input_dataset."
             )
-        seed_window = (
-            _preflight_seed_window(data_designer=data_designer, seed_config=seed_config, num_records=num_records)
-            if not use_input_dataset and seed_config is not None
-            else None
-        )
+        seed_window: _RaySeedWindow | None = None
+        if not use_input_dataset and seed_config is not None:
+            if _should_materialize_seed_on_driver(data_designer=data_designer, seed_config=seed_config):
+                input_dataset = ray.data.from_pandas(
+                    _materialize_seed_dataframe(
+                        data_designer=data_designer,
+                        seed_config=seed_config,
+                        num_records=num_records,
+                    )
+                )
+                use_input_dataset = True
+            else:
+                seed_window = _preflight_seed_window(
+                    data_designer=data_designer,
+                    seed_config=seed_config,
+                    num_records=num_records,
+                )
         if not self.allow_unsafe_processors:
             validate_ray_safe_processors(config_builder)
 
@@ -420,11 +438,16 @@ class RayBackend:
             config_builder,
             worker_model_health_checks=self.worker_model_health_checks,
         )
+        worker_seed_readers = (
+            [DataFrameSeedReader()]
+            if use_input_dataset
+            else _clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
+        )
         worker_options = _RayWorkerOptions(
             model_providers=list(data_designer._model_providers),
             default_provider_name=data_designer._model_provider_registry.get_default_provider_name(),
             secret_resolver=data_designer._secret_resolver,
-            seed_readers=_clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values()),
+            seed_readers=worker_seed_readers,
             managed_assets_path=str(data_designer._managed_assets_path),
             person_reader=data_designer._person_reader,
             mcp_providers=list(data_designer._mcp_providers),
@@ -479,7 +502,7 @@ class RayBackend:
 
         output_blocks = len(output) if output is not None else _get_num_blocks(mapped)
         metrics = RayDatasetMetrics(
-            total_rows=num_records if input_dataset is None else 0,
+            total_rows=num_records if not external_input_dataset else 0,
             blocks=output_blocks or input_blocks or (block_plan.planned_blocks if block_plan is not None else 0) or 0,
             elapsed_seconds=time.perf_counter() - start_time,
         )
@@ -697,6 +720,66 @@ def _preflight_seed_window(
     return _RaySeedWindow(start=index_range.start, size=index_range.size)
 
 
+def _should_materialize_seed_on_driver(*, data_designer: Any, seed_config: SeedConfig) -> bool:
+    """Return whether Ray should treat a seed source as a materialized input dataset."""
+    try:
+        seed_reader = SeedReaderRegistry(
+            readers=_clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
+        ).get_reader(seed_config.source, data_designer._secret_resolver)
+    except Exception as exc:
+        raise RayBackendConfigurationError("RayBackend failed to inspect the seed reader for Ray planning.") from exc
+    return isinstance(seed_reader, FileSystemSeedReader)
+
+
+def _materialize_seed_dataframe(
+    *,
+    data_designer: Any,
+    seed_config: SeedConfig,
+    num_records: int,
+) -> Any:
+    if seed_config.sampling_strategy != SamplingStrategy.ORDERED:
+        raise RayBackendConfigurationError(
+            "RayBackend driver-materialized filesystem seed configs currently support only ordered sampling. "
+            "Pass the seed data as input_dataset or use the local backend for shuffled seed sampling."
+        )
+
+    try:
+        seed_reader = SeedReaderRegistry(
+            readers=_clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
+        ).get_reader(seed_config.source, data_designer._secret_resolver)
+        seed_dataset_size = seed_reader.get_seed_dataset_size()
+        index_range = _resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=seed_dataset_size)
+    except RayBackendConfigurationError:
+        raise
+    except Exception as exc:
+        raise RayBackendConfigurationError("RayBackend failed to materialize the seed config for Ray input.") from exc
+
+    batch_reader = seed_reader.create_batch_reader(batch_size=num_records, index_range=index_range, shuffle=False)
+    output = lazy.pd.DataFrame()
+    empty_batch_reads = 0
+    while len(output) < num_records:
+        try:
+            seed_batch = batch_reader.read_next_batch().to_pandas().reset_index(drop=True)
+        except StopIteration:
+            batch_reader = seed_reader.create_batch_reader(
+                batch_size=num_records,
+                index_range=index_range,
+                shuffle=False,
+            )
+            continue
+
+        if len(seed_batch) == 0:
+            empty_batch_reads += 1
+            if empty_batch_reads > max(num_records * 2, 1):
+                raise RayBackendConfigurationError(
+                    "RayBackend filesystem seed materialization did not produce any rows after repeated reads."
+                )
+            continue
+        output = lazy.pd.concat([output, seed_batch], ignore_index=True)
+
+    return output.iloc[:num_records].reset_index(drop=True)
+
+
 def _resolve_seed_config_index_range(*, seed_config: SeedConfig, seed_dataset_size: int) -> IndexRange:
     if seed_dataset_size <= 0:
         raise RayBackendConfigurationError("RayBackend seed config resolved to an empty seed dataset.")
@@ -783,9 +866,31 @@ def _dataset_from_arrow_refs(ray: Any, refs: list[Any]) -> Any:
     try:
         return from_arrow_refs(refs)
     except Exception as exc:
-        raise RayDatasetGenerationError(
-            "RayBackend failed to rebuild a Ray Dataset from materialized Arrow ObjectRefs."
-        ) from exc
+        try:
+            return _dataset_from_arrow_refs_via_items(ray, refs)
+        except Exception:
+            raise RayDatasetGenerationError(
+                "RayBackend failed to rebuild a Ray Dataset from materialized Arrow ObjectRefs."
+            ) from exc
+
+
+def _dataset_from_arrow_refs_via_items(ray: Any, refs: list[Any]) -> Any:
+    from_items = getattr(ray.data, "from_items", None)
+    if not callable(from_items):
+        raise RayDatasetGenerationError("RayBackend fallback requires ray.data.from_items.")
+    records: list[dict[str, Any]] = []
+    for table in ray.get(refs):
+        to_pylist = getattr(table, "to_pylist", None)
+        if callable(to_pylist):
+            records.extend(to_pylist())
+            continue
+        to_pandas = getattr(table, "to_pandas", None)
+        if callable(to_pandas):
+            records.extend(to_pandas().to_dict(orient="records"))
+            continue
+        raise RayDatasetGenerationError("RayBackend Arrow ObjectRef fallback expected PyArrow tables with to_pylist().")
+    kwargs = {"override_num_blocks": len(refs)} if refs else {}
+    return from_items(records, **kwargs)
 
 
 def _compile_ray_execution_payload(
@@ -900,7 +1005,12 @@ def _merge_driver_and_worker_metrics(
 
 
 def _clone_seed_readers_for_worker(readers: Iterable[SeedReader]) -> list[SeedReader]:
-    return [_clone_seed_reader_for_worker(reader) for reader in readers]
+    clones = [_clone_seed_reader_for_worker(reader) for reader in readers]
+    seed_types = {reader.get_seed_type() for reader in clones}
+    dataframe_reader = DataFrameSeedReader()
+    if dataframe_reader.get_seed_type() not in seed_types:
+        clones.append(dataframe_reader)
+    return clones
 
 
 def _clone_seed_reader_for_worker(reader: SeedReader) -> SeedReader:
@@ -1074,6 +1184,12 @@ class _RayBatchWorker:
         self._seed_reader_registry: SeedReaderRegistry = SeedReaderRegistry(
             readers=copy.deepcopy(worker_options.seed_readers)
         )
+        dataframe_seed_reader = DataFrameSeedReader()
+        if (
+            execution_payload.use_input_dataset
+            and dataframe_seed_reader.get_seed_type() not in self._seed_reader_registry._readers
+        ):
+            self._seed_reader_registry.add_reader(dataframe_seed_reader)
         self._resource_provider: Any = create_resource_provider(
             artifact_storage=self._artifact_storage,
             model_configs=self._base_config.model_configs or [],
@@ -1453,8 +1569,16 @@ def _get_ray_task_context() -> str | None:
         return None
 
     context_values: list[str] = []
-    for attr in ("task_id", "actor_id", "worker_id"):
-        value = getattr(runtime_context, attr, None)
+    for attr, method_name in (
+        ("task_id", "get_task_id"),
+        ("actor_id", "get_actor_id"),
+        ("worker_id", "get_worker_id"),
+    ):
+        try:
+            method = getattr(runtime_context, method_name, None)
+            value = method() if callable(method) else getattr(runtime_context, attr, None)
+        except Exception:
+            continue
         if value is None:
             continue
         context_values.append(f"{attr}={value}")

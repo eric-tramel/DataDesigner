@@ -15,9 +15,11 @@ from data_designer.config.column_configs import ExpressionColumnConfig, LLMTextC
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.processors import SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
+from data_designer.config.seed_source import DirectorySeedSource
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
+from data_designer.engine.testing.seed_readers import LineFanoutDirectorySeedReader
 from data_designer.integrations.ray import (
     RayBackend,
     RayBackendConfigurationError,
@@ -86,6 +88,8 @@ class FakeRayDataModule:
     def __init__(self) -> None:
         self.from_arrow_refs_input: list[Any] | None = None
         self.from_pandas_refs_input: list[Any] | None = None
+        self.from_pandas_input: Any | None = None
+        self.from_items_input: list[Any] | None = None
         self.reverse_mapped_blocks = False
         self.range_kwargs: dict[str, Any] | None = None
 
@@ -110,6 +114,16 @@ class FakeRayDataModule:
             [_arrow_ref_to_pandas(ref) for ref in refs],
             reverse_mapped_blocks=self.reverse_mapped_blocks,
         )
+
+    def from_items(self, items: list[Any], **_: Any) -> FakeRayDataset:
+        self.from_items_input = items
+        return FakeRayDataset([lazy.pd.DataFrame(items)])
+
+    def from_pandas(self, dataframes: Any) -> FakeRayDataset:
+        self.from_pandas_input = dataframes
+        if isinstance(dataframes, list):
+            return FakeRayDataset(list(dataframes), reverse_mapped_blocks=self.reverse_mapped_blocks)
+        return FakeRayDataset([dataframes], reverse_mapped_blocks=self.reverse_mapped_blocks)
 
     def from_pandas_refs(self, refs: list[Any]) -> FakeRayDataset:
         self.from_pandas_refs_input = refs
@@ -186,6 +200,7 @@ def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     fake_ray.data = FakeRayDataModule()
     fake_ray.is_initialized = lambda: True
     fake_ray.init = lambda: None
+    fake_ray.get = lambda refs: refs
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     return fake_ray
 
@@ -195,6 +210,7 @@ def _install_counting_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     fake_ray.data = CountingRayDataModule()
     fake_ray.is_initialized = lambda: True
     fake_ray.init = lambda: None
+    fake_ray.get = lambda refs: refs
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     return fake_ray
 
@@ -762,6 +778,67 @@ def test_ray_backend_arrow_refs_load_dataset_uses_materialized_refs_without_reru
         {"id": 1, "generated": 1},
     ]
     assert generate_calls == 1
+
+
+def test_ray_backend_arrow_refs_dataset_rebuild_falls_back_to_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_ray = _install_fake_ray(monkeypatch)
+
+    def fail_from_arrow_refs(refs: list[Any]) -> FakeRayDataset:
+        del refs
+        raise ValueError("nested schema unification failed")
+
+    fake_ray.data.from_arrow_refs = fail_from_arrow_refs
+    refs = [
+        lazy.pa.table({"payload": [{"a": 1}]}),
+        lazy.pa.table({"payload": [{"b": "two"}]}),
+    ]
+
+    dataset = ray_backend_module._dataset_from_arrow_refs(fake_ray, refs)
+
+    assert fake_ray.data.from_items_input == [{"payload": {"a": 1}}, {"payload": {"b": "two"}}]
+    assert dataset.to_pandas().to_dict(orient="records") == [
+        {"payload": {"a": 1}},
+        {"payload": {"b": "two"}},
+    ]
+
+
+def test_ray_backend_materializes_filesystem_seed_reader_fanout_as_input_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = _install_fake_ray(monkeypatch)
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    (seed_dir / "a.txt").write_text("alpha\nbeta", encoding="utf-8")
+    (seed_dir / "b.txt").write_text("gamma\ndelta", encoding="utf-8")
+
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    config_builder.with_seed_dataset(DirectorySeedSource(path=str(seed_dir), file_pattern="*.txt"))
+    config_builder.add_column(
+        ExpressionColumnConfig(
+            name="line_label",
+            expr="{{ relative_path }}:{{ line_index }}:{{ line }}",
+        )
+    )
+    designer = DataDesigner(
+        artifact_path=tmp_path / "artifacts",
+        model_providers=stub_model_providers,
+        seed_readers=[LineFanoutDirectorySeedReader()],
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=3),
+    )
+
+    output_df = designer.create(config_builder, num_records=3).load_dataset().to_pandas()
+
+    assert fake_ray.data.from_pandas_input is not None
+    assert fake_ray.data.range_kwargs is None
+    assert output_df.to_dict(orient="records") == [
+        {"relative_path": "a.txt", "line_index": 0, "line": "alpha", "line_label": "a.txt:0:alpha"},
+        {"relative_path": "a.txt", "line_index": 1, "line": "beta", "line_label": "a.txt:1:beta"},
+        {"relative_path": "b.txt", "line_index": 0, "line": "gamma", "line_label": "b.txt:0:gamma"},
+    ]
 
 
 def test_ray_results_to_arrow_refs_wraps_materialization_failures(

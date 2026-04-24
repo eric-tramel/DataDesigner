@@ -98,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=f"Allow live provider calls. Also accepted when {LIVE_RUN_ENV}=1.",
     )
+    parser.add_argument(
+        "--allow-failures",
+        action="store_true",
+        default=False,
+        help="Exit 0 even if a backend produces invalid output.",
+    )
     return parser.parse_args()
 
 
@@ -138,6 +144,7 @@ def main() -> None:
         "providers": [provider.name for provider in providers],
         "expected_columns": expected_columns,
         "live_run_env": LIVE_RUN_ENV,
+        "allow_failures": args.allow_failures,
     }
     _emit({"type": "setup", **setup})
 
@@ -171,6 +178,7 @@ def main() -> None:
         args.output_json.write_text(
             json.dumps({"setup": setup, "results": results, "summary": summary}, indent=2, default=_json_default)
         )
+    _fail_on_invalid_summary(summary=summary, allow_failures=args.allow_failures)
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -628,7 +636,23 @@ def _build_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "per_backend": per_backend,
         "comparisons_vs_local_sync": comparisons,
         "all_output_valid": all(bool(result["validity"]["all_output_valid"]) for result in results),
+        "failed_backends": _failed_backends(results),
     }
+
+
+def _failed_backends(results: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(result["backend"])
+        for result in results
+        if result.get("status") == "failed" or not bool(result["validity"]["all_output_valid"])
+    ]
+
+
+def _fail_on_invalid_summary(*, summary: dict[str, Any], allow_failures: bool) -> None:
+    if allow_failures:
+        return
+    if summary["failed_backends"] or not summary["all_output_valid"]:
+        raise SystemExit(1)
 
 
 def _speedup_comparisons(results: list[dict[str, Any]], *, baseline_backend: BackendName) -> dict[str, Any]:
