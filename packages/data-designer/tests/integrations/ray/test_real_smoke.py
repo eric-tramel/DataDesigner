@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import importlib.util
 import os
 from pathlib import Path
@@ -42,7 +43,7 @@ def test_real_ray_markdown_seed_recipe_arrow_refs_smoke(
     input_df = _markdown_sections_dataframe(recipe, seed_dir)
     input_blocks = [input_df.iloc[:2].reset_index(drop=True), input_df.iloc[2:].reset_index(drop=True)]
 
-    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
+    _init_local_ray(ray)
     try:
         input_dataset = ray.data.from_pandas(input_blocks)
         config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
@@ -52,11 +53,13 @@ def test_real_ray_markdown_seed_recipe_arrow_refs_smoke(
                 expr="{{ file_name }} :: {{ section_header }}",
             )
         )
+        managed_assets_path = tmp_path / "managed-assets"
+        managed_assets_path.mkdir()
         designer = DataDesigner(
             artifact_path=tmp_path / "artifacts",
             model_providers=stub_model_providers,
             secret_resolver=PlaintextResolver(),
-            managed_assets_path=tmp_path / "managed-assets",
+            managed_assets_path=managed_assets_path,
             backend=RayBackend(batch_size=2, output="arrow_refs"),
         )
 
@@ -85,12 +88,14 @@ def test_real_ray_text_to_python_openai_recipe_smoke(tmp_path: Path) -> None:
     config_builder = _single_llm_text_to_python_config(recipe)
     provider = _builtin_provider("openai")
 
-    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
+    _init_local_ray(ray)
     try:
+        managed_assets_path = tmp_path / "managed-assets"
+        managed_assets_path.mkdir()
         designer = DataDesigner(
             artifact_path=tmp_path / "artifacts",
             model_providers=[provider],
-            managed_assets_path=tmp_path / "managed-assets",
+            managed_assets_path=managed_assets_path,
             backend=RayBackend(batch_size=1, output="arrow_refs"),
         )
 
@@ -111,10 +116,91 @@ def test_real_ray_text_to_python_openai_recipe_smoke(tmp_path: Path) -> None:
         ray.shutdown()
 
 
+def test_real_ray_streaming_out_of_core_parquet_smoke(
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    ray = _require_real_ray()
+    num_records = 32
+    source_blocks = 8
+
+    _init_local_ray(ray)
+    try:
+        input_dataset = ray.data.range(num_records, override_num_blocks=source_blocks)
+        config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+        config_builder.add_column(ExpressionColumnConfig(name="ticket_key", expr="tenant-{{ id }}::ticket-{{ id }}"))
+        config_builder.add_column(ExpressionColumnConfig(name="routing_key", expr="support::{{ id }}"))
+        config_builder.add_column(
+            ExpressionColumnConfig(
+                name="audit_record",
+                expr="{{ ticket_key }}::customer-{{ id }}::{{ routing_key }}",
+            )
+        )
+        managed_assets_path = tmp_path / "managed-assets"
+        managed_assets_path.mkdir()
+        designer = DataDesigner(
+            artifact_path=tmp_path / "artifacts",
+            model_providers=stub_model_providers,
+            secret_resolver=PlaintextResolver(),
+            managed_assets_path=managed_assets_path,
+            backend=RayBackend(
+                batch_size=4,
+                output="dataset",
+                profile_workers=True,
+                trace_enabled=True,
+                max_trace_events=64,
+            ),
+        )
+
+        results = designer.create(config_builder, input_dataset=input_dataset, num_records=num_records)
+        parquet_dir = tmp_path / "ray-streaming-output"
+        results.dataset.write_parquet(str(parquet_dir))
+
+        persisted = ray.data.read_parquet(str(parquet_dir))
+        metrics = results.load_metrics()
+        analysis = results.load_analysis()
+        sample_batches = persisted.iter_batches(batch_size=5, batch_format="pandas")
+        sample = next(iter(sample_batches))
+
+        assert persisted.count() == num_records
+        assert metrics.total_rows == num_records
+        assert metrics.blocks == source_blocks
+        assert metrics.failed_blocks == 0
+        assert analysis is not None
+        assert analysis.total_rows == num_records
+        assert analysis.worker_profiles
+        assert analysis.trace_events
+        assert sample["ticket_key"].notna().all()
+        assert sample["routing_key"].str.contains("::").all()
+        assert list(parquet_dir.glob("*.parquet"))
+    finally:
+        ray.shutdown()
+
+
 def _require_real_ray() -> Any:
     if os.environ.get(REAL_RAY_SMOKE_ENV) != "1":
         pytest.skip(f"Set {REAL_RAY_SMOKE_ENV}=1 to run real-Ray smoke tests.")
     return pytest.importorskip("ray")
+
+
+def _init_local_ray(ray: Any) -> None:
+    _patch_ray_sandbox_process_discovery()
+    ray.init(address="local", num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
+
+
+def _patch_ray_sandbox_process_discovery() -> None:
+    node_module = importlib.import_module("ray._private.node")
+
+    def _sandbox_safe_system_processes(self: Any) -> str:
+        all_processes = getattr(self, "all_processes", {})
+        pids: list[str] = []
+        for processes in all_processes.values():
+            if processes:
+                pids.append(str(processes[0].process.pid))
+        return ",".join(pids)
+
+    node_module.Node._get_system_processes_for_resource_isolation = _sandbox_safe_system_processes
 
 
 def _repo_root() -> Path:
