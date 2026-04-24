@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
-from data_designer.config.processors import ProcessorType
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
@@ -26,6 +25,7 @@ from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics, aggregate_ray_metrics
+from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -199,7 +199,7 @@ class RayBackend:
                 "Automatic hidden row-id injection is tracked as follow-up hardening work."
             )
         if not self.allow_unsafe_processors:
-            _validate_ray_safe_processors(config_builder)
+            validate_ray_safe_processors(config_builder)
 
         dataset = self._resolve_input_dataset(ray, input_dataset=input_dataset, num_records=num_records)
         input_blocks = _get_num_blocks(dataset)
@@ -277,22 +277,6 @@ class RayBackend:
         if self.drop_order_column:
             return ordered.drop_columns([self.order_column])
         return ordered
-
-
-def _validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> None:
-    unsafe_processors = [
-        processor
-        for processor in config_builder.get_processor_configs()
-        if processor.processor_type != ProcessorType.DROP_COLUMNS
-    ]
-    if not unsafe_processors:
-        return
-    processor_names = ", ".join(f"{processor.name} ({processor.processor_type})" for processor in unsafe_processors)
-    raise RayBackendConfigurationError(
-        "RayBackend currently supports only distributed-safe processors. "
-        f"Unsupported processor(s): {processor_names}. "
-        "Pass allow_unsafe_processors=True to bypass this experimental guard."
-    )
 
 
 def _get_num_blocks(dataset: Any) -> int | None:
