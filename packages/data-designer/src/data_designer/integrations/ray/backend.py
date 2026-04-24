@@ -17,7 +17,6 @@ from pydantic import PrivateAttr
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.data_designer_config import DataDesignerConfig
-from data_designer.config.processors import ProcessorType
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import IndexRange, PartitionBlock, SamplingStrategy, SeedConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
@@ -31,6 +30,7 @@ from data_designer.engine.storage.artifact_storage import ArtifactStorage, Batch
 from data_designer.engine.storage.media_storage import StorageMode
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics, aggregate_ray_metrics
+from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -219,7 +219,7 @@ class RayBackend:
             else None
         )
         if not self.allow_unsafe_processors:
-            _validate_ray_safe_processors(config_builder)
+            validate_ray_safe_processors(config_builder)
 
         dataset = self._resolve_input_dataset(ray, input_dataset=input_dataset, num_records=num_records)
         hidden_order_column = _RAY_INTERNAL_ROW_ID_COLUMN if self.preserve_order and self.order_column is None else None
@@ -327,7 +327,6 @@ class RayBackend:
             return ordered.drop_columns([order_column])
         return ordered
 
-
 def _preflight_seed_window(
     *,
     data_designer: Any,
@@ -382,22 +381,6 @@ def _resolve_seed_config_index_range(*, seed_config: SeedConfig, seed_dataset_si
         return seed_config.selection_strategy.to_index_range(seed_dataset_size)
     raise RayBackendConfigurationError(
         "RayBackend seed config uses an unsupported selection_strategy for partitioned execution."
-    )
-
-
-def _validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> None:
-    unsafe_processors = [
-        processor
-        for processor in config_builder.get_processor_configs()
-        if processor.processor_type != ProcessorType.DROP_COLUMNS
-    ]
-    if not unsafe_processors:
-        return
-    processor_names = ", ".join(f"{processor.name} ({processor.processor_type})" for processor in unsafe_processors)
-    raise RayBackendConfigurationError(
-        "RayBackend currently supports only distributed-safe processors. "
-        f"Unsupported processor(s): {processor_names}. "
-        "Pass allow_unsafe_processors=True to bypass this experimental guard."
     )
 
 

@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import json
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import Field, field_validator
 
-from data_designer.config.base import ProcessorConfig
+from data_designer.config.base import ConfigBase, ProcessorConfig
 from data_designer.config.errors import InvalidConfigError
 
 
@@ -23,6 +23,38 @@ class ProcessorType(str, Enum):
 
     DROP_COLUMNS = "drop_columns"
     SCHEMA_TRANSFORM = "schema_transform"
+
+
+class ProcessorSideEffect(str, Enum):
+    """Side-effect behavior relevant to distributed processor execution."""
+
+    NONE = "none"
+    BATCH_ARTIFACT = "batch_artifact"
+    DATASET_ARTIFACT = "dataset_artifact"
+    EXTERNAL = "external"
+
+
+class ProcessorDistributedSafety(ConfigBase):
+    """Declarative distributed-execution safety metadata for processor configs.
+
+    Processor configs declare this as class-level metadata so execution backends
+    can fail closed for processors that have not been reviewed for distributed
+    semantics.
+    """
+
+    ray_safe: bool = Field(description="Whether the processor is safe to run independently on Ray Data blocks.")
+    requires_global_order: bool = Field(
+        default=False,
+        description="Whether the processor requires a globally ordered or complete dataset view.",
+    )
+    side_effects: ProcessorSideEffect = Field(
+        default=ProcessorSideEffect.NONE,
+        description="Side-effect behavior the backend must account for when distributing this processor.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Human-readable explanation for unsafe or constrained distributed execution.",
+    )
 
 
 def get_processor_config_from_kwargs(processor_type: ProcessorType, **kwargs: Any) -> ProcessorConfig:
@@ -58,6 +90,12 @@ class DropColumnsProcessorConfig(ProcessorConfig):
 
     column_names: list[str] = Field(description="List of column names to drop from the output dataset.")
     processor_type: Literal[ProcessorType.DROP_COLUMNS] = ProcessorType.DROP_COLUMNS
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        ray_safe=True,
+        requires_global_order=False,
+        side_effects=ProcessorSideEffect.BATCH_ARTIFACT,
+        reason="Drops columns independently per batch; dropped-column artifacts are batch-local.",
+    )
 
 
 class SchemaTransformProcessorConfig(ProcessorConfig):
@@ -100,6 +138,12 @@ class SchemaTransformProcessorConfig(ProcessorConfig):
         """,
     )
     processor_type: Literal[ProcessorType.SCHEMA_TRANSFORM] = ProcessorType.SCHEMA_TRANSFORM
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        ray_safe=False,
+        requires_global_order=False,
+        side_effects=ProcessorSideEffect.DATASET_ARTIFACT,
+        reason="Writes processor output artifacts that RayBackend does not collect from worker-local storage.",
+    )
 
     @field_validator("template")
     def validate_template(cls, v: dict[str, Any]) -> dict[str, Any]:
