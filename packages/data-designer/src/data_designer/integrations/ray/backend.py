@@ -6,16 +6,19 @@ from __future__ import annotations
 import copy
 import importlib
 import os
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
+from pydantic import PrivateAttr
+
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
+from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.processors import ProcessorType
 from data_designer.config.run_config import RunConfig
+from data_designer.config.seed import SeedConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
 from data_designer.engine.model_provider import resolve_model_provider_registry
@@ -23,7 +26,8 @@ from data_designer.engine.resources.person_reader import PersonReader, create_pe
 from data_designer.engine.resources.resource_provider import create_resource_provider
 from data_designer.engine.resources.seed_reader import SeedReader, SeedReaderRegistry
 from data_designer.engine.secret_resolver import SecretResolver
-from data_designer.engine.storage.artifact_storage import ArtifactStorage
+from data_designer.engine.storage.artifact_storage import ArtifactStorage, BatchStage
+from data_designer.engine.storage.media_storage import StorageMode
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics, aggregate_ray_metrics
 
@@ -46,6 +50,13 @@ class _RayWorkerOptions:
     person_reader: PersonReader | None
     mcp_providers: list[MCPProviderT]
     run_config: RunConfig
+
+
+@dataclass(frozen=True)
+class _RayExecutionPayload:
+    config_json: str
+    worker_options: _RayWorkerOptions
+    use_input_dataset: bool
 
 
 class RayDatasetCreationResults:
@@ -215,12 +226,15 @@ class RayBackend:
             mcp_providers=list(data_designer._mcp_providers),
             run_config=data_designer._run_config,
         )
+        execution_payload = _compile_ray_execution_payload(
+            config_builder=config_builder,
+            worker_options=worker_options,
+            use_input_dataset=use_input_dataset,
+        )
 
         map_batches_kwargs: dict[str, Any] = {
-            "fn_kwargs": {
-                "config_builder": config_builder,
-                "worker_options": worker_options,
-                "use_input_dataset": use_input_dataset,
+            "fn_constructor_kwargs": {
+                "execution_payload": execution_payload,
                 "metrics_collector": metrics_collector,
             },
             "batch_size": batch_size,
@@ -231,7 +245,7 @@ class RayBackend:
             map_batches_kwargs.update(self.ray_remote_args)
 
         try:
-            mapped = dataset.map_batches(_generate_batch, **map_batches_kwargs)
+            mapped = dataset.map_batches(_RayBatchWorker, **map_batches_kwargs)
             mapped = self._apply_ordering(mapped)
             output = mapped.to_arrow_refs() if self.output == "arrow_refs" else None
             result_dataset = _dataset_from_arrow_refs(ray, output) if output is not None else mapped
@@ -316,6 +330,22 @@ def _dataset_from_arrow_refs(ray: Any, refs: list[Any]) -> Any:
     return from_arrow_refs(refs)
 
 
+def _compile_ray_execution_payload(
+    *,
+    config_builder: DataDesignerConfigBuilder,
+    worker_options: _RayWorkerOptions,
+    use_input_dataset: bool,
+) -> _RayExecutionPayload:
+    config_json = config_builder.build().to_json(indent=None)
+    if config_json is None:
+        raise RayBackendConfigurationError("RayBackend failed to serialize the Data Designer configuration.")
+    return _RayExecutionPayload(
+        config_json=config_json,
+        worker_options=worker_options,
+        use_input_dataset=use_input_dataset,
+    )
+
+
 class _RayMetricsCollector:
     def __init__(self) -> None:
         self._payloads: list[dict[str, Any]] = []
@@ -359,79 +389,293 @@ def _clone_seed_reader_for_worker(reader: SeedReader) -> SeedReader:
     return clone
 
 
-def _generate_batch(
-    batch: Any,
-    *,
-    config_builder: DataDesignerConfigBuilder,
-    worker_options: _RayWorkerOptions,
-    use_input_dataset: bool,
-    metrics_collector: Any | None = None,
-) -> Any:
-    start_time = time.perf_counter()
-    os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
-    dataframe = _coerce_pandas_dataframe(batch)
-    num_records = len(dataframe)
-    if num_records == 0:
-        _record_worker_metrics(
-            metrics_collector,
-            RayWorkerMetrics(total_rows=0, blocks=1, elapsed_seconds=time.perf_counter() - start_time),
+class _InMemoryPreviewArtifactStorage(ArtifactStorage):
+    """ArtifactStorage implementation for Ray preview batches.
+
+    Ray workers use ``DatasetBuilder.build_preview()``, which returns the main
+    dataset in memory. Processor preview artifacts may still be written through
+    the storage interface, so this class keeps those frames in memory and avoids
+    per-block temporary filesystem setup.
+    """
+
+    _frames: dict[tuple[str, str, str], Any] = PrivateAttr(default_factory=dict)
+    _metadata: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def __init__(self, *, dataset_name: str = "ray-block") -> None:
+        super().__init__(artifact_path=Path.cwd(), dataset_name=dataset_name)
+        self.set_media_storage_mode(StorageMode.DATAFRAME)
+
+    def clear(self) -> None:
+        self._frames.clear()
+        self._metadata.clear()
+
+    def load_dataset(self, batch_stage: BatchStage = BatchStage.FINAL_RESULT) -> Any:
+        frames = [self._copy_dataframe(frame) for _, frame in self._iter_stage_frames(batch_stage)]
+        if not frames:
+            return lazy.pd.DataFrame()
+        return lazy.pd.concat(frames, ignore_index=True)
+
+    def load_processor_dataset(self, processor_name: str) -> Any:
+        frames = [
+            self._copy_dataframe(frame)
+            for (stage, subfolder, parquet_file_name), frame in self._frames.items()
+            if stage == BatchStage.PROCESSORS_OUTPUTS.value
+            and (subfolder == processor_name or (not subfolder and Path(parquet_file_name).stem == processor_name))
+        ]
+        if not frames:
+            return lazy.pd.DataFrame()
+        return lazy.pd.concat(frames, ignore_index=True)
+
+    def list_processor_names(self) -> list[str]:
+        names = {
+            subfolder or Path(parquet_file_name).stem
+            for (stage, subfolder, parquet_file_name) in self._frames
+            if stage == BatchStage.PROCESSORS_OUTPUTS.value
+        }
+        return sorted(names)
+
+    def load_dataset_with_dropped_columns(self) -> Any:
+        dataset = self.load_dataset()
+        dropped = self.load_dataset(BatchStage.DROPPED_COLUMNS)
+        if len(dropped) == 0:
+            return dataset
+        return lazy.pd.concat([dataset, dropped], axis=1)
+
+    def move_partial_result_to_final_file_path(self, batch_number: int) -> Path:
+        partial_file_name = self.create_batch_file_path(batch_number, BatchStage.PARTIAL_RESULT).name
+        partial_key = (BatchStage.PARTIAL_RESULT.value, "", partial_file_name)
+        final_key = (BatchStage.FINAL_RESULT.value, "", partial_file_name)
+        frame = self._frames.pop(partial_key)
+        self._frames[final_key] = frame
+        return self.create_batch_file_path(batch_number, BatchStage.FINAL_RESULT)
+
+    def write_batch_to_parquet_file(
+        self,
+        batch_number: int,
+        dataframe: Any,
+        batch_stage: BatchStage,
+        subfolder: str | None = None,
+    ) -> Path:
+        file_path = self.create_batch_file_path(batch_number, batch_stage)
+        self.write_parquet_file(file_path.name, dataframe, batch_stage, subfolder=subfolder)
+        return file_path
+
+    def write_parquet_file(
+        self,
+        parquet_file_name: str,
+        dataframe: Any,
+        batch_stage: BatchStage,
+        subfolder: str | None = None,
+    ) -> Path:
+        subfolder = subfolder or ""
+        stage = self._stage_value(batch_stage)
+        self._frames[(stage, subfolder, parquet_file_name)] = self._copy_dataframe(dataframe)
+        stage_path = self._get_stage_path(batch_stage)
+        return stage_path / subfolder / parquet_file_name if subfolder else stage_path / parquet_file_name
+
+    def get_parquet_file_paths(self) -> list[str]:
+        return [
+            str(Path(self.final_dataset_folder_name) / parquet_file_name)
+            for (stage, _, parquet_file_name) in sorted(self._frames)
+            if stage == BatchStage.FINAL_RESULT.value
+        ]
+
+    def get_processor_file_paths(self) -> dict[str, list[str]]:
+        processor_files: dict[str, list[str]] = {}
+        for stage, subfolder, parquet_file_name in sorted(self._frames):
+            if stage != BatchStage.PROCESSORS_OUTPUTS.value:
+                continue
+            processor_name = subfolder or Path(parquet_file_name).stem
+            path_parts = [self.processors_outputs_folder_name]
+            if subfolder:
+                path_parts.append(subfolder)
+            path_parts.append(parquet_file_name)
+            processor_files.setdefault(processor_name, []).append(str(Path(*path_parts)))
+        return processor_files
+
+    def get_file_paths(self) -> dict[str, list[str] | dict[str, list[str]]]:
+        file_paths: dict[str, list[str] | dict[str, list[str]]] = {
+            "parquet-files": self.get_parquet_file_paths(),
+        }
+        processor_file_paths = self.get_processor_file_paths()
+        if processor_file_paths:
+            file_paths["processor-files"] = processor_file_paths
+        return file_paths
+
+    def read_metadata(self) -> dict[str, Any]:
+        return dict(self._metadata)
+
+    def write_metadata(self, metadata: dict[str, Any]) -> Path:
+        self._metadata = dict(metadata)
+        return self.metadata_file_path
+
+    def update_metadata(self, updates: dict[str, Any]) -> Path:
+        self._metadata.update(updates)
+        return self.metadata_file_path
+
+    def _iter_stage_frames(self, batch_stage: BatchStage) -> list[tuple[tuple[str, str, str], Any]]:
+        stage = self._stage_value(batch_stage)
+        return sorted((key, frame) for key, frame in self._frames.items() if key[0] == stage)
+
+    def _stage_value(self, batch_stage: BatchStage) -> str:
+        return BatchStage(batch_stage).value
+
+    def _copy_dataframe(self, dataframe: Any) -> Any:
+        copy_method = getattr(dataframe, "copy", None)
+        if not callable(copy_method):
+            return dataframe
+        try:
+            return copy_method(deep=True)
+        except TypeError:
+            return copy_method()
+
+
+class _RayBatchWorker:
+    def __init__(
+        self,
+        *,
+        execution_payload: _RayExecutionPayload,
+        metrics_collector: Any | None = None,
+    ) -> None:
+        os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
+        self._execution_payload: _RayExecutionPayload = execution_payload
+        self._metrics_collector: Any | None = metrics_collector
+        self._base_config: DataDesignerConfig = DataDesignerConfig.model_validate_json(execution_payload.config_json)
+        self._artifact_storage: _InMemoryPreviewArtifactStorage = _InMemoryPreviewArtifactStorage()
+        worker_options = execution_payload.worker_options
+        self._seed_reader_registry: SeedReaderRegistry = SeedReaderRegistry(
+            readers=copy.deepcopy(worker_options.seed_readers)
         )
-        return dataframe
+        self._resource_provider: Any = create_resource_provider(
+            artifact_storage=self._artifact_storage,
+            model_configs=self._base_config.model_configs or [],
+            secret_resolver=worker_options.secret_resolver,
+            model_provider_registry=resolve_model_provider_registry(
+                worker_options.model_providers,
+                worker_options.default_provider_name,
+            ),
+            seed_reader_registry=self._seed_reader_registry,
+            person_reader=worker_options.person_reader or create_person_reader(worker_options.managed_assets_path),
+            seed_dataset_source=None,
+            run_config=copy.deepcopy(worker_options.run_config),
+            mcp_providers=worker_options.mcp_providers,
+            tool_configs=self._base_config.tool_configs or [],
+        )
 
-    try:
-        block_builder = copy.deepcopy(config_builder)
-        if use_input_dataset:
-            block_builder.with_seed_dataset(DataFrameSeedSource(df=dataframe.copy()))
+    def __call__(self, batch: Any) -> Any:
+        return _generate_batch(batch, worker=self, metrics_collector=self._metrics_collector)
 
-        with tempfile.TemporaryDirectory(prefix="data-designer-ray-") as artifact_dir:
-            ArtifactStorage.mkdir_if_needed(Path(artifact_dir))
-            seed_readers = copy.deepcopy(worker_options.seed_readers)
-            resource_provider = create_resource_provider(
-                artifact_storage=ArtifactStorage(artifact_path=artifact_dir, dataset_name="ray-block"),
-                model_configs=block_builder.model_configs,
-                secret_resolver=worker_options.secret_resolver,
-                model_provider_registry=resolve_model_provider_registry(
-                    worker_options.model_providers,
-                    worker_options.default_provider_name,
-                ),
-                seed_reader_registry=SeedReaderRegistry(readers=seed_readers),
-                person_reader=worker_options.person_reader or create_person_reader(worker_options.managed_assets_path),
-                seed_dataset_source=(
-                    block_builder.get_seed_config().source if block_builder.get_seed_config() is not None else None
-                ),
-                run_config=copy.deepcopy(worker_options.run_config),
-                mcp_providers=worker_options.mcp_providers,
-                tool_configs=block_builder.tool_configs,
+    def close(self) -> None:
+        self._release_block_state()
+
+    def generate_batch(self, batch: Any) -> Any:
+        start_time = time.perf_counter()
+        dataframe = _coerce_pandas_dataframe(batch)
+        num_records = len(dataframe)
+        if num_records == 0:
+            _record_worker_metrics(
+                self._metrics_collector,
+                RayWorkerMetrics(total_rows=0, blocks=1, elapsed_seconds=time.perf_counter() - start_time),
             )
+            return dataframe
+
+        try:
+            block_config = self._create_block_config(dataframe)
+            self._attach_seed_reader(block_config)
+            model_usage_snapshot = self._resource_provider.model_registry.get_model_usage_snapshot()
             builder = DatasetBuilder(
-                data_designer_config=block_builder.build(),
-                resource_provider=resource_provider,
+                data_designer_config=block_config,
+                resource_provider=self._resource_provider,
                 use_async=True,
             )
             raw_dataset = builder.build_preview(num_records=num_records)
             output = builder.process_preview(raw_dataset)
             elapsed_seconds = time.perf_counter() - start_time
             _record_worker_metrics(
-                metrics_collector,
+                self._metrics_collector,
                 RayWorkerMetrics(
                     total_rows=len(output),
                     blocks=1,
                     elapsed_seconds=elapsed_seconds,
-                    model_usage=resource_provider.model_registry.get_model_usage_stats(elapsed_seconds),
+                    model_usage=self._get_model_usage_delta(model_usage_snapshot, elapsed_seconds),
                 ),
             )
             return output
-    except Exception:
-        _record_worker_metrics(
-            metrics_collector,
-            RayWorkerMetrics(
-                total_rows=0,
-                blocks=1,
-                failed_blocks=1,
-                elapsed_seconds=time.perf_counter() - start_time,
-            ),
+        except Exception:
+            _record_worker_metrics(
+                self._metrics_collector,
+                RayWorkerMetrics(
+                    total_rows=0,
+                    blocks=1,
+                    failed_blocks=1,
+                    elapsed_seconds=time.perf_counter() - start_time,
+                ),
+            )
+            raise
+        finally:
+            self._release_block_state()
+
+    def _create_block_config(self, dataframe: Any) -> DataDesignerConfig:
+        block_config = DataDesignerConfig.model_validate_json(self._execution_payload.config_json)
+        if self._execution_payload.use_input_dataset:
+            block_config.seed_config = SeedConfig(source=DataFrameSeedSource(df=dataframe.copy()))
+        return block_config
+
+    def _attach_seed_reader(self, block_config: DataDesignerConfig) -> None:
+        if block_config.seed_config is None:
+            self._resource_provider.seed_reader = None
+            return
+        self._resource_provider.seed_reader = self._seed_reader_registry.get_reader(
+            block_config.seed_config.source,
+            self._execution_payload.worker_options.secret_resolver,
         )
-        raise
+
+    def _get_model_usage_delta(
+        self,
+        model_usage_snapshot: Any,
+        elapsed_seconds: float,
+    ) -> dict[str, dict[str, Any]] | None:
+        usage_deltas = self._resource_provider.model_registry.get_usage_deltas(model_usage_snapshot)
+        if not usage_deltas:
+            return None
+        return {
+            model_name: usage_stats.get_usage_stats(total_time_elapsed=elapsed_seconds)
+            for model_name, usage_stats in usage_deltas.items()
+        }
+
+    def _release_block_state(self) -> None:
+        self._resource_provider.seed_reader = None
+        self._artifact_storage.clear()
+        _detach_seed_readers(self._seed_reader_registry._readers.values())
+
+
+def _detach_seed_readers(readers: Iterable[SeedReader]) -> None:
+    for reader in readers:
+        reader._reset_attachment_state()
+        for attr in ("source", "secret_resolver"):
+            if hasattr(reader, attr):
+                delattr(reader, attr)
+
+
+def _generate_batch(
+    batch: Any,
+    *,
+    worker: _RayBatchWorker | None = None,
+    config_builder: DataDesignerConfigBuilder | None = None,
+    worker_options: _RayWorkerOptions | None = None,
+    use_input_dataset: bool | None = None,
+    metrics_collector: Any | None = None,
+) -> Any:
+    if worker is not None:
+        return worker.generate_batch(batch)
+    if config_builder is None or worker_options is None or use_input_dataset is None:
+        raise TypeError("_generate_batch requires a worker or legacy config_builder/worker_options arguments.")
+    execution_payload = _compile_ray_execution_payload(
+        config_builder=config_builder,
+        worker_options=worker_options,
+        use_input_dataset=use_input_dataset,
+    )
+    return _RayBatchWorker(execution_payload=execution_payload, metrics_collector=metrics_collector)(batch)
 
 
 def _record_worker_metrics(metrics_collector: Any | None, metrics: RayWorkerMetrics) -> None:

@@ -14,10 +14,12 @@ import pytest
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import ExpressionColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
+from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
+from data_designer.engine.storage.artifact_storage import BatchStage
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.interface.data_designer import DataDesigner
@@ -124,18 +126,17 @@ def test_worker_options_and_map_payload_are_pickle_serializable(
     designer.set_run_config(RunConfig(buffer_size=2))
     worker_options = _worker_options_from_designer(designer)
     config_builder = _input_expression_config_builder(stub_model_configs)
-
-    payload = {
-        "config_builder": config_builder,
-        "worker_options": worker_options,
-        "use_input_dataset": True,
-    }
+    payload = ray_backend_module._compile_ray_execution_payload(
+        config_builder=config_builder,
+        worker_options=worker_options,
+        use_input_dataset=True,
+    )
 
     round_tripped = pickle.loads(pickle.dumps(payload))
 
-    assert round_tripped["use_input_dataset"] is True
-    assert round_tripped["worker_options"].run_config.buffer_size == 2
-    assert round_tripped["config_builder"].get_seed_config() is None
+    assert round_tripped.use_input_dataset is True
+    assert round_tripped.worker_options.run_config.buffer_size == 2
+    assert DataDesignerConfig.model_validate_json(round_tripped.config_json).seed_config is None
 
 
 def test_worker_options_and_map_payload_are_cloudpickle_serializable_when_available(
@@ -152,17 +153,146 @@ def test_worker_options_and_map_payload_are_cloudpickle_serializable_when_availa
     )
     worker_options = _worker_options_from_designer(designer)
     config_builder = _input_expression_config_builder(stub_model_configs)
-
-    payload = {
-        "config_builder": config_builder,
-        "worker_options": worker_options,
-        "use_input_dataset": True,
-    }
+    payload = ray_backend_module._compile_ray_execution_payload(
+        config_builder=config_builder,
+        worker_options=worker_options,
+        use_input_dataset=True,
+    )
 
     round_tripped = cloudpickle.loads(cloudpickle.dumps(payload))
 
-    assert round_tripped["worker_options"].default_provider_name == worker_options.default_provider_name
-    assert round_tripped["config_builder"].get_seed_config() is None
+    assert round_tripped.worker_options.default_provider_name == worker_options.default_provider_name
+    assert DataDesignerConfig.model_validate_json(round_tripped.config_json).seed_config is None
+
+
+def test_in_memory_preview_artifact_storage_keeps_processor_outputs_off_disk() -> None:
+    storage = ray_backend_module._InMemoryPreviewArtifactStorage()
+    dataframe = lazy.pd.DataFrame({"value": [1, 2]})
+
+    path = storage.write_parquet_file(
+        "schema-transform.parquet",
+        dataframe,
+        BatchStage.PROCESSORS_OUTPUTS,
+    )
+
+    assert not path.exists()
+    assert storage.list_processor_names() == ["schema-transform"]
+    assert storage.load_processor_dataset("schema-transform").to_dict(orient="records") == [
+        {"value": 1},
+        {"value": 2},
+    ]
+
+    storage.clear()
+
+    assert storage.list_processor_names() == []
+    assert storage.load_processor_dataset("schema-transform").empty
+
+
+def test_ray_batch_worker_reuses_setup_and_clears_block_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+    )
+    payload = ray_backend_module._compile_ray_execution_payload(
+        config_builder=_input_expression_config_builder(stub_model_configs),
+        worker_options=_worker_options_from_designer(designer),
+        use_input_dataset=True,
+    )
+    resource_provider_ids: list[int] = []
+    model_registry_ids: list[int] = []
+    artifact_storage_ids: list[int] = []
+    seed_records: list[list[dict[str, Any]]] = []
+    processor_names_seen: list[list[str]] = []
+
+    class RecordingBuilder:
+        def __init__(
+            self,
+            *,
+            data_designer_config: DataDesignerConfig,
+            resource_provider: Any,
+            use_async: bool | None = None,
+        ) -> None:
+            assert use_async is True
+            assert data_designer_config.seed_config is not None
+            self._resource_provider: Any = resource_provider
+            resource_provider_ids.append(id(resource_provider))
+            model_registry_ids.append(id(resource_provider.model_registry))
+            artifact_storage_ids.append(id(resource_provider.artifact_storage))
+            seed_records.append(data_designer_config.seed_config.source.df.to_dict(orient="records"))
+
+        def build_preview(self, *, num_records: int) -> Any:
+            return lazy.pd.DataFrame({"row": list(range(num_records))})
+
+        def process_preview(self, dataset: Any) -> Any:
+            self._resource_provider.artifact_storage.write_parquet_file(
+                "processor.parquet",
+                dataset,
+                BatchStage.PROCESSORS_OUTPUTS,
+            )
+            processor_names_seen.append(self._resource_provider.artifact_storage.list_processor_names())
+            return dataset
+
+    monkeypatch.setattr(ray_backend_module, "DatasetBuilder", RecordingBuilder)
+    worker = ray_backend_module._RayBatchWorker(execution_payload=payload)
+
+    first = worker(lazy.pd.DataFrame({"x": [1], "label": ["a"]}))
+    second = worker(lazy.pd.DataFrame({"x": [2, 3], "label": ["b", "c"]}))
+
+    assert first.to_dict(orient="records") == [{"row": 0}]
+    assert second.to_dict(orient="records") == [{"row": 0}, {"row": 1}]
+    assert len(set(resource_provider_ids)) == 1
+    assert len(set(model_registry_ids)) == 1
+    assert len(set(artifact_storage_ids)) == 1
+    assert seed_records == [
+        [{"x": 1, "label": "a"}],
+        [{"x": 2, "label": "b"}, {"x": 3, "label": "c"}],
+    ]
+    assert processor_names_seen == [["processor"], ["processor"]]
+    assert worker._artifact_storage.list_processor_names() == []
+    assert worker._resource_provider.seed_reader is None
+    for reader in worker._seed_reader_registry._readers.values():
+        assert not hasattr(reader, "source")
+        assert not hasattr(reader, "secret_resolver")
+
+
+def test_ray_execution_payload_is_driver_config_snapshot(
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+    )
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    payload = ray_backend_module._compile_ray_execution_payload(
+        config_builder=config_builder,
+        worker_options=_worker_options_from_designer(designer),
+        use_input_dataset=True,
+    )
+    config_builder.add_column(
+        ExpressionColumnConfig(
+            name="driver_only",
+            expr="{{ label }}",
+        )
+    )
+
+    output_batch = ray_backend_module._RayBatchWorker(execution_payload=payload)(
+        lazy.pd.DataFrame({"x": [1], "label": ["a"]})
+    )
+
+    assert output_batch.to_dict(orient="records") == [{"x": 1, "label": "a", "x_label": "1-a"}]
+    assert config_builder.get_seed_config() is None
+    assert DataDesignerConfig.model_validate_json(payload.config_json).seed_config is None
 
 
 def test_worker_batch_input_seed_does_not_leak_into_driver_builder(
