@@ -600,6 +600,7 @@ ray_dataset_out = results.load_dataset()</pre>
           <li><strong>Recipe shape:</strong> five sampler columns, one LLM text instruction column, one LLM code column, one LLM judge column, and one Python code validation column.</li>
           <li><strong>Ray settings:</strong> <code>batch_size=16</code>, <code>ray_cpus=4</code>, 16 Ray blocks.</li>
           <li>Measured timings include dataset materialization to pandas. Ray timing also includes local Ray startup; the Ray Data execution log reported <code>301.70s</code> versus <code>304.59s</code> end-to-end.</li>
+          <li>The comparison is intentionally user-path oriented: local uses the current <code>create()</code> path, while Ray uses the experimental Ray data plane and async worker path.</li>
         </ul>
       </div>
     </div>
@@ -669,6 +670,74 @@ ray_dataset_out = results.load_dataset()</pre>
       <code>770</code> successful requests and <code>1,070,168</code> total tokens. The wall-clock time was
       <code>304.590s</code>; summed worker elapsed time was <code>1,002.803s</code> because metrics aggregate
       per-block execution seconds across concurrent Ray workers.
+    </div>
+  </section>
+
+  <section>
+    <h2>Why Performance Can Differ</h2>
+    <p>
+      Ray does not make <code>gpt-4.1</code> generate tokens faster, and it does not reduce the number of model
+      calls required by the recipe. Any speedup has to come from the orchestration around those calls: how many
+      requests are in flight, how much work is serialized through one driver process, and how much local artifact
+      work is on the critical path.
+    </p>
+
+    <div class="grid">
+      <div class="card wide">
+        <h3>The unit of parallelism changes</h3>
+        <p>
+          The local benchmark exercises the current default <code>DataDesigner.create()</code> path in one process.
+          The Ray benchmark converts the 256 requested rows into a Ray Dataset, partitions it into 16 batches of 16
+          rows, and runs <code>map_batches()</code>. Each Ray worker constructs its own <code>DatasetBuilder</code>
+          with <code>use_async=True</code> for that block.
+        </p>
+      </div>
+      <div class="card wide">
+        <h3>LLM latency is overlapped</h3>
+        <p>
+          The recipe has three model-backed columns per row, so 256 rows imply roughly 768 OpenAI requests before
+          retries or implementation details. The Ray metrics reported 770 successful <code>gpt-4.1</code> requests.
+          Ray wall time was <code>304.590s</code>, while summed worker elapsed time was <code>1,002.803s</code>,
+          which means the run overlapped about <code>3.29</code> worker-seconds per wall-clock second. That overlap
+          is consistent with the observed <code>2.96x</code> wall-clock speedup on a 4-CPU local Ray instance.
+        </p>
+      </div>
+      <div class="card wide">
+        <h3>Ray adds fixed costs</h3>
+        <p>
+          Each Ray block crosses a serialization boundary and currently rebuilds temp artifact storage, resource
+          providers, model registries, seed-reader state, and a dataset builder. That fixed setup cost is why Ray is
+          expected to lose on sampler-only or tiny jobs. It only becomes attractive when model/network latency is
+          large enough to hide that scheduling and setup overhead.
+        </p>
+      </div>
+      <div class="card wide">
+        <h3>The benchmark is not a pure engine microbenchmark</h3>
+        <p>
+          The local <code>create()</code> path writes artifacts, reloads the generated dataset, and runs profiling.
+          The Ray backend currently uses preview-style block execution and returns Ray-resident outputs; distributed
+          profiling is still future work. So the measured number is best read as "current local user path versus
+          experimental Ray data-plane path", not as an isolated comparison of identical inner loops.
+        </p>
+      </div>
+      <div class="card full">
+        <h3>Provider limits decide the ceiling</h3>
+        <p>
+          More Ray workers increase request concurrency, but throughput stops improving once the OpenAI account,
+          model endpoint, network, or DataDesigner model-config concurrency limits become the bottleneck. A robust
+          benchmark suite should sweep <code>batch_size</code>, Ray worker count, and model
+          <code>max_parallel_requests</code>, then report request rate, token rate, retry/throttle counts, and output
+          quality alongside rows/sec.
+        </p>
+      </div>
+    </div>
+
+    <div class="callout warning">
+      <strong>Interpretation guardrail:</strong> the 2.96x result is a real end-to-end result for this branch and
+      recipe, but it should not be generalized as "Ray is 3x faster." It says that this OpenAI-heavy job had enough
+      independent network-bound work for Ray's block-level concurrency to overcome its setup overhead in this local
+      test. The next correctness/performance phase should add an apples-to-apples local async baseline and repeated
+      runs with confidence intervals.
     </div>
   </section>
 
@@ -753,9 +822,9 @@ ray_dataset_out = results.load_dataset()</pre>
         <h3>Ray helps when work is large enough</h3>
         <p>
           The 256-row OpenAI benchmark is the clearest signal so far: for a recipe with three model-backed columns,
-          the Ray path was 2.96x faster than the current local default path on a local 4-CPU Ray instance. This does
-          not prove cluster-scale throughput, but it shows the backend is useful once model work dominates scheduling
-          overhead.
+          the Ray path was 2.96x faster than the current local default path on a local 4-CPU Ray instance. The likely
+          mechanism is not faster model execution; it is overlapping independent OpenAI calls across Ray blocks and
+          async workers once model work dominates scheduling overhead.
         </p>
       </div>
       <div class="card wide">
