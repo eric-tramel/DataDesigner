@@ -32,9 +32,8 @@ class FakeMetricDataset:
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeMetricDataset:
         self.map_batches_kwargs = kwargs
-        fn_kwargs = kwargs.get("fn_kwargs") or {}
         return FakeMetricDataset(
-            [fn(block, **fn_kwargs) for block in self.blocks],
+            _map_batches_blocks(fn, self.blocks, kwargs),
             worker_metrics=self.worker_metrics,
         )
 
@@ -50,6 +49,13 @@ class FakeRayDataModule:
 
     def range(self, num_records: int) -> FakeMetricDataset:
         return FakeMetricDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
+
+
+def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
+    fn_kwargs = kwargs.get("fn_kwargs") or {}
+    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
+    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
+    return [map_fn(block, **fn_kwargs) for block in blocks]
 
 
 class FakeObjectRef:

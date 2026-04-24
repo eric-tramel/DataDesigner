@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     )
     from data_designer.config.processors import (  # noqa: F401
         DropColumnsProcessorConfig,
+        ProcessorDistributedSafety,
+        ProcessorSideEffect,
         ProcessorType,
         SchemaTransformProcessorConfig,
     )
@@ -172,6 +174,8 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "UniformDistributionParams": (_MOD_MODELS, "UniformDistributionParams"),
     # processors
     "DropColumnsProcessorConfig": (_MOD_PROCESSORS, "DropColumnsProcessorConfig"),
+    "ProcessorDistributedSafety": (_MOD_PROCESSORS, "ProcessorDistributedSafety"),
+    "ProcessorSideEffect": (_MOD_PROCESSORS, "ProcessorSideEffect"),
     "ProcessorType": (_MOD_PROCESSORS, "ProcessorType"),
     "SchemaTransformProcessorConfig": (_MOD_PROCESSORS, "SchemaTransformProcessorConfig"),
     # run_config

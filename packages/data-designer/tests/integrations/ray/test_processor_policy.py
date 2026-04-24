@@ -6,14 +6,20 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 import pytest
 
 import data_designer.lazy_heavy_imports as lazy
+from data_designer.config.base import ProcessorConfig
 from data_designer.config.column_configs import ExpressionColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
-from data_designer.config.processors import DropColumnsProcessorConfig, SchemaTransformProcessorConfig
+from data_designer.config.processors import (
+    DropColumnsProcessorConfig,
+    ProcessorDistributedSafety,
+    ProcessorSideEffect,
+    SchemaTransformProcessorConfig,
+)
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError
 from data_designer.integrations.ray import backend as ray_backend_module
@@ -27,8 +33,7 @@ class FakeRayDataset:
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         self.map_batches_kwargs = kwargs
-        fn_kwargs = kwargs.get("fn_kwargs") or {}
-        return FakeRayDataset([fn(block, **fn_kwargs) for block in self.blocks])
+        return FakeRayDataset(_map_batches_blocks(fn, self.blocks, kwargs))
 
     def to_pandas(self) -> lazy.pd.DataFrame:
         return lazy.pd.concat(self.blocks, ignore_index=True)
@@ -45,6 +50,27 @@ class FakeRayDataModule:
 
     def range(self, num_records: int) -> FakeRayDataset:
         return FakeRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
+
+
+def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
+    fn_kwargs = kwargs.get("fn_kwargs") or {}
+    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
+    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
+    return [map_fn(block, **fn_kwargs) for block in blocks]
+
+
+class MissingSafetyProcessorConfig(ProcessorConfig):
+    processor_type: Literal["missing_safety"] = "missing_safety"
+
+
+class GlobalOrderProcessorConfig(ProcessorConfig):
+    processor_type: Literal["global_order"] = "global_order"
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        ray_safe=True,
+        requires_global_order=True,
+        side_effects=ProcessorSideEffect.NONE,
+        reason="Requires a globally ordered dataset.",
+    )
 
 
 def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,9 +157,53 @@ def test_ray_backend_rejects_schema_transform_processor_by_default(
     )
     designer = _designer(tmp_path, stub_model_providers, backend=RayBackend())
 
-    with pytest.raises(RayBackendConfigurationError, match="Unsupported processor"):
+    with pytest.raises(RayBackendConfigurationError, match="Unsupported processor") as exc_info:
         designer.create(config_builder, input_dataset=input_dataset)
 
+    message = str(exc_info.value)
+    assert "schema-transform (schema_transform)" in message
+    assert "ray_safe=False" in message
+    assert "side_effects=dataset_artifact" in message
+    assert "worker-local storage" in message
+    assert "allow_unsafe_processors=True" in message
+    assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_backend_rejects_processor_without_distributed_safety_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(MissingSafetyProcessorConfig(name="custom-processor"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend())
+
+    with pytest.raises(RayBackendConfigurationError, match="missing distributed_safety metadata") as exc_info:
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    assert "custom-processor (missing_safety)" in str(exc_info.value)
+    assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_backend_rejects_global_order_processor_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(GlobalOrderProcessorConfig(name="global-order-processor"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend())
+
+    with pytest.raises(RayBackendConfigurationError, match="requires_global_order=True") as exc_info:
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    assert "global-order-processor (global_order)" in str(exc_info.value)
     assert input_dataset.map_batches_kwargs is None
 
 
