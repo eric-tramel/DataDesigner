@@ -125,7 +125,7 @@ Rather than relying on LLM creativity alone for diversity, the pipeline samples 
 Standard categorical samplers draw independently from their value lists. Data Designer's `SubcategorySamplerParams` creates hierarchical dependencies --- what we call "Semantic Blueprints" --- that ensure internally consistent records. When `industry_sector` samples "Healthcare", `topic` is drawn only from healthcare-specific subcategories. When `sql_complexity` samples "Beginner", `sql_concept` is restricted to foundational SQL operations. This is the difference between realistic training data and random noise.
 
 !!! note "Code snippets in this post are illustrative"
-    The code blocks below show the key configuration patterns for each pipeline stage. Model aliases (`prompt_gen`, `context_gen`, etc.) and companion files (`prompts.py`, `rubrics.py`) are referenced but not fully defined inline. For a complete, runnable pipeline, see the [Enterprise Text-to-SQL Recipe](../../recipes/code_generation/enterprise_text_to_sql/).
+    The code blocks below show the key configuration patterns for each pipeline stage. Model aliases (`prompt_gen`, `context_gen`, etc.) and companion files (`prompts.py`, `rubrics.py`) are referenced but not fully defined inline. For a complete, runnable pipeline, see the [Enterprise Text-to-SQL Recipe](../../recipes/code_generation/enterprise_text_to_sql.md).
 
 ```python
 import data_designer.config as dd
@@ -370,7 +370,7 @@ The SQL judge rubric explicitly penalizes distractor usage:
 
 > *"The SQL should only JOIN or reference tables that are strictly necessary to answer the prompt. The database context may include distractor tables that look relevant but are not needed -- penalize queries that unnecessarily join or reference these tables."*
 
-Each judge provides a score *and* reasoning for each dimension, making it easy to diagnose why a record scored low. After configuring the five `LLMJudgeColumnConfig` columns (see the [full recipe](../../recipes/code_generation/enterprise_text_to_sql/) for complete judge definitions), expression columns extract numeric scores into flat columns for downstream filtering:
+Each judge provides a score *and* reasoning for each dimension, making it easy to diagnose why a record scored low. After configuring the five `LLMJudgeColumnConfig` columns (see the [full recipe](../../recipes/code_generation/enterprise_text_to_sql.md) for complete judge definitions), expression columns extract numeric scores into flat columns for downstream filtering:
 
 ```python
 config.add_column(dd.ExpressionColumnConfig(

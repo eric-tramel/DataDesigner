@@ -33,13 +33,13 @@ nav:
       - Deployment Options: concepts/deployment-options.md
       - Security: concepts/security.md
   - Tutorials:
-      - Overview: notebooks/README.md
-      - The Basics: notebooks/1-the-basics.ipynb
-      - Structured Outputs, Jinja Expressions, and Conditional Generation: notebooks/2-structured-outputs-and-jinja-expressions.ipynb
-      - Seeding with an External Dataset: notebooks/3-seeding-with-a-dataset.ipynb
-      - Providing Images as Context: notebooks/4-providing-images-as-context.ipynb
-      - Generating Images: notebooks/5-generating-images.ipynb
-      - Image-to-Image Editing: notebooks/6-editing-images-with-image-context.ipynb
+      - Overview: colab_notebooks/README.md
+      - The Basics: colab_notebooks/1-the-basics.ipynb
+      - Structured Outputs, Jinja Expressions, and Conditional Generation: colab_notebooks/2-structured-outputs-and-jinja-expressions.ipynb
+      - Seeding with an External Dataset: colab_notebooks/3-seeding-with-a-dataset.ipynb
+      - Providing Images as Context: colab_notebooks/4-providing-images-as-context.ipynb
+      - Generating Images: colab_notebooks/5-generating-images.ipynb
+      - Image-to-Image Editing: colab_notebooks/6-editing-images-with-image-context.ipynb
   - Recipes:
       - Recipe Cards: recipes/cards.md
       - Code Generation:
@@ -129,6 +129,10 @@ watch:
   - packages/data-designer-engine/src/data_designer
   - packages/data-designer/src/data_designer
   - docs/
+
+exclude_docs: |
+  notebook_source/**
+  scripts/**
 
 plugins:
   - search
