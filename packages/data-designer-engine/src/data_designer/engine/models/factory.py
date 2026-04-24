@@ -13,6 +13,7 @@ from data_designer.engine.secret_resolver import SecretResolver
 if TYPE_CHECKING:
     from data_designer.config.run_config import RunConfig
     from data_designer.engine.mcp.registry import MCPRegistry
+    from data_designer.engine.models.clients.throttle_manager import ThrottleManagerLike
     from data_designer.engine.models.registry import ModelRegistry
 
 
@@ -24,6 +25,7 @@ def create_model_registry(
     mcp_registry: MCPRegistry | None = None,
     client_concurrency_mode: ClientConcurrencyMode = ClientConcurrencyMode.SYNC,
     run_config: RunConfig | None = None,
+    throttle_manager: ThrottleManagerLike | None = None,
 ) -> ModelRegistry:
     """Factory function for creating a ModelRegistry instance.
 
@@ -54,7 +56,7 @@ def create_model_registry(
     from data_designer.engine.models.facade import ModelFacade
     from data_designer.engine.models.registry import ModelRegistry
 
-    throttle_manager = ThrottleManager((run_config or RunConfig()).throttle)
+    effective_throttle_manager = throttle_manager or ThrottleManager((run_config or RunConfig()).throttle)
 
     def model_facade_factory(
         model_config: ModelConfig,
@@ -68,7 +70,7 @@ def create_model_registry(
             model_provider_registry,
             retry_config=retry_config,
             client_concurrency_mode=client_concurrency_mode,
-            throttle_manager=throttle_manager,
+            throttle_manager=effective_throttle_manager,
         )
         return ModelFacade(
             model_config,
@@ -82,6 +84,6 @@ def create_model_registry(
         secret_resolver=secret_resolver,
         model_provider_registry=model_provider_registry,
         model_facade_factory=model_facade_factory,
-        throttle_manager=throttle_manager,
+        throttle_manager=effective_throttle_manager,
         retry_config=RetryConfig(),
     )

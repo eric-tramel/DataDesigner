@@ -47,6 +47,7 @@ class RayDatasetMetrics:
     failed_blocks: int = 0
     elapsed_seconds: float = 0.0
     model_usage: ModelUsageSummary | None = None
+    throttle: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _validate_non_negative_int("total_rows", self.total_rows)
