@@ -585,26 +585,29 @@ ray_dataset_out = results.load_dataset()</pre>
           <li>Worktree: <code>/Users/eric/src/DataDesigner-ray-backend</code></li>
           <li>Python: <code>3.13.0</code></li>
           <li>Ray: <code>2.55.1</code>, local Ray instance</li>
-          <li>Engine: <code>DATA_DESIGNER_ASYNC_ENGINE=1</code></li>
-          <li>Configured providers: <code>nvidia</code>, <code>openai</code>, <code>openrouter</code></li>
-          <li>Missing configured provider credential: <code>openrouter</code></li>
+          <li>Benchmark script: <code>scripts/benchmarks/benchmark_ray_openai.py</code></li>
+          <li>Providers passed to benchmark: <code>openai</code> only</li>
+          <li>Model configs passed to benchmark: <code>openai-text</code>, <code>openai-reasoning</code>, <code>openai-vision</code>, <code>openai-embedding</code></li>
+          <li>Execution modes: current local default backend versus Ray backend async worker path</li>
+          <li>Health checks: skipped in benchmark configs so timings measure generation rather than preflight</li>
         </ul>
       </div>
       <div class="card wide">
         <h3>Workloads</h3>
         <ul>
-          <li><strong>Sampler + expression:</strong> 10,000 rows, no model calls, intended to expose orchestration overhead.</li>
-          <li><strong>NVIDIA LLM:</strong> 8 seeded rows, <code>nvidia-text</code>, <code>nvidia/nemotron-3-nano-30b-a3b</code>, <code>max_tokens=16</code>.</li>
-          <li><strong>OpenAI LLM:</strong> 4 seeded rows, <code>openai-text</code>, <code>gpt-4.1</code>, <code>max_tokens=16</code>.</li>
-          <li><strong>Docs/assets OpenAI recipe:</strong> 128 rows from <code>docs/assets/recipes/code_generation/text_to_python.py</code>, <code>openai-text</code>, <code>gpt-4.1</code>, no max-token override, Ray <code>batch_size=16</code>.</li>
-          <li>Ray startup was excluded from measured sections. Ray Dataset timings include pulling to pandas on the driver unless noted as Arrow refs.</li>
+          <li><strong>OpenAI docs/assets recipe:</strong> 256 rows from <code>docs/assets/recipes/code_generation/text_to_python.py</code>.</li>
+          <li><strong>Model endpoint:</strong> <code>openai-text</code> using <code>gpt-4.1</code>, no max-token override, <code>temperature=0.85</code>, <code>top_p=0.95</code>.</li>
+          <li><strong>Recipe shape:</strong> five sampler columns, one LLM text instruction column, one LLM code column, one LLM judge column, and one Python code validation column.</li>
+          <li><strong>Ray settings:</strong> <code>batch_size=16</code>, <code>ray_cpus=4</code>, 16 Ray blocks.</li>
+          <li>Measured timings include dataset materialization to pandas. Ray timing also includes local Ray startup; the Ray Data execution log reported <code>301.70s</code> versus <code>304.59s</code> end-to-end.</li>
         </ul>
       </div>
     </div>
     <div class="callout warning">
-      <strong>Caveat:</strong> the LLM runs are intentionally small to limit API cost. These are smoke-scale
-      performance tests, not statistically stable throughput claims. Network latency and provider scheduling noise
-      are material at this size.
+      <strong>Caveat:</strong> this is a larger single-run benchmark, not a statistically stable benchmark suite.
+      Network latency, provider scheduling, and generated-code length still materially affect timings. The key
+      improvement over the earlier report is scale and provider isolation: the comparison now uses only OpenAI models
+      and 768-plus model requests per backend.
     </div>
   </section>
 
@@ -623,115 +626,48 @@ ray_dataset_out = results.load_dataset()</pre>
       </thead>
       <tbody>
         <tr>
-          <td>Sampler + expression</td>
-          <td>Local</td>
-          <td>10,000</td>
-          <td>1.292</td>
-          <td>7,741</td>
-          <td>Fast local path; minimal orchestration overhead.</td>
+          <td>OpenAI <code>text_to_python</code></td>
+          <td>Local default</td>
+          <td>256</td>
+          <td>903.057</td>
+          <td>0.283</td>
+          <td>Current local artifact-backed path. Produced 256 rows with zero null output columns.</td>
         </tr>
         <tr>
-          <td>Sampler + expression</td>
+          <td>OpenAI <code>text_to_python</code></td>
           <td>Ray Dataset</td>
-          <td>10,000</td>
-          <td>3.045</td>
-          <td>3,284</td>
-          <td>Ray is 2.36x slower for this cheap workload because block scheduling dominates.</td>
-        </tr>
-        <tr>
-          <td>NVIDIA LLM</td>
-          <td>Local</td>
-          <td>8</td>
-          <td>1.954</td>
-          <td>4.09</td>
-          <td>Configured default provider path. Includes local artifact/profiler result path.</td>
-        </tr>
-        <tr>
-          <td>NVIDIA LLM</td>
-          <td>Ray Dataset</td>
-          <td>8</td>
-          <td>2.172</td>
-          <td>3.68</td>
-          <td>About 11% slower at tiny local scale; expected to improve with larger partitions and real cluster parallelism.</td>
-        </tr>
-        <tr>
-          <td>NVIDIA LLM</td>
-          <td>Ray Arrow refs</td>
-          <td>8</td>
-          <td>4.346</td>
-          <td>1.84</td>
-          <td>Returned 2 in-memory refs. This run was slower due to API variance; it validates the ObjectRef path.</td>
-        </tr>
-        <tr>
-          <td>OpenAI LLM</td>
-          <td>Local</td>
-          <td>4</td>
-          <td>4.784</td>
-          <td>0.84</td>
-          <td>Configured <code>gpt-4.1</code> path produced non-empty outputs.</td>
-        </tr>
-        <tr>
-          <td>OpenAI LLM</td>
-          <td>Ray Dataset</td>
-          <td>4</td>
-          <td>4.190</td>
-          <td>0.95</td>
-          <td>About 12% faster in this run, but small-N variance is high.</td>
-        </tr>
-        <tr>
-          <td>Docs/assets text_to_python</td>
-          <td>Ray Dataset</td>
-          <td>128</td>
-          <td>136.633</td>
-          <td>0.94</td>
-          <td>Real recipe run against <code>openai-text</code> with no max-token cap; generated 128 non-null rows and exercised the metrics actor across 8 Ray blocks.</td>
+          <td>256</td>
+          <td>304.590</td>
+          <td>0.840</td>
+          <td>2.96x faster end to end on the local Ray instance, with 16 Ray blocks and zero failed blocks.</td>
         </tr>
       </tbody>
     </table>
 
     <h3>Rows/sec Comparison</h3>
     <div class="bar-row">
-      <div>Local sampler</div>
+      <div>Local OpenAI 256</div>
+      <div class="bar-track"><div class="bar" style="width: 34%"></div></div>
+      <div>0.283</div>
+    </div>
+    <div class="bar-row">
+      <div>Ray OpenAI 256</div>
       <div class="bar-track"><div class="bar" style="width: 100%"></div></div>
-      <div>7,741</div>
-    </div>
-    <div class="bar-row">
-      <div>Ray sampler</div>
-      <div class="bar-track"><div class="bar" style="width: 42%"></div></div>
-      <div>3,284</div>
-    </div>
-    <div class="bar-row">
-      <div>Local NVIDIA LLM</div>
-      <div class="bar-track"><div class="bar" style="width: 53%"></div></div>
-      <div>4.09</div>
-    </div>
-    <div class="bar-row">
-      <div>Ray NVIDIA LLM</div>
-      <div class="bar-track"><div class="bar" style="width: 48%"></div></div>
-      <div>3.68</div>
-    </div>
-    <div class="bar-row">
-      <div>Local OpenAI LLM</div>
-      <div class="bar-track"><div class="bar" style="width: 11%"></div></div>
-      <div>0.84</div>
-    </div>
-    <div class="bar-row">
-      <div>Ray OpenAI LLM</div>
-      <div class="bar-track"><div class="bar" style="width: 12%"></div></div>
-      <div>0.95</div>
+      <div>0.840</div>
     </div>
 
     <div class="callout">
-      <strong>Observation:</strong> the NVIDIA endpoint returned empty content for the short prompt while still
-      reporting successful requests and token usage. The OpenAI run produced non-empty values. The NVIDIA timing
-      is still useful for exercising the configured provider path and network/model stack, but not for output-quality assessment.
+      <strong>Scale result:</strong> moving from smoke-size runs to 256 records changed the interpretation. Ray is
+      not useful for tiny or cheap workloads, but for this OpenAI-heavy recipe the Ray path completed in
+      <code>304.590s</code> versus <code>903.057s</code> locally, a <code>2.96x</code> speedup even with local Ray
+      startup included.
     </div>
 
     <div class="callout">
-      <strong>Distributed metrics validation:</strong> the 128-row docs/assets run returned
-      <code>total_rows=128</code>, <code>blocks=8</code>, <code>failed_blocks=0</code>, and <code>gpt-4.1</code>
-      usage of <code>384</code> successful requests and <code>526,073</code> total tokens. The wall-clock time was
-      <code>136.633s</code>; the reported worker elapsed time was <code>474.829s</code> because it aggregates
+      <strong>Ray metrics:</strong> the 256-row Ray run returned <code>total_rows=256</code>,
+      <code>blocks=16</code>, <code>failed_blocks=0</code>, and <code>gpt-4.1</code> usage of
+      <code>770</code> successful requests and <code>1,070,168</code> total tokens. The wall-clock time was
+      <code>304.590s</code>; summed worker elapsed time was <code>1,002.803s</code> because metrics aggregate
       per-block execution seconds across concurrent Ray workers.
     </div>
   </section>
@@ -816,9 +752,10 @@ ray_dataset_out = results.load_dataset()</pre>
       <div class="card wide">
         <h3>Ray helps when work is large enough</h3>
         <p>
-          For cheap sampler/expression jobs, Ray overhead is too high. For LLM jobs, model latency dominates enough
-          that Ray is close even on a local instance. On a real cluster and with larger record counts, the Ray path
-          should become more attractive.
+          The 256-row OpenAI benchmark is the clearest signal so far: for a recipe with three model-backed columns,
+          the Ray path was 2.96x faster than the current local default path on a local 4-CPU Ray instance. This does
+          not prove cluster-scale throughput, but it shows the backend is useful once model work dominates scheduling
+          overhead.
         </p>
       </div>
       <div class="card wide">
@@ -1041,8 +978,9 @@ ray_dataset_out = results.load_dataset()</pre>
     <h2>Recommended Next Implementation Steps</h2>
     <ol>
       <li>
-        <strong>Promote the benchmark into the repo.</strong> Move the temporary benchmark into
-        <code>scripts/benchmarks/</code>, parameterize provider/model/record counts, and emit JSON plus HTML.
+        <strong>Turn the benchmark script into a repeatable suite.</strong> The OpenAI benchmark now lives in
+        <code>scripts/benchmarks/benchmark_ray_openai.py</code>; next, add multiple iterations, confidence intervals,
+        machine-readable historical outputs, and CI-safe dry-run modes.
       </li>
       <li>
         <strong>Implement partition-offset-aware seed support.</strong> Either teach seed readers to accept
@@ -1096,6 +1034,10 @@ ray_dataset_out = results.load_dataset()</pre>
         <tr>
           <td><code>uv build packages/data-designer</code></td>
           <td><span class="good">built sdist and wheel</span></td>
+        </tr>
+        <tr>
+          <td><code>./.venv/bin/python scripts/benchmarks/benchmark_ray_openai.py --num-records 256 --batch-size 16 --ray-cpus 4 --output-json /tmp/dd-ray-openai-benchmark-256.json</code></td>
+          <td><span class="good">local 903.057s, Ray 304.590s, Ray speedup 2.96x, 256 rows each</span></td>
         </tr>
         <tr>
           <td><code>./.venv/bin/python /tmp/dd_docs_text_to_python_ray_128.py</code></td>
