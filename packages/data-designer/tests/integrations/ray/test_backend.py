@@ -18,19 +18,40 @@ from data_designer.config.run_config import RunConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
-from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetMetrics
+from data_designer.integrations.ray import (
+    RayBackend,
+    RayBackendConfigurationError,
+    RayDatasetCreationResults,
+    RayDatasetGenerationError,
+    RayDatasetMetrics,
+)
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.interface.data_designer import DataDesigner
 
 
 class FakeRayDataset:
-    def __init__(self, blocks: list[lazy.pd.DataFrame]) -> None:
+    def __init__(self, blocks: list[lazy.pd.DataFrame], *, reverse_mapped_blocks: bool = False) -> None:
         self.blocks = blocks
+        self.reverse_mapped_blocks = reverse_mapped_blocks
         self.map_batches_kwargs: dict[str, Any] | None = None
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         self.map_batches_kwargs = kwargs
-        return FakeRayDataset(_map_batches_blocks(fn, self.blocks, kwargs))
+        blocks = _map_batches_blocks(fn, self.blocks, kwargs)
+        if self.reverse_mapped_blocks:
+            blocks.reverse()
+        return FakeRayDataset(blocks, reverse_mapped_blocks=self.reverse_mapped_blocks)
+
+    def zip(self, other: FakeRayDataset) -> FakeRayDataset:
+        other_df = other.to_pandas()
+        offset = 0
+        blocks: list[lazy.pd.DataFrame] = []
+        for block in self.blocks:
+            block_len = len(block)
+            other_block = other_df.iloc[offset : offset + block_len].reset_index(drop=True)
+            blocks.append(lazy.pd.concat([block.reset_index(drop=True), other_block], axis=1))
+            offset += block_len
+        return FakeRayDataset(blocks, reverse_mapped_blocks=self.reverse_mapped_blocks)
 
     def to_arrow_refs(self) -> list[str]:
         return [f"arrow-ref-{i}" for i, _ in enumerate(self.blocks)]
@@ -48,6 +69,9 @@ class FakeRayDataset:
     def num_blocks(self) -> int:
         return len(self.blocks)
 
+    def count(self) -> int:
+        return sum(len(block) for block in self.blocks)
+
 
 class FakeRayDataModule:
     Dataset = FakeRayDataset
@@ -55,17 +79,21 @@ class FakeRayDataModule:
     def __init__(self) -> None:
         self.from_arrow_refs_input: list[Any] | None = None
         self.from_pandas_refs_input: list[Any] | None = None
+        self.reverse_mapped_blocks = False
 
     def range(self, num_records: int) -> FakeRayDataset:
         return FakeRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
 
     def from_arrow_refs(self, refs: list[Any]) -> FakeRayDataset:
         self.from_arrow_refs_input = refs
-        return FakeRayDataset([_arrow_ref_to_pandas(ref) for ref in refs])
+        return FakeRayDataset(
+            [_arrow_ref_to_pandas(ref) for ref in refs],
+            reverse_mapped_blocks=self.reverse_mapped_blocks,
+        )
 
     def from_pandas_refs(self, refs: list[Any]) -> FakeRayDataset:
         self.from_pandas_refs_input = refs
-        return FakeRayDataset(list(refs))
+        return FakeRayDataset(list(refs), reverse_mapped_blocks=self.reverse_mapped_blocks)
 
 
 class CountingRayDataset:
@@ -274,22 +302,35 @@ def test_ray_backend_can_sort_by_explicit_order_column(
     ]
 
 
-def test_ray_backend_requires_order_column_for_preserve_order(
+def test_ray_backend_preserve_order_does_not_require_explicit_order_column(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    stub_sampler_only_config_builder: Any,
+    stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
     _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset(
+        [
+            lazy.pd.DataFrame({"x": [1], "label": ["a"]}),
+            lazy.pd.DataFrame({"x": [2], "label": ["b"]}),
+        ],
+        reverse_mapped_blocks=True,
+    )
     designer = DataDesigner(
         artifact_path=tmp_path,
         model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
         managed_assets_path=_managed_assets_path(tmp_path),
         backend=RayBackend(preserve_order=True),
     )
+    config_builder = _input_expression_config_builder(stub_model_configs)
 
-    with pytest.raises(RayBackendConfigurationError, match="requires order_column"):
-        designer.create(stub_sampler_only_config_builder, num_records=1)
+    output_df = designer.create(config_builder, input_dataset=input_dataset).load_dataset().to_pandas()
+
+    assert output_df.to_dict(orient="records") == [
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+    ]
 
 
 def test_ray_backend_uses_pandas_object_refs_as_in_memory_seed(
@@ -434,6 +475,25 @@ def test_ray_backend_arrow_refs_load_dataset_uses_materialized_refs_without_reru
         {"id": 1, "generated": 1},
     ]
     assert generate_calls == 1
+
+
+def test_ray_results_to_arrow_refs_wraps_materialization_failures(
+    stub_sampler_only_config_builder: DataDesignerConfigBuilder,
+) -> None:
+    class FailingArrowDataset:
+        def to_arrow_refs(self) -> list[Any]:
+            raise RuntimeError("object store unavailable")
+
+    results = RayDatasetCreationResults(
+        dataset=FailingArrowDataset(),
+        config_builder=stub_sampler_only_config_builder,
+        metrics=RayDatasetMetrics(),
+    )
+
+    with pytest.raises(RayDatasetGenerationError, match="materialize Arrow ObjectRefs") as exc_info:
+        results.to_arrow_refs()
+
+    assert "object store unavailable" in str(exc_info.value.__cause__)
 
 
 def test_ray_backend_dataset_output_wraps_dataset_and_delegates_arrow_refs(
