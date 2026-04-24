@@ -16,6 +16,15 @@ from data_designer.integrations.ray.metrics import (
     aggregate_ray_metrics,
     normalize_ray_worker_metrics,
 )
+from data_designer.integrations.ray.observability import (
+    RayDatasetAnalysis,
+    RayThrottleSnapshot,
+    RayTraceEvent,
+    RayWorkerProfile,
+    normalize_ray_throttle_snapshot,
+    normalize_ray_trace_event,
+    normalize_ray_worker_profile,
+)
 from data_designer.integrations.ray.options import (
     RayBlockPlanning,
     RayExecutionOptions,
@@ -26,6 +35,7 @@ __all__ = [
     "RayBackend",
     "RayBackendConfigurationError",
     "RayBlockPlanning",
+    "RayDatasetAnalysis",
     "RayDatasetCreationResults",
     "RayDatasetGenerationError",
     "RayDatasetMetrics",
@@ -33,7 +43,13 @@ __all__ = [
     "RayIntegrationError",
     "RayMetricsError",
     "RayResolvedBlockPlan",
+    "RayThrottleSnapshot",
+    "RayTraceEvent",
     "RayWorkerMetrics",
+    "RayWorkerProfile",
     "aggregate_ray_metrics",
+    "normalize_ray_throttle_snapshot",
+    "normalize_ray_trace_event",
     "normalize_ray_worker_metrics",
+    "normalize_ray_worker_profile",
 ]

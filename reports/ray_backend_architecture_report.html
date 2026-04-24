@@ -856,15 +856,13 @@ ray_dataset_out = results.load_dataset()</pre>
   <section>
     <h2>Current Limitations</h2>
     <ol>
-      <li><strong>Per-block setup cost:</strong> each Ray block currently creates temp artifact storage, resource providers, registries, and a DatasetBuilder.</li>
-      <li><strong>Per-block model health checks:</strong> workers may repeat checks that should be a driver preflight or cached per worker.</li>
-      <li><strong>No actor reuse:</strong> <code>map_batches</code> uses a function. A callable class or actor-style execution could reuse model clients and resource setup across blocks.</li>
-      <li><strong>Profiler artifact gap:</strong> Ray results are Ray-resident and <code>load_analysis()</code> currently returns <code>None</code>. Full profiler artifact generation remains future distributed/Ray-native work.</li>
-      <li><strong>Automatic ordering:</strong> explicit <code>order_column</code> sorting is supported, but hidden row-id injection for automatic <code>preserve_order=True</code> is still future work.</li>
-      <li><strong>Seed configs without input datasets:</strong> Ray now rejects this unsafe mode before execution. Partition-offset-aware seed readers remain future work; use in-memory Ray inputs for seeded Ray jobs today.</li>
-      <li><strong>From-scratch partitioning:</strong> <code>ray.data.range(num_records)</code> needs explicit block planning for high throughput.</li>
+      <li><strong>Actor lifetime tuning:</strong> callable-class workers now reuse resource providers and model clients, but production deployments still need real-cluster tuning for actor pool sizing, placement, and autoscaling behavior.</li>
+      <li><strong>Profiler artifact scope:</strong> Ray results now expose bounded worker profile summaries, trace events, and worker-local throttle snapshots through <code>load_analysis()</code>. Full local-style <code>DatasetProfilerResults</code> still requires materializing the dataset on the driver and remains unsupported for Ray-resident outputs.</li>
+      <li><strong>Automatic ordering:</strong> automatic hidden row-id preservation is implemented for Ray inputs and from-scratch range datasets, but order preservation still assumes one output row per input row.</li>
+      <li><strong>Seed configs without input datasets:</strong> ordered seed configs now use partition offsets. Shuffled seed sampling without an input dataset remains unsupported in Ray.</li>
+      <li><strong>From-scratch partitioning:</strong> explicit block planning controls exist, but production defaults should still be tuned against real cluster and model-provider behavior.</li>
       <li><strong>Processor side effects:</strong> unsafe processors are now rejected by default, but first-class distributed side-effect semantics are not implemented.</li>
-      <li><strong>Secrets and trust boundary:</strong> provider config and secret resolvers are serialized to workers. That is normal for trusted Ray clusters, but should be documented.</li>
+      <li><strong>Trusted-cluster boundary:</strong> provider config and secret resolvers are serialized to workers. The supported deployment assumption is a trusted single-tenant Ray cluster or equivalent platform isolation.</li>
     </ol>
   </section>
 
@@ -931,16 +929,17 @@ ray_dataset_out = results.load_dataset()</pre>
         </tr>
         <tr>
           <td>Phase D: Error and Metrics Surface</td>
-          <td><span class="good">Metrics done</span></td>
+          <td><span class="good">Metrics and bounded artifacts done</span></td>
           <td>
-            Worker metrics aggregation now uses a Ray-side metrics actor that returns compact usage, row-count,
-            block-count, failed-block, elapsed-time, and model-usage summaries to the Ray result object. Zero-row
-            worker metrics remain zero instead of falling back to requested driver row counts.
+            Worker metrics aggregation now uses a Ray-side actor that returns compact usage, row-count, block-count,
+            failed-block, elapsed-time, model-usage summaries, per-worker profile summaries, bounded trace events,
+            and worker-local throttle snapshots to the Ray result object. Zero-row worker metrics remain zero instead
+            of falling back to requested driver row counts.
           </td>
           <td>
-            Remaining: broader Ray task, serialization, object-store, cancellation, and worker exceptions should carry
-            richer task/block context. Validation counts, retry attribution, and full distributed profiler artifacts
-            remain future work rather than part of the initial Phase D metrics channel.
+            Remaining: broader Ray serialization, object-store, cancellation, and worker exceptions should carry richer
+            task/block context. Validation counts, retry attribution, and full local-style profiler reports remain
+            future work rather than part of the bounded Ray-native artifact channel.
           </td>
         </tr>
         <tr>
@@ -966,19 +965,21 @@ ray_dataset_out = results.load_dataset()</pre>
             rejected processors, success and failure paths, Ray installed and Ray absent.
           </td>
           <td>
-            Remaining for production: expand from fake Ray/test doubles into recurring real-Ray smoke coverage,
-            repeated OpenAI benchmark runs, and an apples-to-apples local async comparison.
+            Recurring opt-in real-Ray smoke coverage and an apples-to-apples OpenAI benchmark script now exist.
+            Remaining for production: run scheduled benchmarks with real credentials, keep trend artifacts, and expand
+            the real-Ray matrix beyond the initial recipe paths.
           </td>
         </tr>
       </tbody>
     </table>
 
     <div class="callout warning">
-      <strong>Sequence constraint:</strong> performance work should not mask correctness gaps. Worker reuse and block
-      planning are high-value optimizations, but they should follow the remaining row-id, seed-offset, error-context,
-      global-throttling, and processor-metadata gates above. Metrics aggregation, no-Ray optional import behavior,
-      Arrow-ref materialization, seeded-mode rejection, and zero-row metrics are no longer open roadmap items in this
-      experimental branch.
+      <strong>Sequence constraint:</strong> performance work should not mask correctness gaps. Worker reuse, block
+      planning, hidden row ids, ordered seed offsets, processor safety metadata, metrics aggregation, bounded
+      Ray-native observability artifacts, global throttling, no-Ray optional import behavior, Arrow-ref
+      materialization, and zero-row metrics are no longer open roadmap items in this experimental branch. Remaining
+      production hardening should focus on broader failure context, validation attribution, cancellation behavior, and
+      real-cluster benchmark trend data.
     </div>
   </section>
 
@@ -988,34 +989,41 @@ ray_dataset_out = results.load_dataset()</pre>
       <div class="card">
         <h3>Phase 1: Correctness Hardening</h3>
         <ul>
-          <li><span class="good">Done:</span> reject seed configs without <code>input_dataset</code> instead of duplicating early rows across Ray batches.</li>
+          <li><span class="good">Done:</span> support ordered seed configs without <code>input_dataset</code> by using partition offsets.</li>
           <li><span class="good">Done:</span> rebuild Arrow-ref result datasets from materialized refs so <code>load_dataset()</code> does not re-run generation.</li>
           <li><span class="good">Done:</span> aggregate Ray worker metrics and preserve zero-row worker totals.</li>
+          <li><span class="good">Done:</span> expose bounded Ray worker profile summaries and trace artifacts without driver dataset materialization.</li>
           <li><span class="good">Done:</span> reject unsupported processors by default and cover the bypass path.</li>
           <li><span class="good">Done:</span> add tests for explicit ordering, ObjectRef input formats, same-process local-then-Ray execution, optional-extra behavior, and metrics aggregation.</li>
-          <li>Remaining: add automatic hidden row-id preservation for Ray inputs and from-scratch generation.</li>
-          <li>Remaining: add partition-offset-aware support for seed configs without requiring <code>input_dataset</code>.</li>
-          <li>Remaining: preflight model health checks on the driver and skip repeated worker checks.</li>
+          <li><span class="good">Done:</span> add automatic hidden row-id preservation for Ray inputs and from-scratch generation.</li>
+          <li><span class="good">Done:</span> preflight model health checks on the driver and skip repeated worker checks by default.</li>
+          <li>Remaining: add shuffled seed sampling for Ray seed configs without <code>input_dataset</code>.</li>
         </ul>
       </div>
       <div class="card">
         <h3>Phase 2: Worker Reuse</h3>
         <ul>
-          <li>Use Ray Data callable classes for <code>map_batches</code> so setup runs once per worker.</li>
-          <li>Reuse model client pools and resource providers per worker.</li>
-          <li>Replace temp artifact storage with an in-memory preview artifact abstraction where possible.</li>
-          <li>Broadcast immutable compiled configs instead of deep-copying builders repeatedly.</li>
+          <li><span class="good">Done:</span> use Ray Data callable classes for <code>map_batches</code> so setup runs once per worker.</li>
+          <li><span class="good">Done:</span> reuse model client pools and resource providers per worker.</li>
+          <li><span class="good">Done:</span> replace temp artifact storage with an in-memory preview artifact abstraction for preview generation.</li>
+          <li><span class="good">Done:</span> broadcast an immutable serialized execution payload instead of deep-copying builders repeatedly.</li>
         </ul>
       </div>
       <div class="card">
         <h3>Phase 3: Cluster Throughput</h3>
         <ul>
-          <li>Expose <code>override_num_blocks</code> / block planning controls.</li>
-          <li>Coordinate provider throttling globally across Ray workers.</li>
-          <li>Support actor placement, CPU/GPU/resource labels, and autoscaling-friendly defaults.</li>
-          <li>Extend Ray-native trace collection beyond the current compact execution metrics actor.</li>
+          <li><span class="good">Done:</span> expose <code>override_num_blocks</code> / block planning controls.</li>
+          <li><span class="good">Done:</span> coordinate provider throttling globally across Ray workers.</li>
+          <li><span class="good">Done:</span> support actor placement, CPU/GPU/resource labels, and autoscaling-friendly execution controls.</li>
+          <li><span class="good">Done:</span> extend Ray-native trace collection beyond the compact execution metrics actor with bounded worker events.</li>
         </ul>
       </div>
+    </div>
+    <div class="callout">
+      <strong>Global throttling design note:</strong> Ray now injects an actor-backed throttle manager proxy before
+      <code>ModelRegistry</code> registers model facades, so <code>ThrottledModelClient</code> acquire/release calls
+      coordinate through one Ray-side state holder. Result metrics include the global throttle snapshot, while
+      observability artifacts can also surface worker-local throttle state when a local manager is used.
     </div>
     <div class="diagram" aria-label="Optimization roadmap">
       <svg viewBox="0 0 1100 260" role="img">
@@ -1062,8 +1070,9 @@ ray_dataset_out = results.load_dataset()</pre>
         model clients and DataDesigner resources once per worker process.
       </li>
       <li>
-        <strong>Extend the distributed metrics channel.</strong> Add validation counts, retry attribution, task traces,
-        and profiler artifact summaries on top of the current worker usage and failed-block aggregation.
+        <strong>Extend the distributed metrics channel.</strong> Add validation counts, retry attribution, object-store
+        events, and cancellation context on top of the current worker usage, failed-block, trace, profile, and
+        throttle-snapshot aggregation.
       </li>
     </ol>
   </section>
