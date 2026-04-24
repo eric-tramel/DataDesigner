@@ -737,6 +737,80 @@ ray_dataset_out = results.load_dataset()</pre>
   </section>
 
   <section>
+    <h2>Review-Triggered Recipe Exercises</h2>
+    <p>
+      After review, the Ray backend was exercised in settings that would have exposed the seeded batching,
+      Arrow-ref materialization, and zero-row metrics bugs. These are correctness probes, not benchmark claims.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Concern</th>
+          <th>Recipe Exercise</th>
+          <th>Observed Result</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Seed configs restart at row 0 in each Ray batch</td>
+          <td>
+            <code>docs/assets/recipes/plugin_development/markdown_seed_reader.py</code>,
+            <code>batch_size=1</code>, 4 requested records, seed config retained and no
+            <code>input_dataset</code>.
+          </td>
+          <td>
+            Rejected before Ray batching with <code>RayBackendConfigurationError</code>. This avoids duplicated
+            first seed rows until partition-offset-aware seed reading exists.
+          </td>
+        </tr>
+        <tr>
+          <td>Supported seeded Ray path should preserve all seed rows</td>
+          <td>
+            Same markdown recipe, converted to in-memory Ray pandas refs, <code>output="arrow_refs"</code>,
+            <code>batch_size=1</code>, then <code>results.load_dataset()</code>.
+          </td>
+          <td>
+            4 input rows, 4 output rows, 4 Arrow refs, 0 duplicate <code>(relative_path, section_index)</code>
+            pairs. Metrics reported <code>total_rows=4</code>, <code>blocks=4</code>, and
+            <code>failed_blocks=0</code>.
+          </td>
+        </tr>
+        <tr>
+          <td>Arrow-ref output followed by dataset access must not re-run generation</td>
+          <td>
+            Markdown recipe Ray refs path and <code>text_to_python.py</code> with <code>openai-text</code> /
+            <code>gpt-4.1</code>, <code>NUM_RECORDS=4</code>, no max-token cap, <code>batch_size=1</code>,
+            <code>output="arrow_refs"</code>, followed by <code>load_dataset()</code>.
+          </td>
+          <td>
+            Metrics actor payload counts stayed stable before and after <code>load_dataset()</code>: 4 to 4 for
+            markdown and 4 to 4 for OpenAI. This indicates the dataset returned after Arrow refs is backed by the
+            materialized refs rather than the original lazy generation plan.
+          </td>
+        </tr>
+        <tr>
+          <td>Zero-row worker metrics must remain zero</td>
+          <td>
+            Empty markdown-recipe-shaped pandas ref through Ray with <code>output="arrow_refs"</code>.
+          </td>
+          <td>
+            0 output rows and metrics preserved <code>total_rows=0</code> with <code>blocks=1</code> and
+            <code>failed_blocks=0</code>.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>OpenAI Arrow-ref probe:</strong> the 4-row <code>text_to_python.py</code> exercise completed in
+      <code>103.853s</code>, generated 4 rows with 0 null output columns, and reported 4 Ray blocks, 0 failed blocks,
+      12 successful <code>gpt-4.1</code> requests, and 15,729 total tokens. Summed worker elapsed time was
+      <code>130.407s</code>.
+    </div>
+  </section>
+
+  <section>
     <h2>What We Learned</h2>
     <div class="grid">
       <div class="card wide">
@@ -759,7 +833,8 @@ ray_dataset_out = results.load_dataset()</pre>
         <h3>Returning refs works</h3>
         <p>
           The Ray backend can return Arrow ObjectRefs, so the output can remain in Ray object store instead of
-          materializing on the driver. This is essential for large-data jobs.
+          materializing on the driver. The result dataset is rebuilt from those materialized refs, so later
+          <code>load_dataset()</code> calls do not re-run generation.
         </p>
       </div>
       <div class="card wide">
@@ -781,6 +856,7 @@ ray_dataset_out = results.load_dataset()</pre>
       <li><strong>Profiler artifact gap:</strong> Ray results are Ray-resident and <code>load_analysis()</code> currently returns <code>None</code>. Full profiler artifact generation remains future distributed/Ray-native work.</li>
       <li><strong>Execution metrics aggregation:</strong> worker row counts, block counts, failed-block counts, elapsed seconds, and model-usage stats now flow through a Ray-side metrics actor into the result object.</li>
       <li><strong>Ordering:</strong> output row order can differ from input order unless explicitly preserved.</li>
+      <li><strong>Seed configs without input datasets:</strong> Ray rejects this mode until seed readers support partition offsets. Use in-memory Ray inputs for seeded Ray jobs today.</li>
       <li><strong>From-scratch partitioning:</strong> <code>ray.data.range(num_records)</code> needs explicit block planning for high throughput.</li>
       <li><strong>Processor side effects:</strong> processors that write side artifacts were built for local storage and need clearer Ray semantics.</li>
       <li><strong>Secrets and trust boundary:</strong> provider config and secret resolvers are serialized to workers. That is normal for trusted Ray clusters, but should be documented.</li>
@@ -816,8 +892,8 @@ ray_dataset_out = results.load_dataset()</pre>
           <td>
             Local and Ray runs can be compared by logical row id with no duplicate or missing ids; supported pandas,
             Arrow, Ray Dataset, and Arrow ObjectRef paths preserve expected schema and null behavior or fail with a
-            normalized DataDesigner error; repeated seeded Ray runs remain deterministic for the same config and
-            partitioning.
+            normalized DataDesigner error. Ray currently rejects seed configs without <code>input_dataset</code>;
+            partition-offset-aware seeded Ray generation remains future work.
           </td>
         </tr>
         <tr>
@@ -831,7 +907,8 @@ ray_dataset_out = results.load_dataset()</pre>
           <td>
             Ray execution succeeds after a local seeded run in the same process; seed readers sent to workers contain
             no live DuckDB connections, file handles, or attached source state; unsupported objects fail during driver
-            preflight before any Ray task is launched.
+            preflight before any Ray task is launched. The markdown recipe exercise confirms unsupported seed configs
+            are rejected before Ray batching.
           </td>
         </tr>
         <tr>
@@ -862,6 +939,7 @@ ray_dataset_out = results.load_dataset()</pre>
             task/block context when available; model usage, row counts, and failed-block summaries are aggregated
             deterministically and exposed through the result interface. Validation counts, retry attribution, and full
             distributed profiler artifacts remain future work rather than part of the initial Phase D metrics channel.
+            Zero-row worker metrics are preserved rather than replaced with driver-requested row counts.
           </td>
         </tr>
         <tr>
@@ -910,6 +988,7 @@ ray_dataset_out = results.load_dataset()</pre>
         <h3>Phase 1: Correctness Hardening</h3>
         <ul>
           <li>Add stable row-id preservation for Ray inputs and from-scratch generation.</li>
+          <li>Add partition-offset-aware support for seed configs without requiring <code>input_dataset</code>.</li>
           <li>Reject or document processors with unsupported distributed side effects.</li>
           <li>Preflight model health checks on the driver and skip repeated worker checks.</li>
           <li>Add tests for ordering, ObjectRef input formats, and same-process local-then-Ray execution.</li>
@@ -966,6 +1045,10 @@ ray_dataset_out = results.load_dataset()</pre>
         <code>scripts/benchmarks/</code>, parameterize provider/model/record counts, and emit JSON plus HTML.
       </li>
       <li>
+        <strong>Implement partition-offset-aware seed support.</strong> Either teach seed readers to accept
+        per-block offsets/selections or compile seeded jobs into explicit Ray input datasets before worker mapping.
+      </li>
+      <li>
         <strong>Make block planning explicit.</strong> Add <code>num_blocks</code> or <code>target_block_size</code>
         options to <code>RayBackend</code> and use Ray APIs to avoid accidental tiny blocks.
       </li>
@@ -976,10 +1059,6 @@ ray_dataset_out = results.load_dataset()</pre>
       <li>
         <strong>Extend the distributed metrics channel.</strong> Add validation counts, retry attribution, task traces,
         and profiler artifact summaries on top of the current worker usage and failed-block aggregation.
-      </li>
-      <li>
-        <strong>Define order semantics.</strong> Either document unordered output or preserve a hidden row id and
-        optionally sort on output.
       </li>
     </ol>
   </section>
@@ -995,23 +1074,23 @@ ray_dataset_out = results.load_dataset()</pre>
       </thead>
       <tbody>
         <tr>
-          <td><code>uv run pytest packages/data-designer/tests/integrations/ray/test_backend.py -q</code></td>
-          <td><span class="good">6 passed</span></td>
-        </tr>
-        <tr>
           <td><code>uv run pytest packages/data-designer/tests/integrations/ray -q</code></td>
-          <td><span class="good">40 passed, 1 skipped</span></td>
+          <td><span class="good">43 passed, 1 skipped</span></td>
         </tr>
         <tr>
-          <td><code>uv run pytest packages/data-designer-engine/tests/engine/dataset_builders/test_dataset_builder.py -q</code></td>
-          <td><span class="good">59 passed</span></td>
+          <td><code>uv run pytest packages/data-designer-engine/tests/engine/dataset_builders/test_dataset_builder.py packages/data-designer/tests/interface/test_data_designer.py packages/data-designer/tests/interface/test_results.py -q</code></td>
+          <td><span class="good">117 passed</span></td>
         </tr>
         <tr>
-          <td><code>uv run pytest packages/data-designer/tests/interface/test_data_designer.py packages/data-designer/tests/interface/test_results.py -q</code></td>
-          <td><span class="good">58 passed</span></td>
+          <td><code>uv run ruff check packages/data-designer/src/data_designer/integrations/ray packages/data-designer/tests/integrations/ray</code></td>
+          <td><span class="good">passed</span></td>
         </tr>
         <tr>
-          <td><code>uv run ruff check ...</code></td>
+          <td><code>uv run ruff format --check packages/data-designer/src/data_designer/integrations/ray packages/data-designer/tests/integrations/ray</code></td>
+          <td><span class="good">passed</span></td>
+        </tr>
+        <tr>
+          <td><code>HTMLParser().feed(reports/ray_backend_architecture_report.html)</code></td>
           <td><span class="good">passed</span></td>
         </tr>
         <tr>
@@ -1021,6 +1100,14 @@ ray_dataset_out = results.load_dataset()</pre>
         <tr>
           <td><code>./.venv/bin/python /tmp/dd_docs_text_to_python_ray_128.py</code></td>
           <td><span class="good">128 generated rows, 8 Ray blocks, 0 failed blocks, non-null OpenAI usage metrics</span></td>
+        </tr>
+        <tr>
+          <td><code>./.venv/bin/python /tmp/dd_markdown_ray_review_exercise.py</code></td>
+          <td><span class="good">seeded Ray guard, Arrow-ref load_dataset no-rerun, and zero-row metrics passed</span></td>
+        </tr>
+        <tr>
+          <td><code>./.venv/bin/python /tmp/dd_text_to_python_arrow_refs_review_exercise.py</code></td>
+          <td><span class="good">4 OpenAI rows, 4 Ray blocks, 0 failed blocks, no Arrow-ref rerun</span></td>
         </tr>
       </tbody>
     </table>
@@ -1032,8 +1119,8 @@ ray_dataset_out = results.load_dataset()</pre>
       The architecture is now in the right shape: Ray is an optional interface-level backend, not a cross-cutting
       dependency, and the engine remains reusable through an explicit async execution selector. The current Ray path
       proves the in-memory contract end to end, but it is still a first functional backend, not an optimized distributed
-      runtime. The highest-leverage next step is worker reuse, followed by explicit partition planning and richer
-      distributed tracing/profiling.
+      runtime. The highest-leverage next step is partition-offset-aware seeded execution, followed by worker reuse,
+      explicit partition planning, and richer distributed tracing/profiling.
     </p>
   </section>
 </main>
