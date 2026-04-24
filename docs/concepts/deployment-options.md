@@ -145,6 +145,28 @@ When users can submit configs containing Jinja templates to a shared engine, tem
 
 ---
 
+## Ray Backend Trusted-Cluster Boundary
+
+The optional Ray backend is a library scaling mode for trusted Ray clusters. It serializes the job configuration,
+model provider definitions, secret resolver state, seed-reader state, MCP provider definitions, and runtime settings
+to Ray workers so each worker can construct its local generation engine.
+
+Use Ray only when the driver and workers are inside the same trusted operational boundary, such as a single-tenant
+cluster or a managed cluster with equivalent isolation. A Ray worker may receive provider endpoint configuration and
+may be able to resolve API keys through the configured `SecretResolver` or worker environment. Treat every Ray worker
+that can run the job as trusted with the same access level as the driver process.
+
+Avoid running the Ray backend on shared clusters where untrusted users can inspect task payloads, object-store data,
+worker logs, runtime environments, or process environment variables. If you must use shared infrastructure, add
+platform controls outside Data Designer: tenant-isolated Ray clusters, scoped service accounts, restricted dashboard
+and log access, network policies around provider endpoints, and secret management that grants only the workers for a
+single job access to the required keys.
+
+The Ray backend does not turn Data Designer into a multi-tenant service boundary. For shared service deployments,
+prefer a service architecture with explicit authentication, authorization, audit logging, and request validation.
+
+---
+
 ## 🧭 Decision Flowchart
 
 ```

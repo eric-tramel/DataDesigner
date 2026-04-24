@@ -6,8 +6,10 @@ from __future__ import annotations
 import copy
 import importlib
 import os
+import socket
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
@@ -25,7 +27,21 @@ from data_designer.engine.resources.seed_reader import SeedReader, SeedReaderReg
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
-from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics, aggregate_ray_metrics
+from data_designer.integrations.ray.metrics import (
+    RayDatasetMetrics,
+    RayWorkerMetrics,
+    aggregate_ray_metrics,
+    normalize_ray_worker_metrics,
+)
+from data_designer.integrations.ray.observability import (
+    RayDatasetAnalysis,
+    RayThrottleSnapshot,
+    RayTraceEvent,
+    RayWorkerProfile,
+    normalize_ray_throttle_snapshot,
+    normalize_ray_trace_event,
+    normalize_ray_worker_profile,
+)
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -48,6 +64,12 @@ class _RayWorkerOptions:
     run_config: RunConfig
 
 
+@dataclass(frozen=True)
+class _RayObservabilityOptions:
+    profile_workers: bool = False
+    trace_enabled: bool = False
+
+
 class RayDatasetCreationResults:
     """Results wrapper for Ray-resident Data Designer outputs."""
 
@@ -60,22 +82,26 @@ class RayDatasetCreationResults:
         ray: Any | None = None,
         metrics_collector: Any | None = None,
         output: Any | None = None,
+        observability_options: _RayObservabilityOptions | None = None,
     ) -> None:
         self.dataset = dataset
         self._config_builder = config_builder
         self._driver_metrics = metrics
         self._metrics_cache: RayDatasetMetrics | None = None
+        self._worker_metrics_cache: list[RayWorkerMetrics] | None = None
+        self._analysis_cache: RayDatasetAnalysis | None = None
         self._ray = ray
         self._metrics_collector = metrics_collector
         self._output = output
+        self._observability_options = observability_options or _RayObservabilityOptions()
 
     def load_dataset(self) -> Any:
         """Return the Ray Dataset without materializing it on the driver."""
         return self.dataset
 
-    def load_analysis(self) -> None:
-        """Ray-resident jobs do not produce local profiler artifacts."""
-        return None
+    def load_analysis(self) -> RayDatasetAnalysis | None:
+        """Return Ray-native worker profiles and bounded traces when available."""
+        return self.load_observability()
 
     def load_metrics(self) -> RayDatasetMetrics:
         """Return driver-visible Ray execution metrics."""
@@ -84,22 +110,80 @@ class RayDatasetCreationResults:
         if self._ray is None or self._metrics_collector is None:
             return self._driver_metrics
         try:
-            payloads = self._ray.get(self._metrics_collector.snapshot.remote())
-            if not payloads:
-                self._materialize_dataset_for_metrics()
-                payloads = self._ray.get(self._metrics_collector.snapshot.remote())
+            worker_metrics_payloads = self._load_worker_metrics_payloads()
         except Exception as exc:
             raise RayDatasetGenerationError("RayBackend failed to load worker metrics.") from exc
-        if not payloads:
+        if not worker_metrics_payloads:
             return self._driver_metrics
-        worker_metrics = aggregate_ray_metrics(payloads)
+        worker_metrics = aggregate_ray_metrics(worker_metrics_payloads)
         self._metrics_cache = _merge_driver_and_worker_metrics(self._driver_metrics, worker_metrics)
         return self._metrics_cache
+
+    def load_worker_metrics(self) -> list[RayWorkerMetrics]:
+        """Return per-worker metrics payloads before dataset-level aggregation."""
+        if self._ray is None or self._metrics_collector is None:
+            return []
+        try:
+            return list(self._load_worker_metrics_payloads())
+        except Exception as exc:
+            raise RayDatasetGenerationError("RayBackend failed to load worker metrics.") from exc
+
+    def load_observability(self) -> RayDatasetAnalysis | None:
+        """Return bounded Ray-native profiles, traces, and worker-local throttle snapshots."""
+        if self._analysis_cache is not None:
+            return self._analysis_cache
+        if self._ray is None or self._metrics_collector is None:
+            return None
+        try:
+            payload = self._load_observability_payload()
+        except Exception as exc:
+            raise RayDatasetGenerationError("RayBackend failed to load Ray observability artifacts.") from exc
+        if not _has_observability_payload(payload):
+            return None
+
+        metrics = self.load_metrics()
+        worker_profiles = [
+            normalize_ray_worker_profile(profile) for profile in payload.get("worker_profiles", []) or []
+        ]
+        trace_events = [normalize_ray_trace_event(event) for event in payload.get("trace_events", []) or []]
+        throttle_snapshots = [
+            normalize_ray_throttle_snapshot(snapshot) for snapshot in payload.get("throttle_snapshots", []) or []
+        ]
+        self._analysis_cache = RayDatasetAnalysis(
+            total_rows=metrics.total_rows,
+            blocks=metrics.blocks,
+            failed_blocks=metrics.failed_blocks,
+            worker_profiles=worker_profiles,
+            trace_events=trace_events,
+            trace_events_dropped=int(payload.get("trace_events_dropped", 0) or 0),
+            throttle_snapshots=throttle_snapshots,
+        )
+        return self._analysis_cache
 
     @property
     def metrics(self) -> RayDatasetMetrics:
         """Return the latest available Ray execution metrics."""
         return self.load_metrics()
+
+    def _load_worker_metrics_payloads(self) -> list[RayWorkerMetrics]:
+        if self._worker_metrics_cache is not None:
+            return self._worker_metrics_cache
+        payloads = self._ray.get(self._metrics_collector.snapshot.remote())
+        if not payloads:
+            self._materialize_dataset_for_metrics()
+            payloads = self._ray.get(self._metrics_collector.snapshot.remote())
+        self._worker_metrics_cache = [normalize_ray_worker_metrics(payload) for payload in payloads]
+        return self._worker_metrics_cache
+
+    def _load_observability_payload(self) -> dict[str, Any]:
+        observability_snapshot = getattr(self._metrics_collector, "observability_snapshot", None)
+        if observability_snapshot is None:
+            return {}
+        payload = self._ray.get(observability_snapshot.remote())
+        if not _has_observability_payload(payload):
+            self._load_worker_metrics_payloads()
+            payload = self._ray.get(observability_snapshot.remote())
+        return dict(payload)
 
     def _materialize_dataset_for_metrics(self) -> None:
         materialize = getattr(self.dataset, "materialize", None)
@@ -144,6 +228,9 @@ class RayBackend:
         drop_order_column: bool = False,
         preserve_order: bool = False,
         allow_unsafe_processors: bool = False,
+        profile_workers: bool = True,
+        trace_enabled: bool = False,
+        max_trace_events: int = 1000,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
             raise ValueError("RayBackend output must be 'dataset' or 'arrow_refs'.")
@@ -151,6 +238,8 @@ class RayBackend:
             raise ValueError("RayBackend object_ref_format must be 'arrow' or 'pandas'.")
         if order_column is not None and order_column == "":
             raise ValueError("RayBackend order_column must be a non-empty string when provided.")
+        if max_trace_events < 0:
+            raise ValueError("RayBackend max_trace_events must be non-negative.")
         self.batch_size = batch_size
         self.output = output
         self.object_ref_format = object_ref_format
@@ -161,6 +250,9 @@ class RayBackend:
         self.drop_order_column = drop_order_column
         self.preserve_order = preserve_order
         self.allow_unsafe_processors = allow_unsafe_processors
+        self.profile_workers = profile_workers
+        self.trace_enabled = trace_enabled
+        self.max_trace_events = max_trace_events
 
     def create(
         self,
@@ -203,8 +295,12 @@ class RayBackend:
 
         dataset = self._resolve_input_dataset(ray, input_dataset=input_dataset, num_records=num_records)
         input_blocks = _get_num_blocks(dataset)
-        metrics_collector = _create_metrics_collector(ray)
+        metrics_collector = _create_metrics_collector(ray, max_trace_events=self.max_trace_events)
         batch_size = self.batch_size or data_designer._run_config.buffer_size
+        observability_options = _RayObservabilityOptions(
+            profile_workers=self.profile_workers,
+            trace_enabled=self.trace_enabled,
+        )
         worker_options = _RayWorkerOptions(
             model_providers=list(data_designer._model_providers),
             default_provider_name=data_designer._model_provider_registry.get_default_provider_name(),
@@ -222,6 +318,7 @@ class RayBackend:
                 "worker_options": worker_options,
                 "use_input_dataset": use_input_dataset,
                 "metrics_collector": metrics_collector,
+                "observability_options": observability_options,
             },
             "batch_size": batch_size,
             "batch_format": "pandas",
@@ -253,6 +350,7 @@ class RayBackend:
             ray=ray,
             metrics_collector=metrics_collector,
             output=output,
+            observability_options=observability_options,
         )
 
     def _resolve_input_dataset(self, ray: Any, *, input_dataset: Any | None, num_records: int) -> Any:
@@ -317,21 +415,48 @@ def _dataset_from_arrow_refs(ray: Any, refs: list[Any]) -> Any:
 
 
 class _RayMetricsCollector:
-    def __init__(self) -> None:
+    def __init__(self, max_trace_events: int = 1000) -> None:
         self._payloads: list[dict[str, Any]] = []
+        self._worker_profiles: list[dict[str, Any]] = []
+        self._trace_events: list[dict[str, Any]] = []
+        self._trace_events_dropped = 0
+        self._throttle_snapshots: list[dict[str, Any]] = []
+        self._max_trace_events = max_trace_events
 
     def record(self, payload: dict[str, Any]) -> None:
         self._payloads.append(payload)
 
+    def record_observability(self, payload: dict[str, Any]) -> None:
+        profile = payload.get("worker_profile")
+        if isinstance(profile, dict):
+            self._worker_profiles.append(profile)
+        for event in payload.get("trace_events", []) or []:
+            if len(self._trace_events) >= self._max_trace_events:
+                self._trace_events_dropped += 1
+                continue
+            if isinstance(event, dict):
+                self._trace_events.append(event)
+        for snapshot in payload.get("throttle_snapshots", []) or []:
+            if isinstance(snapshot, dict):
+                self._throttle_snapshots.append(snapshot)
+
     def snapshot(self) -> list[dict[str, Any]]:
         return list(self._payloads)
 
+    def observability_snapshot(self) -> dict[str, Any]:
+        return {
+            "worker_profiles": list(self._worker_profiles),
+            "trace_events": list(self._trace_events),
+            "trace_events_dropped": self._trace_events_dropped,
+            "throttle_snapshots": list(self._throttle_snapshots),
+        }
 
-def _create_metrics_collector(ray: Any) -> Any | None:
+
+def _create_metrics_collector(ray: Any, *, max_trace_events: int = 1000) -> Any | None:
     remote = getattr(ray, "remote", None)
     if not callable(remote):
         return None
-    return remote(_RayMetricsCollector).remote()
+    return remote(_RayMetricsCollector).remote(max_trace_events=max_trace_events)
 
 
 def _merge_driver_and_worker_metrics(
@@ -366,15 +491,54 @@ def _generate_batch(
     worker_options: _RayWorkerOptions,
     use_input_dataset: bool,
     metrics_collector: Any | None = None,
+    observability_options: _RayObservabilityOptions | None = None,
 ) -> Any:
     start_time = time.perf_counter()
+    block_id = uuid.uuid4().hex
+    observability_options = observability_options or _RayObservabilityOptions()
+    worker_context = _get_ray_worker_context()
+    trace_events: list[RayTraceEvent] = []
     os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
     dataframe = _coerce_pandas_dataframe(batch)
     num_records = len(dataframe)
+    if observability_options.trace_enabled:
+        trace_events.append(
+            _create_trace_event(
+                block_id,
+                "block_started",
+                start_time,
+                row_count=num_records,
+                worker_context=worker_context,
+                details={"input_columns": [str(column) for column in dataframe.columns]},
+            )
+        )
     if num_records == 0:
+        elapsed_seconds = time.perf_counter() - start_time
+        profile = (
+            _profile_worker_output(dataframe, block_id=block_id, model_usage=None)
+            if observability_options.profile_workers
+            else None
+        )
+        if observability_options.trace_enabled:
+            trace_events.append(
+                _create_trace_event(
+                    block_id,
+                    "block_completed",
+                    start_time,
+                    row_count=0,
+                    worker_context=worker_context,
+                    details={"empty_batch": True},
+                )
+            )
         _record_worker_metrics(
             metrics_collector,
-            RayWorkerMetrics(total_rows=0, blocks=1, elapsed_seconds=time.perf_counter() - start_time),
+            RayWorkerMetrics(total_rows=0, blocks=1, elapsed_seconds=elapsed_seconds, block_id=block_id),
+        )
+        _record_worker_observability(
+            metrics_collector,
+            worker_profile=profile,
+            trace_events=trace_events,
+            throttle_snapshots=[],
         )
         return dataframe
 
@@ -384,8 +548,21 @@ def _generate_batch(
             block_builder.with_seed_dataset(DataFrameSeedSource(df=dataframe.copy()))
 
         with tempfile.TemporaryDirectory(prefix="data-designer-ray-") as artifact_dir:
+            if observability_options.trace_enabled:
+                trace_events.append(
+                    _create_trace_event(
+                        block_id,
+                        "resource_setup_started",
+                        start_time,
+                        row_count=num_records,
+                        worker_context=worker_context,
+                    )
+                )
             ArtifactStorage.mkdir_if_needed(Path(artifact_dir))
             seed_readers = copy.deepcopy(worker_options.seed_readers)
+            run_config = copy.deepcopy(worker_options.run_config)
+            if observability_options.trace_enabled:
+                run_config.async_trace = True
             resource_provider = create_resource_provider(
                 artifact_storage=ArtifactStorage(artifact_path=artifact_dir, dataset_name="ray-block"),
                 model_configs=block_builder.model_configs,
@@ -399,7 +576,7 @@ def _generate_batch(
                 seed_dataset_source=(
                     block_builder.get_seed_config().source if block_builder.get_seed_config() is not None else None
                 ),
-                run_config=copy.deepcopy(worker_options.run_config),
+                run_config=run_config,
                 mcp_providers=worker_options.mcp_providers,
                 tool_configs=block_builder.tool_configs,
             )
@@ -408,20 +585,81 @@ def _generate_batch(
                 resource_provider=resource_provider,
                 use_async=True,
             )
+            if observability_options.trace_enabled:
+                trace_events.append(
+                    _create_trace_event(
+                        block_id,
+                        "resource_setup_completed",
+                        start_time,
+                        row_count=num_records,
+                        worker_context=worker_context,
+                    )
+                )
+                trace_events.append(
+                    _create_trace_event(
+                        block_id,
+                        "generation_started",
+                        start_time,
+                        row_count=num_records,
+                        worker_context=worker_context,
+                    )
+                )
             raw_dataset = builder.build_preview(num_records=num_records)
             output = builder.process_preview(raw_dataset)
             elapsed_seconds = time.perf_counter() - start_time
+            model_usage = resource_provider.model_registry.get_model_usage_stats(elapsed_seconds)
+            if observability_options.trace_enabled:
+                trace_events.extend(
+                    _task_traces_to_events(
+                        builder.task_traces,
+                        block_id=block_id,
+                        worker_context=worker_context,
+                    )
+                )
+                trace_events.append(
+                    _create_trace_event(
+                        block_id,
+                        "block_completed",
+                        start_time,
+                        row_count=len(output),
+                        worker_context=worker_context,
+                        details={"output_columns": [str(column) for column in output.columns]},
+                    )
+                )
+            throttle_snapshots = _snapshot_worker_throttle(resource_provider.model_registry.throttle_manager)
             _record_worker_metrics(
                 metrics_collector,
                 RayWorkerMetrics(
                     total_rows=len(output),
                     blocks=1,
                     elapsed_seconds=elapsed_seconds,
-                    model_usage=resource_provider.model_registry.get_model_usage_stats(elapsed_seconds),
+                    model_usage=model_usage,
+                    block_id=block_id,
                 ),
             )
+            _record_worker_observability(
+                metrics_collector,
+                worker_profile=(
+                    _profile_worker_output(output, block_id=block_id, model_usage=model_usage)
+                    if observability_options.profile_workers
+                    else None
+                ),
+                trace_events=trace_events,
+                throttle_snapshots=throttle_snapshots,
+            )
             return output
-    except Exception:
+    except Exception as exc:
+        if observability_options.trace_enabled:
+            trace_events.append(
+                _create_trace_event(
+                    block_id,
+                    "block_failed",
+                    start_time,
+                    row_count=num_records,
+                    worker_context=worker_context,
+                    details={"error_type": type(exc).__name__, "error": str(exc)},
+                )
+            )
         _record_worker_metrics(
             metrics_collector,
             RayWorkerMetrics(
@@ -429,15 +667,213 @@ def _generate_batch(
                 blocks=1,
                 failed_blocks=1,
                 elapsed_seconds=time.perf_counter() - start_time,
+                block_id=block_id,
             ),
         )
+        _record_worker_observability(
+            metrics_collector,
+            worker_profile=None,
+            trace_events=trace_events,
+            throttle_snapshots=[],
+        )
         raise
+
+
+def _record_worker_observability(
+    metrics_collector: Any | None,
+    *,
+    worker_profile: RayWorkerProfile | None,
+    trace_events: list[RayTraceEvent],
+    throttle_snapshots: list[RayThrottleSnapshot],
+) -> None:
+    if metrics_collector is None:
+        return
+    payload = {
+        "worker_profile": worker_profile.to_dict() if worker_profile is not None else None,
+        "trace_events": [event.to_dict() for event in trace_events],
+        "throttle_snapshots": [snapshot.to_dict() for snapshot in throttle_snapshots],
+    }
+    importlib.import_module("ray").get(metrics_collector.record_observability.remote(payload))
 
 
 def _record_worker_metrics(metrics_collector: Any | None, metrics: RayWorkerMetrics) -> None:
     if metrics_collector is None:
         return
     importlib.import_module("ray").get(metrics_collector.record.remote(metrics.to_dict()))
+
+
+def _profile_worker_output(
+    output: Any, *, block_id: str, model_usage: dict[str, dict[str, Any]] | None
+) -> RayWorkerProfile:
+    warnings: list[str] = []
+    try:
+        columns = [str(column) for column in output.columns]
+        column_dtypes = {str(column): str(dtype) for column, dtype in output.dtypes.items()}
+        non_null_counts = {str(column): int(value) for column, value in output.notna().sum().to_dict().items()}
+        null_counts = {str(column): int(value) for column, value in output.isna().sum().to_dict().items()}
+        memory_usage_bytes = int(output.memory_usage(deep=True).sum())
+    except Exception as exc:
+        columns = []
+        column_dtypes = {}
+        non_null_counts = {}
+        null_counts = {}
+        memory_usage_bytes = None
+        warnings.append(f"Failed to profile Ray worker output: {type(exc).__name__}: {exc}")
+    return RayWorkerProfile(
+        block_id=block_id,
+        total_rows=len(output),
+        columns=columns,
+        column_dtypes=column_dtypes,
+        non_null_counts=non_null_counts,
+        null_counts=null_counts,
+        memory_usage_bytes=memory_usage_bytes,
+        model_usage=model_usage,
+        warnings=warnings,
+    )
+
+
+def _snapshot_worker_throttle(throttle_manager: Any | None) -> list[RayThrottleSnapshot]:
+    if throttle_manager is None:
+        return []
+    domains = getattr(throttle_manager, "_domains", None)
+    if not isinstance(domains, dict):
+        return []
+    get_effective_max = getattr(throttle_manager, "get_effective_max", None)
+    snapshots: list[RayThrottleSnapshot] = []
+    for key, state in domains.items():
+        if not isinstance(key, tuple) or len(key) != 3:
+            continue
+        provider_name, model_id, domain = key
+        if not all(isinstance(value, str) for value in (provider_name, model_id, domain)):
+            continue
+        effective_max = get_effective_max(provider_name, model_id) if callable(get_effective_max) else None
+        snapshots.append(
+            RayThrottleSnapshot(
+                provider_name=provider_name,
+                model_id=model_id,
+                domain=domain,
+                current_limit=_safe_int_attr(state, "current_limit"),
+                effective_max=effective_max,
+                in_flight=_safe_int_attr(state, "in_flight"),
+                waiters=_safe_int_attr(state, "waiters"),
+                rate_limit_ceiling=_safe_int_attr(state, "rate_limit_ceiling"),
+                consecutive_rate_limits=_safe_int_attr(state, "consecutive_429s"),
+            )
+        )
+    return snapshots
+
+
+def _task_traces_to_events(
+    task_traces: list[Any],
+    *,
+    block_id: str,
+    worker_context: dict[str, Any],
+) -> list[RayTraceEvent]:
+    events: list[RayTraceEvent] = []
+    for task_trace in task_traces:
+        dispatched_at = _safe_float_attr(task_trace, "dispatched_at")
+        slot_acquired_at = _safe_float_attr(task_trace, "slot_acquired_at")
+        completed_at = _safe_float_attr(task_trace, "completed_at")
+        elapsed_seconds = max(completed_at - dispatched_at, 0.0) if completed_at > 0 and dispatched_at > 0 else 0.0
+        wait_seconds = max(slot_acquired_at - dispatched_at, 0.0) if slot_acquired_at > 0 and dispatched_at > 0 else 0.0
+        run_seconds = max(completed_at - slot_acquired_at, 0.0) if completed_at > 0 and slot_acquired_at > 0 else 0.0
+        events.append(
+            RayTraceEvent(
+                block_id=block_id,
+                event_type="engine_task",
+                timestamp_seconds=time.time(),
+                elapsed_seconds=elapsed_seconds,
+                row_count=0,
+                worker_hostname=worker_context["worker_hostname"],
+                worker_pid=worker_context["worker_pid"],
+                ray_task_id=worker_context.get("ray_task_id"),
+                ray_node_id=worker_context.get("ray_node_id"),
+                details={
+                    "column": getattr(task_trace, "column", None),
+                    "row_group": getattr(task_trace, "row_group", None),
+                    "row_index": getattr(task_trace, "row_index", None),
+                    "task_type": getattr(task_trace, "task_type", None),
+                    "status": getattr(task_trace, "status", None),
+                    "error": getattr(task_trace, "error", None),
+                    "queue_wait_seconds": wait_seconds,
+                    "run_seconds": run_seconds,
+                },
+            )
+        )
+    return events
+
+
+def _create_trace_event(
+    block_id: str,
+    event_type: str,
+    start_time: float,
+    *,
+    row_count: int,
+    worker_context: dict[str, Any],
+    details: dict[str, Any] | None = None,
+) -> RayTraceEvent:
+    return RayTraceEvent(
+        block_id=block_id,
+        event_type=event_type,
+        timestamp_seconds=time.time(),
+        elapsed_seconds=time.perf_counter() - start_time,
+        row_count=row_count,
+        worker_hostname=worker_context["worker_hostname"],
+        worker_pid=worker_context["worker_pid"],
+        ray_task_id=worker_context.get("ray_task_id"),
+        ray_node_id=worker_context.get("ray_node_id"),
+        details=details,
+    )
+
+
+def _get_ray_worker_context() -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "worker_hostname": socket.gethostname(),
+        "worker_pid": os.getpid(),
+        "ray_task_id": None,
+        "ray_node_id": None,
+    }
+    try:
+        ray = importlib.import_module("ray")
+        get_runtime_context = getattr(ray, "get_runtime_context", None)
+        runtime_context = get_runtime_context() if callable(get_runtime_context) else None
+    except Exception:
+        runtime_context = None
+    if runtime_context is None:
+        return context
+    context["ray_task_id"] = _runtime_context_value(runtime_context, "get_task_id")
+    context["ray_node_id"] = _runtime_context_value(runtime_context, "get_node_id")
+    return context
+
+
+def _runtime_context_value(runtime_context: Any, method_name: str) -> str | None:
+    method = getattr(runtime_context, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        value = method()
+    except Exception:
+        return None
+    return str(value) if value is not None else None
+
+
+def _safe_int_attr(value: Any, attr_name: str) -> int:
+    attr = getattr(value, attr_name, 0)
+    return attr if isinstance(attr, int) and not isinstance(attr, bool) and attr >= 0 else 0
+
+
+def _safe_float_attr(value: Any, attr_name: str) -> float:
+    attr = getattr(value, attr_name, 0.0)
+    return float(attr) if isinstance(attr, (int, float)) and not isinstance(attr, bool) and attr >= 0 else 0.0
+
+
+def _has_observability_payload(payload: dict[str, Any]) -> bool:
+    return bool(
+        payload.get("worker_profiles")
+        or payload.get("trace_events")
+        or payload.get("trace_events_dropped")
+        or payload.get("throttle_snapshots")
+    )
 
 
 def _coerce_pandas_dataframe(batch: Any) -> Any:

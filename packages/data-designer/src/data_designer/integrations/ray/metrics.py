@@ -22,12 +22,15 @@ class RayWorkerMetrics:
     failed_blocks: int = 0
     elapsed_seconds: float = 0.0
     model_usage: ModelUsageSummary | None = None
+    block_id: str | None = None
 
     def __post_init__(self) -> None:
         _validate_non_negative_int("total_rows", self.total_rows)
         _validate_non_negative_int("blocks", self.blocks)
         _validate_non_negative_int("failed_blocks", self.failed_blocks)
         _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
+        if self.block_id is not None and not isinstance(self.block_id, str):
+            raise RayMetricsError("Ray metrics field 'block_id' must be a string when provided.")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -113,6 +116,7 @@ def normalize_ray_worker_metrics(payload: RayMetricsPayload) -> RayWorkerMetrics
             failed_blocks=payload.failed_blocks,
             elapsed_seconds=payload.elapsed_seconds,
             model_usage=payload.model_usage,
+            block_id=None,
         )
     if isinstance(payload, RayWorkerMetrics):
         return payload
@@ -125,6 +129,7 @@ def normalize_ray_worker_metrics(payload: RayMetricsPayload) -> RayWorkerMetrics
         failed_blocks=_coerce_int(payload, "failed_blocks", default=0),
         elapsed_seconds=_coerce_float(payload, "elapsed_seconds", default=0.0),
         model_usage=_coerce_model_usage(payload.get("model_usage")),
+        block_id=_coerce_optional_str(payload.get("block_id")),
     )
 
 
@@ -156,6 +161,14 @@ def _coerce_model_usage(value: Any) -> ModelUsageSummary | None:
             raise RayMetricsError(f"Ray metrics model usage for {model_name!r} must be a mapping.")
         model_usage[model_name] = dict(stats)
     return model_usage
+
+
+def _coerce_optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RayMetricsError("Ray metrics field 'block_id' must be a string when provided.")
+    return value
 
 
 def _validate_non_negative_int(field_name: str, value: int) -> None:
