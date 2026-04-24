@@ -30,8 +30,7 @@ class FakeRayDataset:
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         self.map_batches_kwargs = kwargs
-        fn_kwargs = kwargs.get("fn_kwargs") or {}
-        return FakeRayDataset([fn(block, **fn_kwargs) for block in self.blocks])
+        return FakeRayDataset(_map_batches_blocks(fn, self.blocks, kwargs))
 
     def to_arrow_refs(self) -> list[str]:
         return [f"arrow-ref-{i}" for i, _ in enumerate(self.blocks)]
@@ -109,8 +108,7 @@ class CountingRayDataset:
             return self.blocks
         if self.map_fn is None:
             return self.parent._evaluate()
-        fn_kwargs = (self.map_kwargs or {}).get("fn_kwargs") or {}
-        return [self.map_fn(block, **fn_kwargs) for block in self.parent._evaluate()]
+        return _map_batches_blocks(self.map_fn, self.parent._evaluate(), self.map_kwargs or {})
 
 
 class CountingRayDataModule:
@@ -126,6 +124,13 @@ class CountingRayDataModule:
     def from_arrow_refs(self, refs: list[Any]) -> CountingRayDataset:
         self.from_arrow_refs_input = refs
         return CountingRayDataset([self.ref_blocks[ref] for ref in refs], self)
+
+
+def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
+    fn_kwargs = kwargs.get("fn_kwargs") or {}
+    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
+    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
+    return [map_fn(block, **fn_kwargs) for block in blocks]
 
 
 def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
@@ -193,6 +198,8 @@ def test_ray_backend_uses_input_dataset_as_in_memory_seed(
 
     assert input_dataset.map_batches_kwargs is not None
     assert input_dataset.map_batches_kwargs["num_cpus"] == 0.5
+    assert "fn_kwargs" not in input_dataset.map_batches_kwargs
+    assert input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"].use_input_dataset is True
     assert "ray_remote_args" not in input_dataset.map_batches_kwargs
     assert output_df.to_dict(orient="records") == [
         {"x": 1, "label": "a", "x_label": "1-a"},

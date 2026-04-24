@@ -27,8 +27,7 @@ class FakeRayDataset:
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         self.map_batches_kwargs = kwargs
-        fn_kwargs = kwargs.get("fn_kwargs") or {}
-        return FakeRayDataset([fn(block, **fn_kwargs) for block in self.blocks])
+        return FakeRayDataset(_map_batches_blocks(fn, self.blocks, kwargs))
 
     def to_pandas(self) -> lazy.pd.DataFrame:
         return lazy.pd.concat(self.blocks, ignore_index=True)
@@ -45,6 +44,13 @@ class FakeRayDataModule:
 
     def range(self, num_records: int) -> FakeRayDataset:
         return FakeRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
+
+
+def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
+    fn_kwargs = kwargs.get("fn_kwargs") or {}
+    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
+    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
+    return [map_fn(block, **fn_kwargs) for block in blocks]
 
 
 def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> None:
