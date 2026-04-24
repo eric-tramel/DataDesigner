@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
 import data_designer.lazy_heavy_imports as lazy
+from data_designer.config.column_configs import CustomColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.processors import ProcessorType
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
+from data_designer.engine.column_generators.utils.generator_classification import column_type_is_model_generated
 from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
 from data_designer.engine.model_provider import resolve_model_provider_registry
 from data_designer.engine.resources.person_reader import PersonReader, create_person_reader
@@ -26,6 +28,7 @@ from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics, aggregate_ray_metrics
+from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, RayMapConcurrency
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -140,6 +143,27 @@ class RayBackend:
         auto_init: bool = False,
         zero_copy_batch: bool = True,
         ray_remote_args: dict[str, Any] | None = None,
+        block_planning: RayBlockPlanning | None = None,
+        override_num_blocks: int | None = None,
+        target_block_size: int | None = None,
+        min_blocks: int | None = None,
+        max_blocks: int | None = None,
+        read_concurrency: int | None = None,
+        execution_options: RayExecutionOptions | None = None,
+        num_cpus: float | None = None,
+        num_gpus: float | None = None,
+        memory: float | None = None,
+        resources: dict[str, float] | None = None,
+        scheduling_strategy: Any | None = None,
+        compute: Any | None = None,
+        map_concurrency: RayMapConcurrency | None = None,
+        ray_remote_args_fn: Any | None = None,
+        use_actor_pool: bool = False,
+        actor_pool_min_size: int | None = None,
+        actor_pool_max_size: int | None = None,
+        actor_pool_initial_size: int | None = None,
+        preflight_model_health_check: bool = True,
+        worker_model_health_checks: bool = False,
         order_column: str | None = None,
         drop_order_column: bool = False,
         preserve_order: bool = False,
@@ -151,12 +175,38 @@ class RayBackend:
             raise ValueError("RayBackend object_ref_format must be 'arrow' or 'pandas'.")
         if order_column is not None and order_column == "":
             raise ValueError("RayBackend order_column must be a non-empty string when provided.")
+        self.block_planning = _resolve_block_planning(
+            block_planning,
+            override_num_blocks=override_num_blocks,
+            target_block_size=target_block_size,
+            min_blocks=min_blocks,
+            max_blocks=max_blocks,
+            read_concurrency=read_concurrency,
+        )
+        self.execution_options = _resolve_execution_options(
+            execution_options,
+            ray_remote_args=ray_remote_args,
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            resources=resources,
+            scheduling_strategy=scheduling_strategy,
+            compute=compute,
+            map_concurrency=map_concurrency,
+            ray_remote_args_fn=ray_remote_args_fn,
+            use_actor_pool=use_actor_pool,
+            actor_pool_min_size=actor_pool_min_size,
+            actor_pool_max_size=actor_pool_max_size,
+            actor_pool_initial_size=actor_pool_initial_size,
+        )
         self.batch_size = batch_size
         self.output = output
         self.object_ref_format = object_ref_format
         self.auto_init = auto_init
         self.zero_copy_batch = zero_copy_batch
         self.ray_remote_args = ray_remote_args
+        self.preflight_model_health_check = preflight_model_health_check
+        self.worker_model_health_checks = worker_model_health_checks
         self.order_column = order_column
         self.drop_order_column = drop_order_column
         self.preserve_order = preserve_order
@@ -198,13 +248,33 @@ class RayBackend:
                 "RayBackend preserve_order=True requires order_column in this experimental backend. "
                 "Automatic hidden row-id injection is tracked as follow-up hardening work."
             )
+        if use_input_dataset and self.block_planning.has_explicit_controls:
+            raise RayBackendConfigurationError(
+                "RayBackend block planning controls apply only when RayBackend creates a from-scratch "
+                "range dataset. Remove override_num_blocks, target_block_size, min_blocks, max_blocks, "
+                "and read_concurrency when passing input_dataset."
+            )
         if not self.allow_unsafe_processors:
             _validate_ray_safe_processors(config_builder)
 
-        dataset = self._resolve_input_dataset(ray, input_dataset=input_dataset, num_records=num_records)
+        model_aliases = _model_health_check_aliases(config_builder)
+        if self.preflight_model_health_check:
+            _run_driver_model_health_check(data_designer, config_builder, model_aliases)
+
+        block_plan = self.block_planning.resolve(num_records=num_records) if input_dataset is None else None
+        dataset = self._resolve_input_dataset(
+            ray,
+            input_dataset=input_dataset,
+            num_records=num_records,
+            block_plan=block_plan,
+        )
         input_blocks = _get_num_blocks(dataset)
         metrics_collector = _create_metrics_collector(ray)
         batch_size = self.batch_size or data_designer._run_config.buffer_size
+        worker_config_builder = _clone_config_builder_for_worker(
+            config_builder,
+            worker_model_health_checks=self.worker_model_health_checks,
+        )
         worker_options = _RayWorkerOptions(
             model_providers=list(data_designer._model_providers),
             default_provider_name=data_designer._model_provider_registry.get_default_provider_name(),
@@ -227,11 +297,15 @@ class RayBackend:
             "batch_format": "pandas",
             "zero_copy_batch": self.zero_copy_batch,
         }
-        if self.ray_remote_args is not None:
-            map_batches_kwargs.update(self.ray_remote_args)
+        map_batches_kwargs["fn_kwargs"]["config_builder"] = worker_config_builder
+        map_batches_kwargs.update(self.execution_options.to_map_batches_kwargs(ray))
+        map_function: Any = _generate_batch
+        if self.execution_options.use_actor_pool:
+            map_function = _RayBatchGenerator
+            map_batches_kwargs["fn_constructor_kwargs"] = map_batches_kwargs.pop("fn_kwargs")
 
         try:
-            mapped = dataset.map_batches(_generate_batch, **map_batches_kwargs)
+            mapped = dataset.map_batches(map_function, **map_batches_kwargs)
             mapped = self._apply_ordering(mapped)
             output = mapped.to_arrow_refs() if self.output == "arrow_refs" else None
             result_dataset = _dataset_from_arrow_refs(ray, output) if output is not None else mapped
@@ -243,7 +317,7 @@ class RayBackend:
         output_blocks = len(output) if output is not None else _get_num_blocks(mapped)
         metrics = RayDatasetMetrics(
             total_rows=num_records if input_dataset is None else 0,
-            blocks=output_blocks or input_blocks or 0,
+            blocks=output_blocks or input_blocks or (block_plan.planned_blocks if block_plan is not None else 0) or 0,
             elapsed_seconds=time.perf_counter() - start_time,
         )
         return RayDatasetCreationResults(
@@ -255,9 +329,17 @@ class RayBackend:
             output=output,
         )
 
-    def _resolve_input_dataset(self, ray: Any, *, input_dataset: Any | None, num_records: int) -> Any:
+    def _resolve_input_dataset(
+        self,
+        ray: Any,
+        *,
+        input_dataset: Any | None,
+        num_records: int,
+        block_plan: Any | None,
+    ) -> Any:
         if input_dataset is None:
-            return ray.data.range(num_records)
+            range_kwargs = block_plan.to_range_kwargs() if block_plan is not None else {}
+            return ray.data.range(num_records, **range_kwargs)
         if hasattr(input_dataset, "map_batches"):
             return input_dataset
         if isinstance(input_dataset, (list, tuple)):
@@ -279,6 +361,107 @@ class RayBackend:
         return ordered
 
 
+class _RayBatchGenerator:
+    def __init__(
+        self,
+        *,
+        config_builder: DataDesignerConfigBuilder,
+        worker_options: _RayWorkerOptions,
+        use_input_dataset: bool,
+        metrics_collector: Any | None = None,
+    ) -> None:
+        self._config_builder = config_builder
+        self._worker_options = worker_options
+        self._use_input_dataset = use_input_dataset
+        self._metrics_collector = metrics_collector
+
+    def __call__(self, batch: Any) -> Any:
+        return _generate_batch(
+            batch,
+            config_builder=self._config_builder,
+            worker_options=self._worker_options,
+            use_input_dataset=self._use_input_dataset,
+            metrics_collector=self._metrics_collector,
+        )
+
+
+def _resolve_block_planning(
+    block_planning: RayBlockPlanning | None,
+    *,
+    override_num_blocks: int | None,
+    target_block_size: int | None,
+    min_blocks: int | None,
+    max_blocks: int | None,
+    read_concurrency: int | None,
+) -> RayBlockPlanning:
+    if block_planning is not None and any(
+        value is not None
+        for value in (override_num_blocks, target_block_size, min_blocks, max_blocks, read_concurrency)
+    ):
+        raise ValueError("RayBackend block_planning cannot be combined with individual block planning arguments.")
+    if block_planning is not None:
+        return block_planning
+    return RayBlockPlanning(
+        override_num_blocks=override_num_blocks,
+        target_block_size=target_block_size,
+        min_blocks=min_blocks,
+        max_blocks=max_blocks,
+        read_concurrency=read_concurrency,
+    )
+
+
+def _resolve_execution_options(
+    execution_options: RayExecutionOptions | None,
+    *,
+    ray_remote_args: dict[str, Any] | None,
+    num_cpus: float | None,
+    num_gpus: float | None,
+    memory: float | None,
+    resources: dict[str, float] | None,
+    scheduling_strategy: Any | None,
+    compute: Any | None,
+    map_concurrency: RayMapConcurrency | None,
+    ray_remote_args_fn: Any | None,
+    use_actor_pool: bool,
+    actor_pool_min_size: int | None,
+    actor_pool_max_size: int | None,
+    actor_pool_initial_size: int | None,
+) -> RayExecutionOptions:
+    explicit_values = (
+        ray_remote_args,
+        num_cpus,
+        num_gpus,
+        memory,
+        resources,
+        scheduling_strategy,
+        compute,
+        map_concurrency,
+        ray_remote_args_fn,
+        actor_pool_min_size,
+        actor_pool_max_size,
+        actor_pool_initial_size,
+    )
+    if execution_options is not None and (use_actor_pool or any(value is not None for value in explicit_values)):
+        raise ValueError("RayBackend execution_options cannot be combined with individual Ray execution arguments.")
+    if execution_options is not None:
+        return execution_options
+    return RayExecutionOptions(
+        num_cpus=num_cpus,
+        num_gpus=num_gpus,
+        memory=memory,
+        resources=resources,
+        scheduling_strategy=scheduling_strategy,
+        compute=compute,
+        concurrency=map_concurrency,
+        ray_remote_args_fn=ray_remote_args_fn,
+        ray_remote_args=ray_remote_args,
+        use_actor_pool=use_actor_pool,
+        actor_pool_min_size=actor_pool_min_size,
+        actor_pool_max_size=actor_pool_max_size,
+        actor_pool_initial_size=actor_pool_initial_size,
+    )
+
+
 def _validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> None:
     unsafe_processors = [
         processor
@@ -293,6 +476,60 @@ def _validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> 
         f"Unsupported processor(s): {processor_names}. "
         "Pass allow_unsafe_processors=True to bypass this experimental guard."
     )
+
+
+def _model_health_check_aliases(config_builder: DataDesignerConfigBuilder) -> list[str]:
+    model_aliases: set[str] = set()
+    for config in config_builder.get_column_configs():
+        if column_type_is_model_generated(config.column_type):
+            model_alias = getattr(config, "model_alias", None)
+            if model_alias:
+                model_aliases.add(model_alias)
+        if isinstance(config, CustomColumnConfig) and config.model_aliases:
+            model_aliases.update(config.model_aliases)
+    return sorted(model_aliases)
+
+
+def _run_driver_model_health_check(
+    data_designer: Any,
+    config_builder: DataDesignerConfigBuilder,
+    model_aliases: list[str],
+) -> None:
+    if not model_aliases:
+        return
+    try:
+        with tempfile.TemporaryDirectory(prefix="data-designer-ray-preflight-") as artifact_dir:
+            ArtifactStorage.mkdir_if_needed(Path(artifact_dir))
+            resource_provider = create_resource_provider(
+                artifact_storage=ArtifactStorage(artifact_path=artifact_dir, dataset_name="ray-preflight"),
+                model_configs=config_builder.model_configs,
+                secret_resolver=data_designer._secret_resolver,
+                model_provider_registry=data_designer._model_provider_registry,
+                seed_reader_registry=data_designer._seed_reader_registry,
+                person_reader=data_designer._person_reader
+                or create_person_reader(str(data_designer._managed_assets_path)),
+                run_config=data_designer._run_config,
+            )
+            resource_provider.model_registry.run_health_check(model_aliases)
+    except RayBackendConfigurationError:
+        raise
+    except Exception as exc:
+        raise RayDatasetGenerationError("RayBackend model health-check preflight failed.") from exc
+
+
+def _clone_config_builder_for_worker(
+    config_builder: DataDesignerConfigBuilder,
+    *,
+    worker_model_health_checks: bool,
+) -> DataDesignerConfigBuilder:
+    worker_config_builder = copy.deepcopy(config_builder)
+    if worker_model_health_checks:
+        return worker_config_builder
+    worker_config_builder._model_configs = [
+        model_config.model_copy(update={"skip_health_check": True})
+        for model_config in worker_config_builder.model_configs
+    ]
+    return worker_config_builder
 
 
 def _get_num_blocks(dataset: Any) -> int | None:

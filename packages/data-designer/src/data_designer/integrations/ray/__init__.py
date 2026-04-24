@@ -16,15 +16,23 @@ from data_designer.integrations.ray.metrics import (
     aggregate_ray_metrics,
     normalize_ray_worker_metrics,
 )
+from data_designer.integrations.ray.options import (
+    RayBlockPlanning,
+    RayExecutionOptions,
+    RayResolvedBlockPlan,
+)
 
 __all__ = [
     "RayBackend",
     "RayBackendConfigurationError",
+    "RayBlockPlanning",
     "RayDatasetCreationResults",
     "RayDatasetGenerationError",
     "RayDatasetMetrics",
+    "RayExecutionOptions",
     "RayIntegrationError",
     "RayMetricsError",
+    "RayResolvedBlockPlan",
     "RayWorkerMetrics",
     "aggregate_ray_metrics",
     "normalize_ray_worker_metrics",

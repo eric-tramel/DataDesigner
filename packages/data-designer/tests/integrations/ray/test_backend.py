@@ -11,27 +11,41 @@ from typing import Any
 import pytest
 
 import data_designer.lazy_heavy_imports as lazy
-from data_designer.config.column_configs import ExpressionColumnConfig
+from data_designer.config.column_configs import ExpressionColumnConfig, LLMTextColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.processors import SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
-from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetMetrics
+from data_designer.integrations.ray import (
+    RayBackend,
+    RayBackendConfigurationError,
+    RayDatasetGenerationError,
+    RayDatasetMetrics,
+)
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.interface.data_designer import DataDesigner
+
+
+class FakeActorPoolStrategy:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
 
 
 class FakeRayDataset:
     def __init__(self, blocks: list[lazy.pd.DataFrame]) -> None:
         self.blocks = blocks
         self.map_batches_kwargs: dict[str, Any] | None = None
+        self.map_batches_fn: Any | None = None
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         self.map_batches_kwargs = kwargs
-        fn_kwargs = kwargs.get("fn_kwargs") or {}
-        return FakeRayDataset([fn(block, **fn_kwargs) for block in self.blocks])
+        self.map_batches_fn = fn
+        if isinstance(fn, type):
+            actor = fn(**(kwargs.get("fn_constructor_kwargs") or {}))
+            return FakeRayDataset([actor(block) for block in self.blocks])
+        return FakeRayDataset([fn(block, **(kwargs.get("fn_kwargs") or {})) for block in self.blocks])
 
     def to_arrow_refs(self) -> list[str]:
         return [f"arrow-ref-{i}" for i, _ in enumerate(self.blocks)]
@@ -56,9 +70,22 @@ class FakeRayDataModule:
     def __init__(self) -> None:
         self.from_arrow_refs_input: list[Any] | None = None
         self.from_pandas_refs_input: list[Any] | None = None
+        self.range_kwargs: dict[str, Any] | None = None
 
-    def range(self, num_records: int) -> FakeRayDataset:
-        return FakeRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
+    def ActorPoolStrategy(self, **kwargs: Any) -> FakeActorPoolStrategy:
+        return FakeActorPoolStrategy(**kwargs)
+
+    def range(self, num_records: int, **kwargs: Any) -> FakeRayDataset:
+        self.range_kwargs = kwargs
+        block_count = kwargs.get("override_num_blocks") or 1
+        if num_records > 0:
+            block_count = min(block_count, num_records)
+        blocks = []
+        for index in range(block_count):
+            start = index * num_records // block_count
+            end = (index + 1) * num_records // block_count
+            blocks.append(lazy.pd.DataFrame({"id": list(range(start, end))}))
+        return FakeRayDataset(blocks)
 
     def from_arrow_refs(self, refs: list[Any]) -> FakeRayDataset:
         self.from_arrow_refs_input = refs
@@ -169,6 +196,18 @@ def _input_expression_config_builder(stub_model_configs: Any) -> DataDesignerCon
     return config_builder
 
 
+def _llm_config_builder(stub_model_configs: Any) -> DataDesignerConfigBuilder:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(
+        LLMTextColumnConfig(
+            name="text",
+            prompt="Say hello.",
+            model_alias="stub-model",
+        )
+    )
+    return config_builder
+
+
 def test_ray_backend_uses_input_dataset_as_in_memory_seed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -198,6 +237,261 @@ def test_ray_backend_uses_input_dataset_as_in_memory_seed(
         {"x": 1, "label": "a", "x_label": "1-a"},
         {"x": 2, "label": "b", "x_label": "2-b"},
     ]
+
+
+def test_ray_backend_uses_override_num_blocks_for_from_scratch_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = _install_fake_ray(monkeypatch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2, override_num_blocks=3, read_concurrency=2),
+    )
+
+    results = designer.create(stub_sampler_only_config_builder, num_records=5)
+
+    assert fake_ray.data.range_kwargs == {"override_num_blocks": 3, "concurrency": 2}
+    assert results.load_metrics().blocks == 3
+
+
+@pytest.mark.parametrize(
+    ("num_records", "target_block_size", "min_blocks", "max_blocks", "expected_blocks"),
+    [
+        (3, 100, None, None, 1),
+        (20, 4, 2, 3, 3),
+    ],
+)
+def test_ray_backend_resolves_target_block_size_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+    num_records: int,
+    target_block_size: int,
+    min_blocks: int | None,
+    max_blocks: int | None,
+    expected_blocks: int,
+) -> None:
+    fake_ray = _install_fake_ray(monkeypatch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=2,
+            target_block_size=target_block_size,
+            min_blocks=min_blocks,
+            max_blocks=max_blocks,
+        ),
+    )
+
+    results = designer.create(stub_sampler_only_config_builder, num_records=num_records)
+
+    assert fake_ray.data.range_kwargs == {"override_num_blocks": expected_blocks}
+    assert results.load_metrics().blocks == expected_blocks
+
+
+def test_ray_backend_rejects_block_planning_with_input_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(override_num_blocks=2),
+    )
+
+    with pytest.raises(RayBackendConfigurationError, match="block planning controls"):
+        designer.create(stub_sampler_only_config_builder, input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"override_num_blocks": 0}, "positive integer"),
+        ({"target_block_size": 10, "min_blocks": 4, "max_blocks": 2}, "min_blocks"),
+        ({"min_blocks": 2}, "require target_block_size"),
+    ],
+)
+def test_ray_backend_validates_invalid_block_planning_options(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        RayBackend(**kwargs)
+
+
+def test_ray_backend_propagates_execution_resource_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            num_cpus=0.5,
+            num_gpus=1,
+            memory=1024,
+            resources={"model_client": 1},
+            scheduling_strategy="SPREAD",
+            map_concurrency=2,
+        ),
+    )
+
+    designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["num_cpus"] == 0.5
+    assert input_dataset.map_batches_kwargs["num_gpus"] == 1
+    assert input_dataset.map_batches_kwargs["memory"] == 1024
+    assert input_dataset.map_batches_kwargs["resources"] == {"model_client": 1}
+    assert input_dataset.map_batches_kwargs["scheduling_strategy"] == "SPREAD"
+    assert input_dataset.map_batches_kwargs["concurrency"] == 2
+
+
+def test_ray_backend_actor_pool_uses_autoscaling_strategy_and_constructor_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            use_actor_pool=True,
+            actor_pool_min_size=1,
+            actor_pool_max_size=4,
+            actor_pool_initial_size=2,
+            scheduling_strategy="DEFAULT",
+        ),
+    )
+
+    designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_fn is ray_backend_module._RayBatchGenerator
+    assert "fn_kwargs" not in input_dataset.map_batches_kwargs
+    assert "fn_constructor_kwargs" in input_dataset.map_batches_kwargs
+    assert input_dataset.map_batches_kwargs["scheduling_strategy"] == "DEFAULT"
+    assert input_dataset.map_batches_kwargs["compute"].kwargs == {
+        "min_size": 1,
+        "max_size": 4,
+        "initial_size": 2,
+    }
+
+
+def test_ray_backend_driver_model_health_check_runs_once_and_workers_skip_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+    preflight_aliases: list[list[str]] = []
+    worker_skip_flags: list[list[bool]] = []
+
+    def run_driver_model_health_check(_: Any, __: DataDesignerConfigBuilder, model_aliases: list[str]) -> None:
+        preflight_aliases.append(model_aliases)
+
+    def generate_batch(batch: lazy.pd.DataFrame, *, config_builder: DataDesignerConfigBuilder, **_: Any) -> Any:
+        worker_skip_flags.append([model_config.skip_health_check for model_config in config_builder.model_configs])
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_run_driver_model_health_check", run_driver_model_health_check)
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    config_builder = _llm_config_builder(stub_model_configs)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1),
+    )
+
+    designer.create(config_builder, input_dataset=input_dataset)
+
+    assert preflight_aliases == [["stub-model"]]
+    assert worker_skip_flags == [[True]]
+    assert [model_config.skip_health_check for model_config in config_builder.model_configs] == [False]
+
+
+def test_ray_backend_worker_model_health_checks_can_be_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+    worker_skip_flags: list[list[bool]] = []
+
+    def generate_batch(batch: lazy.pd.DataFrame, *, config_builder: DataDesignerConfigBuilder, **_: Any) -> Any:
+        worker_skip_flags.append([model_config.skip_health_check for model_config in config_builder.model_configs])
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_run_driver_model_health_check", lambda *_: None)
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1, worker_model_health_checks=True),
+    )
+
+    designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert worker_skip_flags == [[False]]
+
+
+def test_ray_backend_driver_model_health_check_failure_stops_before_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+
+    def fail_preflight(_: Any, __: DataDesignerConfigBuilder, ___: list[str]) -> None:
+        raise RayDatasetGenerationError("preflight failed")
+
+    monkeypatch.setattr(ray_backend_module, "_run_driver_model_health_check", fail_preflight)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1),
+    )
+
+    with pytest.raises(RayDatasetGenerationError, match="preflight failed"):
+        designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is None
 
 
 def test_ray_backend_preserves_input_dataset_order_across_blocks(
