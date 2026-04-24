@@ -319,9 +319,9 @@
       <div class="card">
         <h3>Performance Takeaway</h3>
         <p>
-          Ray is slower for tiny cheap jobs because setup overhead dominates. For API-bound LLM jobs,
-          Ray is already competitive locally and should improve with larger block sizes, real clusters,
-          and worker/client reuse.
+          The 256-row OpenAI run shows an effective-concurrency win, not a pure Ray-only engine speedup.
+          The local path used the current default <code>create()</code> behavior, while Ray used block-level
+          parallelism plus async worker execution.
         </p>
       </div>
     </div>
@@ -860,11 +860,10 @@ ray_dataset_out = results.load_dataset()</pre>
       <li><strong>Per-block model health checks:</strong> workers may repeat checks that should be a driver preflight or cached per worker.</li>
       <li><strong>No actor reuse:</strong> <code>map_batches</code> uses a function. A callable class or actor-style execution could reuse model clients and resource setup across blocks.</li>
       <li><strong>Profiler artifact gap:</strong> Ray results are Ray-resident and <code>load_analysis()</code> currently returns <code>None</code>. Full profiler artifact generation remains future distributed/Ray-native work.</li>
-      <li><strong>Execution metrics aggregation:</strong> worker row counts, block counts, failed-block counts, elapsed seconds, and model-usage stats now flow through a Ray-side metrics actor into the result object.</li>
-      <li><strong>Ordering:</strong> output row order can differ from input order unless explicitly preserved.</li>
-      <li><strong>Seed configs without input datasets:</strong> Ray rejects this mode until seed readers support partition offsets. Use in-memory Ray inputs for seeded Ray jobs today.</li>
+      <li><strong>Automatic ordering:</strong> explicit <code>order_column</code> sorting is supported, but hidden row-id injection for automatic <code>preserve_order=True</code> is still future work.</li>
+      <li><strong>Seed configs without input datasets:</strong> Ray now rejects this unsafe mode before execution. Partition-offset-aware seed readers remain future work; use in-memory Ray inputs for seeded Ray jobs today.</li>
       <li><strong>From-scratch partitioning:</strong> <code>ray.data.range(num_records)</code> needs explicit block planning for high throughput.</li>
-      <li><strong>Processor side effects:</strong> processors that write side artifacts were built for local storage and need clearer Ray semantics.</li>
+      <li><strong>Processor side effects:</strong> unsafe processors are now rejected by default, but first-class distributed side-effect semantics are not implemented.</li>
       <li><strong>Secrets and trust boundary:</strong> provider config and secret resolvers are serialized to workers. That is normal for trusted Ray clusters, but should be documented.</li>
     </ol>
   </section>
@@ -889,22 +888,21 @@ ray_dataset_out = results.load_dataset()</pre>
       <tbody>
         <tr>
           <td>Phase A: Data Semantics Contract</td>
-          <td><span class="good">Implementation focus</span></td>
+          <td><span class="good">Partly done</span></td>
           <td>
-            Stabilize the logical row contract for Ray inputs and from-scratch generation. Preserve hidden row ids
-            through partitioned execution, protect user column order, and keep deterministic seeding independent of
-            Ray block order, worker identity, or scheduling timing.
+            Stabilize the logical row contract for Ray inputs and from-scratch generation. Completed pieces:
+            supported pandas refs, Arrow refs, and Ray Dataset inputs preserve row/schema behavior in tests;
+            explicit <code>order_column</code> sorting can restore order; unsafe seed-config batching is rejected.
           </td>
           <td>
-            Local and Ray runs can be compared by logical row id with no duplicate or missing ids; supported pandas,
-            Arrow, Ray Dataset, and Arrow ObjectRef paths preserve expected schema and null behavior or fail with a
-            normalized DataDesigner error. Ray currently rejects seed configs without <code>input_dataset</code>;
-            partition-offset-aware seeded Ray generation remains future work.
+            Remaining: automatic hidden row-id injection for <code>preserve_order=True</code>, partition-offset-aware
+            seed configs without <code>input_dataset</code>, and deterministic seeding independent of Ray block order,
+            worker identity, or scheduling timing.
           </td>
         </tr>
         <tr>
           <td>Phase B: Worker Boundary</td>
-          <td><span class="good">Implementation focus</span></td>
+          <td><span class="good">Done for current scope</span></td>
           <td>
             Treat the Ray worker payload as a serialization boundary. Seed readers, config builders, model
             configs, secret resolvers, processors, and resource handles must be classified as serializable data,
@@ -919,38 +917,35 @@ ray_dataset_out = results.load_dataset()</pre>
         </tr>
         <tr>
           <td>Phase C: Processor Policy</td>
-          <td><span class="good">Implementation focus</span></td>
+          <td><span class="good">Guard done</span></td>
           <td>
-            Define processor side-effect semantics. Pure row/column transforms are safe. Processors that write files,
-            mutate shared state, depend on local artifact paths, or require global ordering need an explicit distributed
-            contract or must be rejected for Ray.
+            Define processor side-effect semantics. Completed pieces: the backend allows the distributed-safe
+            <code>drop_columns</code> processor path, rejects other processors by default before Ray tasks launch,
+            and exposes an explicit experimental <code>allow_unsafe_processors=True</code> bypass.
           </td>
           <td>
-            Processor metadata or registration declares <code>ray_safe</code>, <code>requires_global_order</code>, and
-            side-effect behavior; unsafe processors raise a normalized DataDesigner error with remediation text; safe
-            processors are covered in partitioned tests.
+            Remaining: processor metadata or registration should declare <code>ray_safe</code>,
+            <code>requires_global_order</code>, and side-effect behavior so safe processors can be admitted without
+            hard-coded policy.
           </td>
         </tr>
         <tr>
           <td>Phase D: Error and Metrics Surface</td>
-          <td><span class="good">Implementation focus</span></td>
+          <td><span class="good">Metrics done</span></td>
           <td>
-            Normalize Ray task failures, serialization failures, object store failures, cancellation, and worker
-            exceptions into DataDesigner error types. Worker metrics aggregation now uses a Ray-side metrics channel
-            that returns compact usage, row-count, and failed-block summaries to the Ray result object without forcing
-            full dataset materialization on the driver after normal dataset execution.
+            Worker metrics aggregation now uses a Ray-side metrics actor that returns compact usage, row-count,
+            block-count, failed-block, elapsed-time, and model-usage summaries to the Ray result object. Zero-row
+            worker metrics remain zero instead of falling back to requested driver row counts.
           </td>
           <td>
-            Users see DataDesigner errors rather than raw Ray stack traces at the public boundary; errors include
-            task/block context when available; model usage, row counts, and failed-block summaries are aggregated
-            deterministically and exposed through the result interface. Validation counts, retry attribution, and full
-            distributed profiler artifacts remain future work rather than part of the initial Phase D metrics channel.
-            Zero-row worker metrics are preserved rather than replaced with driver-requested row counts.
+            Remaining: broader Ray task, serialization, object-store, cancellation, and worker exceptions should carry
+            richer task/block context. Validation counts, retry attribution, and full distributed profiler artifacts
+            remain future work rather than part of the initial Phase D metrics channel.
           </td>
         </tr>
         <tr>
           <td>Phase E: Optional Extra Guarantees</td>
-          <td><span class="good">Implementation focus</span></td>
+          <td><span class="good">Done</span></td>
           <td>
             Preserve no-Ray installs. Imports outside <code>data_designer.integrations.ray</code> must not import Ray,
             require Ray dependencies, or slow normal startup. The <code>data-designer[ray]</code> extra remains the
@@ -964,16 +959,15 @@ ray_dataset_out = results.load_dataset()</pre>
         </tr>
         <tr>
           <td>Phase F: Test Matrix</td>
-          <td><span class="good">Report update</span></td>
+          <td><span class="good">Done for experimental PR</span></td>
           <td>
-            Document the correctness-first matrix created by the A-F push: local versus Ray Dataset versus Arrow
-            ObjectRefs, seeded versus from-scratch generation, one block versus many blocks, pandas and Arrow-backed
-            inputs, pure and rejected processors, success and failure paths, Ray installed and Ray absent.
+            The correctness-first test matrix now covers local versus Ray Dataset versus Arrow ObjectRefs, seeded
+            versus from-scratch generation, one block versus many blocks, pandas and Arrow-backed inputs, pure and
+            rejected processors, success and failure paths, Ray installed and Ray absent.
           </td>
           <td>
-            Tests assert behavior rather than implementation details: stable logical row ids, dtype fidelity,
-            deterministic seeded values, normalized errors, metrics aggregation, no-Ray import behavior, and
-            local-then-Ray execution in the same Python process.
+            Remaining for production: expand from fake Ray/test doubles into recurring real-Ray smoke coverage,
+            repeated OpenAI benchmark runs, and an apples-to-apples local async comparison.
           </td>
         </tr>
       </tbody>
@@ -981,9 +975,10 @@ ray_dataset_out = results.load_dataset()</pre>
 
     <div class="callout warning">
       <strong>Sequence constraint:</strong> performance work should not mask correctness gaps. Worker reuse and block
-      planning are high-value optimizations, but they should follow the row-id, dtype, seed, error, metrics, optional
-      import, and processor-policy gates above. The Ray-side execution metrics channel is part of the correctness surface now;
-      full profiler artifact production remains a later optimization/research item.
+      planning are high-value optimizations, but they should follow the remaining row-id, seed-offset, error-context,
+      global-throttling, and processor-metadata gates above. Metrics aggregation, no-Ray optional import behavior,
+      Arrow-ref materialization, seeded-mode rejection, and zero-row metrics are no longer open roadmap items in this
+      experimental branch.
     </div>
   </section>
 
@@ -993,11 +988,14 @@ ray_dataset_out = results.load_dataset()</pre>
       <div class="card">
         <h3>Phase 1: Correctness Hardening</h3>
         <ul>
-          <li>Add stable row-id preservation for Ray inputs and from-scratch generation.</li>
-          <li>Add partition-offset-aware support for seed configs without requiring <code>input_dataset</code>.</li>
-          <li>Reject or document processors with unsupported distributed side effects.</li>
-          <li>Preflight model health checks on the driver and skip repeated worker checks.</li>
-          <li>Add tests for ordering, ObjectRef input formats, and same-process local-then-Ray execution.</li>
+          <li><span class="good">Done:</span> reject seed configs without <code>input_dataset</code> instead of duplicating early rows across Ray batches.</li>
+          <li><span class="good">Done:</span> rebuild Arrow-ref result datasets from materialized refs so <code>load_dataset()</code> does not re-run generation.</li>
+          <li><span class="good">Done:</span> aggregate Ray worker metrics and preserve zero-row worker totals.</li>
+          <li><span class="good">Done:</span> reject unsupported processors by default and cover the bypass path.</li>
+          <li><span class="good">Done:</span> add tests for explicit ordering, ObjectRef input formats, same-process local-then-Ray execution, optional-extra behavior, and metrics aggregation.</li>
+          <li>Remaining: add automatic hidden row-id preservation for Ray inputs and from-scratch generation.</li>
+          <li>Remaining: add partition-offset-aware support for seed configs without requiring <code>input_dataset</code>.</li>
+          <li>Remaining: preflight model health checks on the driver and skip repeated worker checks.</li>
         </ul>
       </div>
       <div class="card">
