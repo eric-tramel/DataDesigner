@@ -8,7 +8,7 @@ import importlib
 import os
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
@@ -31,6 +31,7 @@ from data_designer.engine.storage.media_storage import StorageMode
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics, aggregate_ray_metrics
 from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
+from data_designer.integrations.ray.throttling import create_ray_throttle_manager
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -53,6 +54,7 @@ class _RayWorkerOptions:
     person_reader: PersonReader | None
     mcp_providers: list[MCPProviderT]
     run_config: RunConfig
+    throttle_manager: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class RayDatasetCreationResults:
         metrics: RayDatasetMetrics,
         ray: Any | None = None,
         metrics_collector: Any | None = None,
+        throttle_manager: Any | None = None,
         output: Any | None = None,
     ) -> None:
         self.dataset = dataset
@@ -90,6 +93,7 @@ class RayDatasetCreationResults:
         self._metrics_cache: RayDatasetMetrics | None = None
         self._ray = ray
         self._metrics_collector = metrics_collector
+        self._throttle_manager = throttle_manager
         self._output = output
 
     def load_dataset(self) -> Any:
@@ -116,7 +120,11 @@ class RayDatasetCreationResults:
         if not payloads:
             return self._driver_metrics
         worker_metrics = aggregate_ray_metrics(payloads)
-        self._metrics_cache = _merge_driver_and_worker_metrics(self._driver_metrics, worker_metrics)
+        self._metrics_cache = _merge_driver_and_worker_metrics(
+            self._driver_metrics,
+            worker_metrics,
+            throttle_metrics=self._load_throttle_metrics(),
+        )
         return self._metrics_cache
 
     @property
@@ -129,6 +137,14 @@ class RayDatasetCreationResults:
         if not callable(materialize):
             return
         self.dataset = materialize()
+
+    def _load_throttle_metrics(self) -> dict[str, Any] | None:
+        if self._throttle_manager is None:
+            return None
+        snapshot = getattr(self._throttle_manager, "snapshot", None)
+        if not callable(snapshot):
+            return None
+        return snapshot()
 
     def to_arrow_refs(self) -> list[Any]:
         """Return Ray ObjectRefs containing PyArrow tables, one per Ray block."""
@@ -168,6 +184,7 @@ class RayBackend:
         preserve_order: bool = False,
         keep_internal_order_column: bool = False,
         allow_unsafe_processors: bool = False,
+        global_provider_throttling: bool = True,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
             raise ValueError("RayBackend output must be 'dataset' or 'arrow_refs'.")
@@ -186,6 +203,7 @@ class RayBackend:
         self.preserve_order = preserve_order
         self.keep_internal_order_column = keep_internal_order_column
         self.allow_unsafe_processors = allow_unsafe_processors
+        self.global_provider_throttling = global_provider_throttling
 
     def create(
         self,
@@ -228,6 +246,13 @@ class RayBackend:
         input_blocks = _get_num_blocks(dataset)
         metrics_collector = _create_metrics_collector(ray)
         batch_size = self.batch_size or data_designer._run_config.buffer_size
+        throttle_manager = (
+            create_ray_throttle_manager(ray, data_designer._run_config)
+            if self.global_provider_throttling
+            and config_builder.model_configs
+            and callable(getattr(ray, "remote", None))
+            else None
+        )
         worker_options = _RayWorkerOptions(
             model_providers=list(data_designer._model_providers),
             default_provider_name=data_designer._model_provider_registry.get_default_provider_name(),
@@ -237,6 +262,7 @@ class RayBackend:
             person_reader=data_designer._person_reader,
             mcp_providers=list(data_designer._mcp_providers),
             run_config=data_designer._run_config,
+            throttle_manager=throttle_manager,
         )
         execution_payload = _compile_ray_execution_payload(
             config_builder=config_builder,
@@ -296,6 +322,7 @@ class RayBackend:
             metrics=metrics,
             ray=ray,
             metrics_collector=metrics_collector,
+            throttle_manager=throttle_manager,
             output=output,
         )
 
@@ -486,6 +513,15 @@ def _validate_worker_payload_serializable(payload: _RayExecutionPayload) -> None
     try:
         serializer.dumps(payload)
     except Exception as exc:
+        if payload.worker_options.throttle_manager is not None:
+            worker_options = replace(payload.worker_options, throttle_manager=None)
+            payload_without_throttle = replace(payload, worker_options=worker_options)
+            try:
+                serializer.dumps(payload_without_throttle)
+            except Exception:
+                pass
+            else:
+                return
         raise RayBackendConfigurationError(
             "RayBackend worker payload is not serializable. Check model providers, seed readers, "
             "secret resolvers, and MCP providers for process-safe state before launching Ray workers."
@@ -511,7 +547,10 @@ def _create_metrics_collector(ray: Any) -> Any | None:
 
 
 def _merge_driver_and_worker_metrics(
-    driver_metrics: RayDatasetMetrics, worker_metrics: RayDatasetMetrics
+    driver_metrics: RayDatasetMetrics,
+    worker_metrics: RayDatasetMetrics,
+    *,
+    throttle_metrics: dict[str, Any] | None = None,
 ) -> RayDatasetMetrics:
     return RayDatasetMetrics(
         total_rows=worker_metrics.total_rows,
@@ -519,6 +558,7 @@ def _merge_driver_and_worker_metrics(
         failed_blocks=worker_metrics.failed_blocks,
         elapsed_seconds=worker_metrics.elapsed_seconds,
         model_usage=worker_metrics.model_usage or driver_metrics.model_usage,
+        throttle=throttle_metrics or worker_metrics.throttle or driver_metrics.throttle,
     )
 
 
@@ -706,6 +746,7 @@ class _RayBatchWorker:
             run_config=copy.deepcopy(worker_options.run_config),
             mcp_providers=worker_options.mcp_providers,
             tool_configs=self._base_config.tool_configs or [],
+            throttle_manager=worker_options.throttle_manager,
         )
 
     def __call__(self, batch: Any) -> Any:

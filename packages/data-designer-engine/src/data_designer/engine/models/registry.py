@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from data_designer.engine.models.clients.retry import RetryConfig
-    from data_designer.engine.models.clients.throttle_manager import ThrottleManager
+    from data_designer.engine.models.clients.throttle_manager import ThrottleManagerLike
     from data_designer.engine.models.facade import ModelFacade
 
     ModelFacadeFactory = Callable[
@@ -35,7 +35,7 @@ class ModelRegistry:
         model_provider_registry: ModelProviderRegistry,
         model_configs: list[ModelConfig] | None = None,
         model_facade_factory: ModelFacadeFactory | None = None,
-        throttle_manager: ThrottleManager | None = None,
+        throttle_manager: ThrottleManagerLike | None = None,
         retry_config: RetryConfig | None = None,
     ) -> None:
         self._secret_resolver = secret_resolver
@@ -56,7 +56,7 @@ class ModelRegistry:
         return self._models
 
     @property
-    def throttle_manager(self) -> ThrottleManager | None:
+    def throttle_manager(self) -> ThrottleManagerLike | None:
         return self._throttle_manager
 
     @property

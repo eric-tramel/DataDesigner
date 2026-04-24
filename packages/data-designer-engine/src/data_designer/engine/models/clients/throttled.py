@@ -22,7 +22,7 @@ from data_designer.engine.models.clients.types import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
-    from data_designer.engine.models.clients.throttle_manager import ThrottleManager
+    from data_designer.engine.models.clients.throttle_manager import ThrottleManagerLike
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ class ThrottledModelClient(ModelClient):
     def __init__(
         self,
         inner: ModelClient,
-        throttle_manager: ThrottleManager,
+        throttle_manager: ThrottleManagerLike,
         provider_name: str,
         model_id: str,
     ) -> None:

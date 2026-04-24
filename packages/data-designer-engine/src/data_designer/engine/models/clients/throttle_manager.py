@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol
 
 from data_designer.config.run_config import ThrottleConfig
 
@@ -30,6 +31,74 @@ class ThrottleDomain(str, Enum):
 DEFAULT_MIN_LIMIT: int = 1
 DEFAULT_ACQUIRE_TIMEOUT: float = 300.0
 CAPACITY_POLL_INTERVAL: float = 0.05
+
+
+class ThrottleManagerLike(Protocol):
+    """Interface used by model clients for local or distributed throttling."""
+
+    def register(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        alias: str,
+        max_parallel_requests: int,
+    ) -> None: ...
+
+    def try_acquire(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> float: ...
+
+    def acquire_sync(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        timeout: float = DEFAULT_ACQUIRE_TIMEOUT,
+    ) -> None: ...
+
+    async def acquire_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        timeout: float = DEFAULT_ACQUIRE_TIMEOUT,
+    ) -> None: ...
+
+    def release_success(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None: ...
+
+    def release_rate_limited(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        retry_after: float | None = None,
+        now: float | None = None,
+    ) -> None: ...
+
+    def release_failure(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +498,34 @@ class ThrottleManager:
     def get_effective_max(self, provider_name: str, model_id: str) -> int:
         with self._lock:
             return self._effective_max_for(provider_name, model_id)
+
+    def snapshot(self) -> dict[str, object]:
+        """Return a serializable throttle-state snapshot for telemetry."""
+        with self._lock:
+            return {
+                "global_caps": [
+                    {
+                        "provider_name": provider_name,
+                        "model_id": model_id,
+                        "effective_max": cap.effective_max,
+                        "limits_by_alias": dict(cap.limits_by_alias),
+                    }
+                    for (provider_name, model_id), cap in sorted(self._global_caps.items())
+                ],
+                "domains": [
+                    {
+                        "provider_name": provider_name,
+                        "model_id": model_id,
+                        "domain": domain,
+                        "current_limit": state.current_limit,
+                        "in_flight": state.in_flight,
+                        "waiters": state.waiters,
+                        "rate_limit_ceiling": state.rate_limit_ceiling,
+                        "consecutive_429s": state.consecutive_429s,
+                    }
+                    for (provider_name, model_id, domain), state in sorted(self._domains.items())
+                ],
+            }
 
     # -------------------------------------------------------------------
     # Private helpers
