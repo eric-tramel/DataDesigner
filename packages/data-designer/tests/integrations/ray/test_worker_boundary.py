@@ -15,10 +15,11 @@ import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import ExpressionColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.run_config import RunConfig
+from data_designer.config.seed import SamplingStrategy
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
-from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError
+from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.interface.data_designer import DataDesigner
 
@@ -234,7 +235,7 @@ def test_driver_preflight_rejects_input_dataset_with_existing_seed_config(
     assert input_dataset.map_batches_called is False
 
 
-def test_driver_preflight_rejects_seed_config_without_input_dataset(
+def test_driver_preflight_rejects_shuffled_seed_config_without_input_dataset(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     stub_model_configs: Any,
@@ -242,7 +243,10 @@ def test_driver_preflight_rejects_seed_config_without_input_dataset(
 ) -> None:
     fake_ray = _install_boundary_ray(monkeypatch)
     config_builder = _input_expression_config_builder(stub_model_configs)
-    config_builder.with_seed_dataset(DataFrameSeedSource(df=lazy.pd.DataFrame({"x": [99], "label": ["seed"]})))
+    config_builder.with_seed_dataset(
+        DataFrameSeedSource(df=lazy.pd.DataFrame({"x": [99], "label": ["seed"]})),
+        sampling_strategy=SamplingStrategy.SHUFFLE,
+    )
     designer = DataDesigner(
         artifact_path=tmp_path,
         model_providers=stub_model_providers,
@@ -251,7 +255,41 @@ def test_driver_preflight_rejects_seed_config_without_input_dataset(
         backend=RayBackend(batch_size=1),
     )
 
-    with pytest.raises(RayBackendConfigurationError):
+    with pytest.raises(RayBackendConfigurationError, match="ordered sampling"):
         designer.create(config_builder, num_records=2)
 
     assert fake_ray.data.range_dataset is None
+
+
+def test_worker_failure_includes_block_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    class FailingDatasetBuilder:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        def build_preview(self, *, num_records: int) -> lazy.pd.DataFrame:
+            del num_records
+            raise RuntimeError("worker boom")
+
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+    )
+    monkeypatch.setattr(ray_backend_module, "DatasetBuilder", FailingDatasetBuilder)
+
+    with pytest.raises(RayDatasetGenerationError, match="range rows 5-6") as exc_info:
+        ray_backend_module._generate_batch(
+            lazy.pd.DataFrame({"id": [5, 6]}),
+            config_builder=_input_expression_config_builder(stub_model_configs),
+            worker_options=_worker_options_from_designer(designer),
+            use_input_dataset=False,
+        )
+
+    assert "2 input row(s)" in str(exc_info.value)
+    assert "worker boom" in str(exc_info.value)
