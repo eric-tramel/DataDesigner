@@ -316,7 +316,9 @@ def test_ray_backend_can_return_arrow_refs(
     assert results.to_arrow_refs() == ["arrow-ref-0"]
     assert isinstance(results.load_dataset(), FakeRayDataset)
     assert results.load_analysis() is None
-    assert results.load_metrics() == RayDatasetMetrics(total_rows=2, blocks=1, elapsed_seconds=results.metrics.elapsed_seconds)
+    assert results.load_metrics() == RayDatasetMetrics(
+        total_rows=2, blocks=1, elapsed_seconds=results.metrics.elapsed_seconds
+    )
 
 
 def test_ray_backend_dataset_output_wraps_dataset_and_delegates_arrow_refs(

@@ -596,6 +596,7 @@ ray_dataset_out = results.load_dataset()</pre>
           <li><strong>Sampler + expression:</strong> 10,000 rows, no model calls, intended to expose orchestration overhead.</li>
           <li><strong>NVIDIA LLM:</strong> 8 seeded rows, <code>nvidia-text</code>, <code>nvidia/nemotron-3-nano-30b-a3b</code>, <code>max_tokens=16</code>.</li>
           <li><strong>OpenAI LLM:</strong> 4 seeded rows, <code>openai-text</code>, <code>gpt-4.1</code>, <code>max_tokens=16</code>.</li>
+          <li><strong>Docs/assets OpenAI recipe:</strong> 128 rows from <code>docs/assets/recipes/code_generation/text_to_python.py</code>, <code>openai-text</code>, <code>gpt-4.1</code>, no max-token override, Ray <code>batch_size=16</code>.</li>
           <li>Ray startup was excluded from measured sections. Ray Dataset timings include pulling to pandas on the driver unless noted as Arrow refs.</li>
         </ul>
       </div>
@@ -677,6 +678,14 @@ ray_dataset_out = results.load_dataset()</pre>
           <td>0.95</td>
           <td>About 12% faster in this run, but small-N variance is high.</td>
         </tr>
+        <tr>
+          <td>Docs/assets text_to_python</td>
+          <td>Ray Dataset</td>
+          <td>128</td>
+          <td>136.633</td>
+          <td>0.94</td>
+          <td>Real recipe run against <code>openai-text</code> with no max-token cap; generated 128 non-null rows and exercised the metrics actor across 8 Ray blocks.</td>
+        </tr>
       </tbody>
     </table>
 
@@ -716,6 +725,14 @@ ray_dataset_out = results.load_dataset()</pre>
       <strong>Observation:</strong> the NVIDIA endpoint returned empty content for the short prompt while still
       reporting successful requests and token usage. The OpenAI run produced non-empty values. The NVIDIA timing
       is still useful for exercising the configured provider path and network/model stack, but not for output-quality assessment.
+    </div>
+
+    <div class="callout">
+      <strong>Distributed metrics validation:</strong> the 128-row docs/assets run returned
+      <code>total_rows=128</code>, <code>blocks=8</code>, <code>failed_blocks=0</code>, and <code>gpt-4.1</code>
+      usage of <code>384</code> successful requests and <code>526,073</code> total tokens. The wall-clock time was
+      <code>136.633s</code>; the reported worker elapsed time was <code>474.829s</code> because it aggregates
+      per-block execution seconds across concurrent Ray workers.
     </div>
   </section>
 
@@ -761,8 +778,8 @@ ray_dataset_out = results.load_dataset()</pre>
       <li><strong>Per-block setup cost:</strong> each Ray block currently creates temp artifact storage, resource providers, registries, and a DatasetBuilder.</li>
       <li><strong>Per-block model health checks:</strong> workers may repeat checks that should be a driver preflight or cached per worker.</li>
       <li><strong>No actor reuse:</strong> <code>map_batches</code> uses a function. A callable class or actor-style execution could reuse model clients and resource setup across blocks.</li>
-      <li><strong>Local profiler gap:</strong> Ray results are Ray-resident and <code>load_analysis()</code> currently returns <code>None</code>. Profiling needs a distributed/Ray-native implementation.</li>
-      <li><strong>Metrics aggregation gap:</strong> worker model-usage stats are not yet aggregated into the Ray result object.</li>
+      <li><strong>Profiler artifact gap:</strong> Ray results are Ray-resident and <code>load_analysis()</code> currently returns <code>None</code>. Full profiler artifact generation remains future distributed/Ray-native work.</li>
+      <li><strong>Execution metrics aggregation:</strong> worker row counts, block counts, failed-block counts, elapsed seconds, and model-usage stats now flow through a Ray-side metrics actor into the result object.</li>
       <li><strong>Ordering:</strong> output row order can differ from input order unless explicitly preserved.</li>
       <li><strong>From-scratch partitioning:</strong> <code>ray.data.range(num_records)</code> needs explicit block planning for high throughput.</li>
       <li><strong>Processor side effects:</strong> processors that write side artifacts were built for local storage and need clearer Ray semantics.</li>
@@ -773,42 +790,39 @@ ray_dataset_out = results.load_dataset()</pre>
   <section>
     <h2>Robustness and Correctness Hardening Plan</h2>
     <p>
-      The next implementation work should treat distributed correctness as a release gate before throughput
-      optimization. The plan below turns the known Ray-specific risks into explicit phases with acceptance criteria.
-      Until each phase passes, benchmark results should be read as functional smoke data rather than production
-      readiness evidence.
+      The A-F implementation push keeps distributed correctness ahead of throughput optimization. The matrix below
+      tracks the current implementation focus and acceptance bar for each phase without treating benchmark smoke
+      results as production-readiness evidence.
     </p>
-
-    <div class="grid">
-      <div class="card wide">
-        <h3>Phase A: Data Semantics Contract</h3>
-        <ul>
-          <li><strong>Ordering semantics and hidden row ids:</strong> define whether Ray output is stable by default. If stable output is required, inject a reserved internal row id before partitioning, preserve it through every block, and remove or hide it before user-facing results unless diagnostics request it.</li>
-          <li><strong>Schema and dtype preservation:</strong> record the input schema at the interface boundary and validate that pandas, Arrow, and Ray conversions preserve nullable integers, booleans, strings, timestamps, categoricals where supported, nested/list values, nulls, and column order.</li>
-          <li><strong>Deterministic seeding:</strong> derive per-row or per-partition random state from a global seed plus the hidden row id, not from Ray block order, worker process identity, or scheduling timing.</li>
-        </ul>
-      </div>
-      <div class="card wide">
-        <h3>Acceptance Criteria</h3>
-        <ul>
-          <li>Local and Ray runs over the same seeded input can be compared by logical row id, with no duplicate or missing ids.</li>
-          <li>Round trips across pandas, Arrow, Ray Dataset, and Arrow ObjectRefs preserve expected schema, dtypes, null behavior, and column order or fail with a DataDesigner error explaining the unsupported type.</li>
-          <li>Repeated Ray runs with identical config, seed, block count, and input produce identical sampler-derived values independent of worker scheduling.</li>
-        </ul>
-      </div>
-    </div>
 
     <table>
       <thead>
         <tr>
           <th>Phase</th>
+          <th>Status</th>
           <th>Scope</th>
           <th>Acceptance Criteria</th>
         </tr>
       </thead>
       <tbody>
         <tr>
+          <td>Phase A: Data Semantics Contract</td>
+          <td><span class="good">Implementation focus</span></td>
+          <td>
+            Stabilize the logical row contract for Ray inputs and from-scratch generation. Preserve hidden row ids
+            through partitioned execution, protect user column order, and keep deterministic seeding independent of
+            Ray block order, worker identity, or scheduling timing.
+          </td>
+          <td>
+            Local and Ray runs can be compared by logical row id with no duplicate or missing ids; supported pandas,
+            Arrow, Ray Dataset, and Arrow ObjectRef paths preserve expected schema and null behavior or fail with a
+            normalized DataDesigner error; repeated seeded Ray runs remain deterministic for the same config and
+            partitioning.
+          </td>
+        </tr>
+        <tr>
           <td>Phase B: Worker Boundary</td>
+          <td><span class="good">Implementation focus</span></td>
           <td>
             Treat the Ray worker payload as a serialization boundary. Seed readers, config builders, model
             configs, secret resolvers, processors, and resource handles must be classified as serializable data,
@@ -822,6 +836,7 @@ ray_dataset_out = results.load_dataset()</pre>
         </tr>
         <tr>
           <td>Phase C: Processor Policy</td>
+          <td><span class="good">Implementation focus</span></td>
           <td>
             Define processor side-effect semantics. Pure row/column transforms are safe. Processors that write files,
             mutate shared state, depend on local artifact paths, or require global ordering need an explicit distributed
@@ -835,19 +850,23 @@ ray_dataset_out = results.load_dataset()</pre>
         </tr>
         <tr>
           <td>Phase D: Error and Metrics Surface</td>
+          <td><span class="good">Implementation focus</span></td>
           <td>
             Normalize Ray task failures, serialization failures, object store failures, cancellation, and worker
-            exceptions into DataDesigner error types. Aggregate worker metrics into the Ray result object without
-            forcing full dataset materialization on the driver.
+            exceptions into DataDesigner error types. Worker metrics aggregation now uses a Ray-side metrics channel
+            that returns compact usage, row-count, and failed-block summaries to the Ray result object without forcing
+            full dataset materialization on the driver after normal dataset execution.
           </td>
           <td>
             Users see DataDesigner errors rather than raw Ray stack traces at the public boundary; errors include
-            task/block context when available; model usage, row counts, validation counts, retries, and failed-block
-            summaries are aggregated deterministically and exposed through the result interface.
+            task/block context when available; model usage, row counts, and failed-block summaries are aggregated
+            deterministically and exposed through the result interface. Validation counts, retry attribution, and full
+            distributed profiler artifacts remain future work rather than part of the initial Phase D metrics channel.
           </td>
         </tr>
         <tr>
           <td>Phase E: Optional Extra Guarantees</td>
+          <td><span class="good">Implementation focus</span></td>
           <td>
             Preserve no-Ray installs. Imports outside <code>data_designer.integrations.ray</code> must not import Ray,
             require Ray dependencies, or slow normal startup. The <code>data-designer[ray]</code> extra remains the
@@ -861,8 +880,9 @@ ray_dataset_out = results.load_dataset()</pre>
         </tr>
         <tr>
           <td>Phase F: Test Matrix</td>
+          <td><span class="good">Report update</span></td>
           <td>
-            Build a correctness-first matrix before expanding performance work: local versus Ray Dataset versus Arrow
+            Document the correctness-first matrix created by the A-F push: local versus Ray Dataset versus Arrow
             ObjectRefs, seeded versus from-scratch generation, one block versus many blocks, pandas and Arrow-backed
             inputs, pure and rejected processors, success and failure paths, Ray installed and Ray absent.
           </td>
@@ -872,25 +892,14 @@ ray_dataset_out = results.load_dataset()</pre>
             local-then-Ray execution in the same Python process.
           </td>
         </tr>
-        <tr>
-          <td>Phase G: Performance After Correctness</td>
-          <td>
-            Only after Phases A-F pass should implementation move to actor/callable-class reuse, model client reuse,
-            block-size tuning, distributed profiler work, and cluster scheduling controls.
-          </td>
-          <td>
-            Performance benchmarks run against the same correctness suite, emit machine-readable results, disclose
-            provider/model/cluster settings, and never relax ordering, dtype, error, metrics, or determinism guarantees
-            to improve throughput.
-          </td>
-        </tr>
       </tbody>
     </table>
 
     <div class="callout warning">
       <strong>Sequence constraint:</strong> performance work should not mask correctness gaps. Worker reuse and block
       planning are high-value optimizations, but they should follow the row-id, dtype, seed, error, metrics, optional
-      import, and processor-policy gates above.
+      import, and processor-policy gates above. The Ray-side execution metrics channel is part of the correctness surface now;
+      full profiler artifact production remains a later optimization/research item.
     </div>
   </section>
 
@@ -921,7 +930,7 @@ ray_dataset_out = results.load_dataset()</pre>
           <li>Expose <code>override_num_blocks</code> / block planning controls.</li>
           <li>Coordinate provider throttling globally across Ray workers.</li>
           <li>Support actor placement, CPU/GPU/resource labels, and autoscaling-friendly defaults.</li>
-          <li>Add Ray-native usage metrics and trace collection.</li>
+          <li>Extend Ray-native trace collection beyond the current compact execution metrics actor.</li>
         </ul>
       </div>
     </div>
@@ -965,8 +974,8 @@ ray_dataset_out = results.load_dataset()</pre>
         model clients and DataDesigner resources once per worker process.
       </li>
       <li>
-        <strong>Add a distributed metrics channel.</strong> Return or collect usage stats, task traces, and error
-        summaries from workers into <code>RayDatasetCreationResults</code>.
+        <strong>Extend the distributed metrics channel.</strong> Add validation counts, retry attribution, task traces,
+        and profiler artifact summaries on top of the current worker usage and failed-block aggregation.
       </li>
       <li>
         <strong>Define order semantics.</strong> Either document unordered output or preserve a hidden row id and
@@ -990,6 +999,10 @@ ray_dataset_out = results.load_dataset()</pre>
           <td><span class="good">6 passed</span></td>
         </tr>
         <tr>
+          <td><code>uv run pytest packages/data-designer/tests/integrations/ray -q</code></td>
+          <td><span class="good">40 passed, 1 skipped</span></td>
+        </tr>
+        <tr>
           <td><code>uv run pytest packages/data-designer-engine/tests/engine/dataset_builders/test_dataset_builder.py -q</code></td>
           <td><span class="good">59 passed</span></td>
         </tr>
@@ -1005,6 +1018,10 @@ ray_dataset_out = results.load_dataset()</pre>
           <td><code>uv build packages/data-designer</code></td>
           <td><span class="good">built sdist and wheel</span></td>
         </tr>
+        <tr>
+          <td><code>./.venv/bin/python /tmp/dd_docs_text_to_python_ray_128.py</code></td>
+          <td><span class="good">128 generated rows, 8 Ray blocks, 0 failed blocks, non-null OpenAI usage metrics</span></td>
+        </tr>
       </tbody>
     </table>
   </section>
@@ -1015,8 +1032,8 @@ ray_dataset_out = results.load_dataset()</pre>
       The architecture is now in the right shape: Ray is an optional interface-level backend, not a cross-cutting
       dependency, and the engine remains reusable through an explicit async execution selector. The current Ray path
       proves the in-memory contract end to end, but it is still a first functional backend, not an optimized distributed
-      runtime. The highest-leverage next step is worker reuse, followed by explicit partition planning and distributed
-      metrics aggregation.
+      runtime. The highest-leverage next step is worker reuse, followed by explicit partition planning and richer
+      distributed tracing/profiling.
     </p>
   </section>
 </main>
