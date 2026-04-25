@@ -50,7 +50,14 @@ from data_designer.interface.backends import BackendRuntimeContext
 
 RayOutputMode = Literal["dataset", "arrow_refs"]
 RayObjectRefInputFormat = Literal["arrow", "pandas"]
-RayDatasetSourceKind = Literal["range", "input_dataset", "object_refs", "driver_materialized_seed", "seed_window"]
+RayDatasetSourceKind = Literal[
+    "range",
+    "input_dataset",
+    "object_refs",
+    "driver_materialized_seed",
+    "ray_native_seed",
+    "seed_window",
+]
 
 
 @dataclass(frozen=True)
@@ -438,11 +445,16 @@ class RayDriverPlanner:
                 runtime_context=runtime_context,
                 seed_config=seed_config,
                 num_records=num_records,
+                ray=self._ray,
             )
             if seed_plan.input_dataframe is not None:
                 input_dataset = self._ray.data.from_pandas(seed_plan.input_dataframe)
                 use_input_dataset = True
                 dataset_source_kind = "driver_materialized_seed"
+            elif seed_plan.input_dataset is not None:
+                input_dataset = seed_plan.input_dataset
+                use_input_dataset = True
+                dataset_source_kind = "ray_native_seed"
             else:
                 seed_window = seed_plan.seed_window
                 dataset_source_kind = "seed_window"

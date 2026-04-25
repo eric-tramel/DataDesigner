@@ -20,6 +20,7 @@ from data_designer.config.default_model_settings import (
     get_builtin_model_providers,
     resolve_seed_default_model_settings,
 )
+from data_designer.config.seed_source import LocalFileSeedSource
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayInputRepartition
 from data_designer.interface.data_designer import DataDesigner
@@ -189,6 +190,39 @@ def test_real_ray_input_dataset_repartition_smoke(
     assert metrics.blocks == 2
     assert sorted(output_df["x"].tolist()) == [1, 2, 3, 4]
     assert output_df["x_label"].notna().all()
+
+
+def test_real_ray_local_file_seed_ingestion_smoke(
+    tmp_path: Path,
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    seed_path = tmp_path / "seed.csv"
+    lazy.pd.DataFrame({"x": [1, 2, 3], "label": ["a", "b", "c"]}).to_csv(seed_path, index=False)
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.with_seed_dataset(LocalFileSeedSource(path=str(seed_path)))
+    config_builder.add_column(ExpressionColumnConfig(name="x_label", expr="{{ x }}-{{ label }}"))
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(batch_size=2, output="dataset"),
+    )
+
+    results = designer.create(config_builder, num_records=5)
+    output_df = results.load_dataset().to_pandas()
+
+    assert local_ray.is_initialized()
+    assert output_df.to_dict(orient="records") == [
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+        {"x": 3, "label": "c", "x_label": "3-c"},
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+    ]
 
 
 def _repo_root() -> Path:
