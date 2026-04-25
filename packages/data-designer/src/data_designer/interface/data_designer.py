@@ -60,7 +60,7 @@ from data_designer.engine.secret_resolver import (
     SecretResolver,
 )
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
-from data_designer.interface.backends import DataDesignerBackend
+from data_designer.interface.backends import DataDesignerBackend, DataDesignerRuntimeContext
 from data_designer.interface.errors import (
     DataDesignerGenerationError,
     DataDesignerProfilingError,
@@ -227,7 +227,7 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
         """
         if self._backend is not None:
             return self._backend.create(
-                data_designer=self,
+                runtime_context=self._create_backend_runtime_context(),
                 config_builder=config_builder,
                 num_records=num_records,
                 dataset_name=dataset_name,
@@ -502,6 +502,19 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             run_config=self._run_config,
             mcp_providers=self._mcp_providers,
             tool_configs=config_builder.tool_configs,
+        )
+
+    def _create_backend_runtime_context(self) -> DataDesignerRuntimeContext:
+        return DataDesignerRuntimeContext(
+            model_providers=tuple(self._model_providers),
+            model_provider_registry=self._model_provider_registry,
+            default_provider_name=self._model_provider_registry.get_default_provider_name(),
+            secret_resolver=self._secret_resolver,
+            seed_readers=tuple(self._seed_reader_registry._readers.values()),
+            managed_assets_path=self._managed_assets_path,
+            person_reader=self._person_reader,
+            mcp_providers=tuple(self._mcp_providers),
+            run_config=self._run_config,
         )
 
     def _get_interface_info(self, model_providers: list[ModelProvider]) -> InterfaceInfo:

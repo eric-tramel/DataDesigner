@@ -90,7 +90,7 @@ def test_ray_backend_usage_without_ray_has_optional_extra_message(monkeypatch: p
 
     with pytest.raises(ImportError, match=r"data-designer\[ray\]"):
         backend.create(
-            data_designer=object(),
+            runtime_context=object(),
             config_builder=config_builder,
             num_records=1,
             dataset_name="dataset",
