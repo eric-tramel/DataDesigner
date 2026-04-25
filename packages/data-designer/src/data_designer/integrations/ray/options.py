@@ -6,8 +6,9 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
+from urllib.parse import urlparse
 
 from data_designer.integrations.ray._validation import validate_finite_number
 from data_designer.integrations.ray.errors import RayBackendConfigurationError
@@ -52,6 +53,8 @@ _RAY_BACKEND_EXECUTION_OPTIONS_LEGACY_KWARGS = frozenset(
         "actor_pool_initial_size",
     }
 )
+_LOCAL_PROVIDER_TYPES = frozenset({"local", "local-openai", "ollama", "vllm"})
+_LOCAL_PROVIDER_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,10 +157,11 @@ class RayExecutionOptions:
     concurrency: RayMapConcurrency | None = None
     ray_remote_args_fn: Any | None = None
     ray_remote_args: Mapping[str, Any] | None = None
-    use_actor_pool: bool = False
+    use_actor_pool: bool | None = None
     actor_pool_min_size: int | None = None
     actor_pool_max_size: int | None = None
     actor_pool_initial_size: int | None = None
+    _default_actor_pool_min_size: bool = field(default=True, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _validate_optional_non_negative_number("num_cpus", self.num_cpus)
@@ -168,6 +172,8 @@ class RayExecutionOptions:
             raise RayBackendConfigurationError(
                 "RayExecutionOptions scheduling_strategy must be non-empty when provided."
             )
+        if self.use_actor_pool is not None and not isinstance(self.use_actor_pool, bool):
+            raise RayBackendConfigurationError("RayExecutionOptions use_actor_pool must be a boolean or None.")
         if self.compute is not None and self.use_actor_pool:
             raise RayBackendConfigurationError(
                 "RayExecutionOptions compute cannot be combined with use_actor_pool=True."
@@ -182,11 +188,11 @@ class RayExecutionOptions:
         _validate_optional_positive_int("actor_pool_min_size", self.actor_pool_min_size)
         _validate_optional_positive_int("actor_pool_max_size", self.actor_pool_max_size)
         _validate_optional_positive_int("actor_pool_initial_size", self.actor_pool_initial_size)
-        if self.actor_pool_min_size is not None and not self.use_actor_pool:
+        if self.actor_pool_min_size is not None and self.use_actor_pool is not True:
             raise RayBackendConfigurationError("RayExecutionOptions actor_pool_min_size requires use_actor_pool=True.")
-        if self.actor_pool_max_size is not None and not self.use_actor_pool:
+        if self.actor_pool_max_size is not None and self.use_actor_pool is not True:
             raise RayBackendConfigurationError("RayExecutionOptions actor_pool_max_size requires use_actor_pool=True.")
-        if self.actor_pool_initial_size is not None and not self.use_actor_pool:
+        if self.actor_pool_initial_size is not None and self.use_actor_pool is not True:
             raise RayBackendConfigurationError(
                 "RayExecutionOptions actor_pool_initial_size requires use_actor_pool=True."
             )
@@ -209,6 +215,34 @@ class RayExecutionOptions:
                 )
         _validate_remote_arg_conflicts(self)
 
+    def resolve_actor_pool_defaults(
+        self,
+        *,
+        model_configs: list[Any],
+        model_providers: list[Any],
+        default_provider_name: str,
+        model_aliases: list[str],
+    ) -> RayExecutionOptions:
+        """Return execution options with provider-aware actor-pool defaults applied."""
+        if self.use_actor_pool is not None:
+            return self
+        policy = resolve_provider_aware_actor_pool_policy(
+            model_configs=model_configs,
+            model_providers=model_providers,
+            default_provider_name=default_provider_name,
+            model_aliases=model_aliases,
+        )
+        if not policy.use_actor_pool:
+            return replace(self, use_actor_pool=False)
+        return replace(
+            self,
+            use_actor_pool=True,
+            actor_pool_min_size=policy.min_size,
+            actor_pool_max_size=policy.max_size,
+            actor_pool_initial_size=policy.initial_size,
+            _default_actor_pool_min_size=False,
+        )
+
     def to_map_batches_kwargs(self, ray: Any | None = None) -> dict[str, Any]:
         """Return keyword arguments accepted by ``Dataset.map_batches``."""
         kwargs: dict[str, Any] = {}
@@ -230,6 +264,16 @@ class RayExecutionOptions:
                 )
             kwargs["compute"] = _create_actor_pool_strategy(ray, self)
         return kwargs
+
+
+@dataclass(frozen=True, slots=True)
+class RayActorPoolPolicy:
+    """Resolved Ray actor-pool policy for provider-aware defaults."""
+
+    use_actor_pool: bool
+    min_size: int | None = None
+    max_size: int | None = None
+    initial_size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,6 +663,7 @@ def _resolve_ray_execution_options(
         )
     if execution_options is not None:
         return execution_options
+    use_actor_pool = legacy_options["use_actor_pool"] if "use_actor_pool" in legacy_options else None
     return RayExecutionOptions(
         num_cpus=legacy_options.get("num_cpus"),
         num_gpus=legacy_options.get("num_gpus"),
@@ -629,7 +674,7 @@ def _resolve_ray_execution_options(
         concurrency=legacy_options.get("map_concurrency"),
         ray_remote_args_fn=legacy_options.get("ray_remote_args_fn"),
         ray_remote_args=legacy_options.get("ray_remote_args"),
-        use_actor_pool=legacy_options.get("use_actor_pool", False),
+        use_actor_pool=use_actor_pool,
         actor_pool_min_size=legacy_options.get("actor_pool_min_size"),
         actor_pool_max_size=legacy_options.get("actor_pool_max_size"),
         actor_pool_initial_size=legacy_options.get("actor_pool_initial_size"),
@@ -661,6 +706,59 @@ def _has_effective_execution_legacy_options(legacy_options: Mapping[str, Any]) -
         if value is not None:
             return True
     return False
+
+
+def resolve_provider_aware_actor_pool_policy(
+    *,
+    model_configs: list[Any],
+    model_providers: list[Any],
+    default_provider_name: str,
+    model_aliases: list[str],
+) -> RayActorPoolPolicy:
+    """Resolve default Ray actor-pool sizing from referenced model providers.
+
+    External provider APIs get a bounded actor pool so Ray does not create more
+    model-client workers than the provider throttle budget can use. Local
+    OpenAI-compatible endpoints are left in task mode by default because their
+    best actor count depends on GPU placement and per-actor resource requests.
+    """
+    referenced_aliases = set(model_aliases)
+    if not referenced_aliases:
+        return RayActorPoolPolicy(use_actor_pool=False)
+
+    providers_by_name = {provider.name: provider for provider in model_providers}
+    external_caps: dict[tuple[str, str], int] = {}
+    for model_config in model_configs:
+        if model_config.alias not in referenced_aliases:
+            continue
+        provider_name = model_config.provider or default_provider_name
+        provider = providers_by_name.get(provider_name)
+        if _is_local_model_provider(provider):
+            continue
+        max_parallel_requests = int(model_config.inference_parameters.max_parallel_requests)
+        throttle_key = (provider_name, model_config.model)
+        external_caps[throttle_key] = min(external_caps.get(throttle_key, max_parallel_requests), max_parallel_requests)
+
+    if not external_caps:
+        return RayActorPoolPolicy(use_actor_pool=False)
+    max_size = max(sum(external_caps.values()), 1)
+    return RayActorPoolPolicy(use_actor_pool=True, max_size=max_size)
+
+
+def _is_local_model_provider(provider: Any | None) -> bool:
+    if provider is None:
+        return False
+    provider_type = getattr(provider, "provider_type", "")
+    if isinstance(provider_type, str) and provider_type.lower() in _LOCAL_PROVIDER_TYPES:
+        return True
+    endpoint = getattr(provider, "endpoint", "")
+    if not isinstance(endpoint, str) or not endpoint:
+        return False
+    parsed = urlparse(endpoint)
+    hostname = parsed.hostname
+    if hostname is None:
+        return endpoint.startswith("unix:")
+    return hostname.lower() in _LOCAL_PROVIDER_HOSTS
 
 
 def _validate_optional_positive_int(field_name: str, value: int | None) -> None:
@@ -806,7 +904,10 @@ def _create_actor_pool_strategy(ray: Any, options: RayExecutionOptions) -> Any:
             "RayExecutionOptions use_actor_pool=True requires ray.data.ActorPoolStrategy."
         )
     kwargs: dict[str, int] = {}
-    _set_if_not_none(kwargs, "min_size", options.actor_pool_min_size or 1)
+    min_size = options.actor_pool_min_size
+    if min_size is None and options._default_actor_pool_min_size:
+        min_size = 1
+    _set_if_not_none(kwargs, "min_size", min_size)
     _set_if_not_none(kwargs, "max_size", options.actor_pool_max_size)
     _set_if_not_none(kwargs, "initial_size", options.actor_pool_initial_size)
     return actor_pool_strategy(**kwargs)

@@ -17,6 +17,7 @@ from data_designer.config.base import ProcessorConfig
 from data_designer.config.column_configs import CustomColumnConfig, ExpressionColumnConfig, LLMTextColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.custom_column import custom_column_generator
+from data_designer.config.models import ChatCompletionInferenceParams, ModelConfig, ModelProvider
 from data_designer.config.processors import DropColumnsProcessorConfig, SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import IndexRange, SamplingStrategy
@@ -78,6 +79,19 @@ def _llm_config_builder(stub_model_configs: Any) -> DataDesignerConfigBuilder:
             model_alias="stub-model",
         )
     )
+    return config_builder
+
+
+def _multi_llm_config_builder(model_configs: list[ModelConfig]) -> DataDesignerConfigBuilder:
+    config_builder = DataDesignerConfigBuilder(model_configs=model_configs)
+    for model_config in model_configs:
+        config_builder.add_column(
+            LLMTextColumnConfig(
+                name=f"text_{model_config.alias.replace('-', '_')}",
+                prompt="Say hello.",
+                model_alias=model_config.alias,
+            )
+        )
     return config_builder
 
 
@@ -1146,6 +1160,147 @@ def test_ray_backend_actor_pool_uses_autoscaling_strategy_and_constructor_payloa
         "max_size": 4,
         "initial_size": 2,
     }
+
+
+def test_ray_backend_defaults_to_provider_capped_actor_pool_for_external_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [1]})])
+
+    def generate_batch(batch: lazy.pd.DataFrame, **_: Any) -> lazy.pd.DataFrame:
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1, preflight_model_health_check=False),
+    )
+
+    designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["compute"].kwargs == {"max_size": 4}
+    assert "num_cpus" not in input_dataset.map_batches_kwargs
+
+
+def test_ray_backend_provider_default_actor_pool_uses_effective_throttle_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [1]})])
+    model_configs = [
+        ModelConfig(
+            alias="fast",
+            model="shared-model",
+            provider="provider-1",
+            inference_parameters=ChatCompletionInferenceParams(max_parallel_requests=8),
+        ),
+        ModelConfig(
+            alias="constrained",
+            model="shared-model",
+            provider="provider-1",
+            inference_parameters=ChatCompletionInferenceParams(max_parallel_requests=2),
+        ),
+    ]
+
+    def generate_batch(batch: lazy.pd.DataFrame, **_: Any) -> lazy.pd.DataFrame:
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1, preflight_model_health_check=False),
+    )
+
+    designer.create(_multi_llm_config_builder(model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["compute"].kwargs["max_size"] == 2
+    assert "num_cpus" not in input_dataset.map_batches_kwargs
+
+
+def test_ray_backend_explicit_execution_options_disable_default_actor_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [1]})])
+
+    def generate_batch(batch: lazy.pd.DataFrame, **_: Any) -> lazy.pd.DataFrame:
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            preflight_model_health_check=False,
+            execution_options=RayExecutionOptions(use_actor_pool=False),
+        ),
+    )
+
+    designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert "compute" not in input_dataset.map_batches_kwargs
+
+
+def test_ray_backend_leaves_local_provider_actor_pool_sizing_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [1]})])
+    providers = [
+        ModelProvider(
+            name="local-gpu",
+            endpoint="http://127.0.0.1:8000/v1",
+            provider_type="openai",
+            api_key="local-key",
+        )
+    ]
+    model_configs = [
+        ModelConfig(
+            alias="local-model",
+            model="gpu-model",
+            provider="local-gpu",
+            inference_parameters=ChatCompletionInferenceParams(max_parallel_requests=16),
+        )
+    ]
+
+    def generate_batch(batch: lazy.pd.DataFrame, **_: Any) -> lazy.pd.DataFrame:
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1, preflight_model_health_check=False),
+    )
+
+    designer.create(_multi_llm_config_builder(model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert "compute" not in input_dataset.map_batches_kwargs
 
 
 def test_ray_backend_rejects_actor_pool_with_map_concurrency() -> None:
