@@ -78,17 +78,16 @@ def _input_expression_config_builder(stub_model_configs: Any) -> DataDesignerCon
 
 
 def _worker_options_from_designer(data_designer: DataDesigner) -> ray_backend_module._RayWorkerOptions:
+    runtime_context = data_designer._create_backend_runtime_context()
     return ray_backend_module._RayWorkerOptions(
-        model_providers=list(data_designer._model_providers),
-        default_provider_name=data_designer._model_provider_registry.get_default_provider_name(),
-        secret_resolver=data_designer._secret_resolver,
-        seed_readers=ray_backend_module._clone_seed_readers_for_worker(
-            data_designer._seed_reader_registry._readers.values()
-        ),
-        managed_assets_path=str(data_designer._managed_assets_path),
-        person_reader=data_designer._person_reader,
-        mcp_providers=list(data_designer._mcp_providers),
-        run_config=data_designer._run_config,
+        model_providers=list(runtime_context.model_providers),
+        default_provider_name=runtime_context.default_provider_name,
+        secret_resolver=runtime_context.secret_resolver,
+        seed_readers=ray_backend_module._clone_seed_readers_for_worker(runtime_context.seed_readers),
+        managed_assets_path=str(runtime_context.managed_assets_path),
+        person_reader=runtime_context.person_reader,
+        mcp_providers=list(runtime_context.mcp_providers),
+        run_config=runtime_context.run_config,
     )
 
 

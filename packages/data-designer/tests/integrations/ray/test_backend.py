@@ -922,7 +922,7 @@ def test_ray_backend_import_is_lazy_when_ray_is_missing(monkeypatch: pytest.Monk
 
     with pytest.raises(ImportError, match="data-designer\\[ray\\]"):
         backend.create(
-            data_designer=object(),
+            runtime_context=object(),
             config_builder=DataDesignerConfigBuilder(model_configs=[]),
             num_records=1,
             dataset_name="dataset",

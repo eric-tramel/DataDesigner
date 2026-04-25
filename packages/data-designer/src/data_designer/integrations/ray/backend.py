@@ -57,6 +57,7 @@ from data_designer.integrations.ray.observability import (
 from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, RayMapConcurrency
 from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
 from data_designer.integrations.ray.throttling import create_ray_throttle_manager
+from data_designer.interface.backends import BackendRuntimeContext
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -356,7 +357,7 @@ class RayBackend:
     def create(
         self,
         *,
-        data_designer: Any,
+        runtime_context: BackendRuntimeContext,
         config_builder: DataDesignerConfigBuilder,
         num_records: int,
         dataset_name: str,
@@ -388,10 +389,10 @@ class RayBackend:
             )
         seed_window: _RaySeedWindow | None = None
         if not use_input_dataset and seed_config is not None:
-            if _should_materialize_seed_on_driver(data_designer=data_designer, seed_config=seed_config):
+            if _should_materialize_seed_on_driver(runtime_context=runtime_context, seed_config=seed_config):
                 input_dataset = ray.data.from_pandas(
                     _materialize_seed_dataframe(
-                        data_designer=data_designer,
+                        runtime_context=runtime_context,
                         seed_config=seed_config,
                         num_records=num_records,
                     )
@@ -399,7 +400,7 @@ class RayBackend:
                 use_input_dataset = True
             else:
                 seed_window = _preflight_seed_window(
-                    data_designer=data_designer,
+                    runtime_context=runtime_context,
                     seed_config=seed_config,
                     num_records=num_records,
                 )
@@ -408,7 +409,7 @@ class RayBackend:
 
         model_aliases = _model_health_check_aliases(config_builder)
         if self.preflight_model_health_check:
-            _run_driver_model_health_check(data_designer, config_builder, model_aliases)
+            _run_driver_model_health_check(runtime_context, config_builder, model_aliases)
 
         block_plan = self.block_planning.resolve(num_records=num_records) if input_dataset is None else None
         dataset = self._resolve_input_dataset(
@@ -422,13 +423,13 @@ class RayBackend:
             dataset = _attach_hidden_row_id_column(ray, dataset, hidden_order_column=hidden_order_column)
         input_blocks = _get_num_blocks(dataset)
         metrics_collector = _create_metrics_collector(ray, max_trace_events=self.max_trace_events)
-        batch_size = self.batch_size or data_designer._run_config.buffer_size
+        batch_size = self.batch_size or runtime_context.run_config.buffer_size
         observability_options = _RayObservabilityOptions(
             profile_workers=self.profile_workers,
             trace_enabled=self.trace_enabled,
         )
         throttle_manager = (
-            create_ray_throttle_manager(ray, data_designer._run_config)
+            create_ray_throttle_manager(ray, runtime_context.run_config)
             if self.global_provider_throttling
             and config_builder.model_configs
             and callable(getattr(ray, "remote", None))
@@ -441,17 +442,17 @@ class RayBackend:
         worker_seed_readers = (
             [DataFrameSeedReader()]
             if use_input_dataset
-            else _clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
+            else _clone_seed_readers_for_worker(runtime_context.seed_readers)
         )
         worker_options = _RayWorkerOptions(
-            model_providers=list(data_designer._model_providers),
-            default_provider_name=data_designer._model_provider_registry.get_default_provider_name(),
-            secret_resolver=data_designer._secret_resolver,
+            model_providers=list(runtime_context.model_providers),
+            default_provider_name=runtime_context.default_provider_name,
+            secret_resolver=runtime_context.secret_resolver,
             seed_readers=worker_seed_readers,
-            managed_assets_path=str(data_designer._managed_assets_path),
-            person_reader=data_designer._person_reader,
-            mcp_providers=list(data_designer._mcp_providers),
-            run_config=data_designer._run_config,
+            managed_assets_path=str(runtime_context.managed_assets_path),
+            person_reader=runtime_context.person_reader,
+            mcp_providers=list(runtime_context.mcp_providers),
+            run_config=runtime_context.run_config,
             throttle_manager=throttle_manager,
         )
         execution_payload = _compile_ray_execution_payload(
@@ -644,7 +645,7 @@ def _model_health_check_aliases(config_builder: DataDesignerConfigBuilder) -> li
 
 
 def _run_driver_model_health_check(
-    data_designer: Any,
+    runtime_context: BackendRuntimeContext,
     config_builder: DataDesignerConfigBuilder,
     model_aliases: list[str],
 ) -> None:
@@ -653,16 +654,9 @@ def _run_driver_model_health_check(
     try:
         with tempfile.TemporaryDirectory(prefix="data-designer-ray-preflight-") as artifact_dir:
             ArtifactStorage.mkdir_if_needed(Path(artifact_dir))
-            resource_provider = create_resource_provider(
+            resource_provider = runtime_context.create_resource_provider(
                 artifact_storage=ArtifactStorage(artifact_path=artifact_dir, dataset_name="ray-preflight"),
                 model_configs=config_builder.model_configs,
-                secret_resolver=data_designer._secret_resolver,
-                model_provider_registry=data_designer._model_provider_registry,
-                seed_reader_registry=data_designer._seed_reader_registry,
-                person_reader=data_designer._person_reader
-                or create_person_reader(str(data_designer._managed_assets_path)),
-                run_config=data_designer._run_config,
-                mcp_providers=list(data_designer._mcp_providers),
                 tool_configs=config_builder.tool_configs,
             )
             resource_provider.model_registry.run_health_check(model_aliases)
@@ -689,7 +683,7 @@ def _clone_config_builder_for_worker(
 
 def _preflight_seed_window(
     *,
-    data_designer: Any,
+    runtime_context: BackendRuntimeContext,
     seed_config: SeedConfig,
     num_records: int,
 ) -> _RaySeedWindow:
@@ -700,9 +694,9 @@ def _preflight_seed_window(
         )
 
     try:
-        seed_reader = SeedReaderRegistry(
-            readers=_clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
-        ).get_reader(seed_config.source, data_designer._secret_resolver)
+        seed_reader = runtime_context.create_seed_reader_registry(
+            seed_readers=_clone_seed_readers_for_worker(runtime_context.seed_readers)
+        ).get_reader(seed_config.source, runtime_context.secret_resolver)
         seed_dataset_size = seed_reader.get_seed_dataset_size()
         index_range = _resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=seed_dataset_size)
     except RayBackendConfigurationError:
@@ -720,12 +714,12 @@ def _preflight_seed_window(
     return _RaySeedWindow(start=index_range.start, size=index_range.size)
 
 
-def _should_materialize_seed_on_driver(*, data_designer: Any, seed_config: SeedConfig) -> bool:
+def _should_materialize_seed_on_driver(*, runtime_context: BackendRuntimeContext, seed_config: SeedConfig) -> bool:
     """Return whether Ray should treat a seed source as a materialized input dataset."""
     try:
-        seed_reader = SeedReaderRegistry(
-            readers=_clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
-        ).get_reader(seed_config.source, data_designer._secret_resolver)
+        seed_reader = runtime_context.create_seed_reader_registry(
+            seed_readers=_clone_seed_readers_for_worker(runtime_context.seed_readers)
+        ).get_reader(seed_config.source, runtime_context.secret_resolver)
     except Exception as exc:
         raise RayBackendConfigurationError("RayBackend failed to inspect the seed reader for Ray planning.") from exc
     return isinstance(seed_reader, FileSystemSeedReader)
@@ -733,7 +727,7 @@ def _should_materialize_seed_on_driver(*, data_designer: Any, seed_config: SeedC
 
 def _materialize_seed_dataframe(
     *,
-    data_designer: Any,
+    runtime_context: BackendRuntimeContext,
     seed_config: SeedConfig,
     num_records: int,
 ) -> Any:
@@ -744,9 +738,9 @@ def _materialize_seed_dataframe(
         )
 
     try:
-        seed_reader = SeedReaderRegistry(
-            readers=_clone_seed_readers_for_worker(data_designer._seed_reader_registry._readers.values())
-        ).get_reader(seed_config.source, data_designer._secret_resolver)
+        seed_reader = runtime_context.create_seed_reader_registry(
+            seed_readers=_clone_seed_readers_for_worker(runtime_context.seed_readers)
+        ).get_reader(seed_config.source, runtime_context.secret_resolver)
         seed_dataset_size = seed_reader.get_seed_dataset_size()
         index_range = _resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=seed_dataset_size)
     except RayBackendConfigurationError:
