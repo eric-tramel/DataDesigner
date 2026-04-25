@@ -17,6 +17,7 @@ from data_designer.integrations.ray import RayBackend, RayDatasetCreationResults
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.integrations.ray import observability_collection as ray_observability_collection
 from data_designer.integrations.ray.metrics import RayWorkerMetrics, aggregate_ray_metrics
+from data_designer.integrations.ray.results import RayResultArtifacts
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = pytest.mark.ray_fake
@@ -111,6 +112,52 @@ def test_ray_results_load_metrics_preserves_zero_worker_total_rows(
     assert metrics.blocks == 1
     assert metrics.elapsed_seconds == 10.0
     assert metrics.worker_elapsed_seconds == 0.25
+
+
+def test_ray_result_artifacts_load_metrics_materializes_lazy_dataset_when_snapshot_empty() -> None:
+    state = {"materialized": False}
+
+    class LazyMetricsDataset:
+        def __init__(self) -> None:
+            self.materialize_calls = 0
+
+        def materialize(self) -> LazyMetricsDataset:
+            self.materialize_calls += 1
+            state["materialized"] = True
+            return self
+
+    class LazyMetricsCollector:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+
+        def snapshot(self) -> list[dict[str, Any]]:
+            self.snapshot_calls += 1
+            if not state["materialized"]:
+                return []
+            return [{"total_rows": 4, "blocks": 1, "elapsed_seconds": 2.0}]
+
+    dataset = LazyMetricsDataset()
+    collector = LazyMetricsCollector()
+    artifacts = RayResultArtifacts(
+        dataset=dataset,
+        metrics=RayDatasetMetrics(total_rows=4, blocks=1, elapsed_seconds=10.0),
+        ray=types.SimpleNamespace(get=lambda ref: ref.value),
+        metrics_collector=FakeActorHandle(collector),
+    )
+
+    metrics = artifacts.load_metrics()
+
+    assert dataset.materialize_calls == 1
+    assert collector.snapshot_calls == 2
+    assert metrics.total_rows == 4
+    assert metrics.blocks == 1
+    assert metrics.elapsed_seconds == 10.0
+    assert metrics.worker_elapsed_seconds == 2.0
+    assert artifacts.load_dataset() is dataset
+
+    assert artifacts.load_metrics() is metrics
+    assert dataset.materialize_calls == 1
+    assert collector.snapshot_calls == 2
 
 
 def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
