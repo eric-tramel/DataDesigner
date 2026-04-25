@@ -220,6 +220,12 @@ class RayBackend:
     ``execution_options=RayExecutionOptions(...)`` for Ray-specific controls.
     Individual Ray planning and execution kwargs are still accepted as
     backwards-compatible shims.
+
+    Observability artifacts are bounded on the metrics actor. ``profile_workers=True``
+    computes one per-block worker profile before the collector applies
+    ``max_worker_profiles``; trace events and throttle snapshots are bounded by
+    ``max_trace_events`` and ``max_throttle_snapshots``. Keep worker profiling
+    disabled for jobs where profiling overhead matters more than diagnostics.
     """
 
     def __init__(
@@ -243,6 +249,8 @@ class RayBackend:
         profile_workers: bool = True,
         trace_enabled: bool = False,
         max_trace_events: int = 1000,
+        max_worker_profiles: int = 1000,
+        max_throttle_snapshots: int = 1000,
         **legacy_options: Any,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
@@ -252,8 +260,9 @@ class RayBackend:
         _validate_ray_backend_batch_size(batch_size)
         if order_column is not None and order_column == "":
             raise RayBackendConfigurationError("RayBackend order_column must be a non-empty string when provided.")
-        if max_trace_events < 0:
-            raise RayBackendConfigurationError("RayBackend max_trace_events must be non-negative.")
+        _validate_ray_backend_non_negative_int("max_trace_events", max_trace_events)
+        _validate_ray_backend_non_negative_int("max_worker_profiles", max_worker_profiles)
+        _validate_ray_backend_non_negative_int("max_throttle_snapshots", max_throttle_snapshots)
         resolved_options = resolve_ray_backend_options(
             block_planning=block_planning,
             execution_options=execution_options,
@@ -278,6 +287,8 @@ class RayBackend:
         self.profile_workers = profile_workers
         self.trace_enabled = trace_enabled
         self.max_trace_events = max_trace_events
+        self.max_worker_profiles = max_worker_profiles
+        self.max_throttle_snapshots = max_throttle_snapshots
 
     def create(
         self,
@@ -451,10 +462,17 @@ class RayDriverPlanner:
                 hidden_order_column=_RAY_INTERNAL_ROW_ID_COLUMN,
             )
 
-        metrics_collector = _create_metrics_collector(self._ray, max_trace_events=self._backend.max_trace_events)
+        metrics_collector = _create_metrics_collector(
+            self._ray,
+            max_trace_events=self._backend.max_trace_events,
+            max_worker_profiles=self._backend.max_worker_profiles,
+            max_throttle_snapshots=self._backend.max_throttle_snapshots,
+        )
         observability_options = _RayObservabilityOptions(
             profile_workers=self._backend.profile_workers,
             trace_enabled=self._backend.trace_enabled,
+            max_worker_profiles=self._backend.max_worker_profiles,
+            max_throttle_snapshots=self._backend.max_throttle_snapshots,
         )
         throttle_manager = self._create_throttle_manager(runtime_context, config_builder)
         worker_config_builder = _clone_config_builder_for_worker(
@@ -561,6 +579,11 @@ def _validate_ray_backend_batch_size(batch_size: int | None) -> None:
         return
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise RayBackendConfigurationError("RayBackend batch_size must be a positive integer or None.")
+
+
+def _validate_ray_backend_non_negative_int(field_name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RayBackendConfigurationError(f"RayBackend {field_name} must be a non-negative integer.")
 
 
 def _model_health_check_aliases(config_builder: DataDesignerConfigBuilder) -> list[str]:

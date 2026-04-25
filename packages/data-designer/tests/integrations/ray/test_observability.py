@@ -88,15 +88,94 @@ def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(
     assert analysis.blocks == 1
     assert analysis.worker_profiles[0].block_id == "block-a"
     assert analysis.worker_profiles[0].null_counts == {"id": 0, "label": 1}
+    assert analysis.worker_profiles_dropped == 0
     assert analysis.trace_events[0].event_type == "block_started"
     assert analysis.trace_events_dropped == 1
     assert analysis.throttle_snapshots[0].rate_limit_ceiling == 3
+    assert analysis.throttle_snapshots_dropped == 0
     assert results.load_worker_metrics()[0].block_id == analysis.worker_profiles[0].block_id
 
     report_path = tmp_path / "ray-analysis.json"
     analysis.to_report(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["worker_profiles"][0]["block_id"] == "block-a"
+    assert report["worker_profiles_dropped"] == 0
+    assert report["throttle_snapshots_dropped"] == 0
+
+
+def test_ray_metrics_collector_bounds_profiles_and_throttle_snapshots() -> None:
+    collector = ray_observability_collection._RayMetricsCollector(
+        max_trace_events=1,
+        max_worker_profiles=1,
+        max_throttle_snapshots=1,
+    )
+
+    collector.record_observability(
+        {
+            "worker_profile": RayWorkerProfile(block_id="block-a", total_rows=1).to_dict(),
+            "trace_events": [
+                RayTraceEvent(block_id="block-a", event_type="block_started", timestamp_seconds=1.0).to_dict(),
+                RayTraceEvent(block_id="block-a", event_type="block_completed", timestamp_seconds=2.0).to_dict(),
+            ],
+            "throttle_snapshots": [
+                RayThrottleSnapshot(
+                    provider_name="provider",
+                    model_id="model",
+                    domain="chat",
+                    current_limit=1,
+                ).to_dict(),
+                RayThrottleSnapshot(
+                    provider_name="provider",
+                    model_id="model",
+                    domain="embedding",
+                    current_limit=2,
+                ).to_dict(),
+            ],
+        }
+    )
+    collector.record_observability(
+        {
+            "worker_profile": RayWorkerProfile(block_id="block-b", total_rows=1).to_dict(),
+            "trace_events": [
+                RayTraceEvent(block_id="block-b", event_type="block_started", timestamp_seconds=3.0).to_dict()
+            ],
+            "throttle_snapshots": [
+                RayThrottleSnapshot(
+                    provider_name="provider",
+                    model_id="model",
+                    domain="chat",
+                    current_limit=3,
+                ).to_dict()
+            ],
+        }
+    )
+
+    snapshot = collector.observability_snapshot()
+    assert [profile["block_id"] for profile in snapshot["worker_profiles"]] == ["block-a"]
+    assert snapshot["worker_profiles_dropped"] == 1
+    assert [event["block_id"] for event in snapshot["trace_events"]] == ["block-a"]
+    assert snapshot["trace_events_dropped"] == 2
+    assert [throttle_snapshot["domain"] for throttle_snapshot in snapshot["throttle_snapshots"]] == ["chat"]
+    assert snapshot["throttle_snapshots_dropped"] == 2
+
+
+def test_assemble_ray_dataset_analysis_reports_dropped_observability_counts() -> None:
+    analysis = ray_observability_collection.assemble_ray_dataset_analysis(
+        RayDatasetMetrics(total_rows=2, blocks=2),
+        {
+            "worker_profiles_dropped": 2,
+            "trace_events_dropped": 3,
+            "throttle_snapshots_dropped": 4,
+        },
+    )
+
+    assert analysis is not None
+    assert analysis.worker_profiles == []
+    assert analysis.worker_profiles_dropped == 2
+    assert analysis.trace_events == []
+    assert analysis.trace_events_dropped == 3
+    assert analysis.throttle_snapshots == []
+    assert analysis.throttle_snapshots_dropped == 4
 
 
 def test_ray_results_load_analysis_returns_none_without_observability_payload(
@@ -157,11 +236,13 @@ def test_ray_dataset_analysis_to_report_filters_json_sections(tmp_path: Path) ->
         total_rows=2,
         blocks=1,
         worker_profiles=[RayWorkerProfile(block_id="block-a", total_rows=2, columns=["label"])],
+        worker_profiles_dropped=4,
         trace_events=[RayTraceEvent(block_id="block-a", event_type="block_started", timestamp_seconds=1.0)],
         trace_events_dropped=3,
         throttle_snapshots=[
             RayThrottleSnapshot(provider_name="provider", model_id="model", domain="chat", current_limit=1)
         ],
+        throttle_snapshots_dropped=5,
     )
     report_path = tmp_path / "ray-analysis.json"
 
@@ -174,8 +255,10 @@ def test_ray_dataset_analysis_to_report_filters_json_sections(tmp_path: Path) ->
             "column_names": ["label"],
             "failed_blocks": 0,
             "successful_blocks": 1,
+            "throttle_snapshots_dropped": 5,
             "total_rows": 2,
             "trace_events_dropped": 3,
+            "worker_profiles_dropped": 4,
         },
         "trace_events": [
             {

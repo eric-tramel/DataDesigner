@@ -175,9 +175,11 @@ class RayDatasetAnalysis:
     blocks: int = 0
     failed_blocks: int = 0
     worker_profiles: list[RayWorkerProfile] = field(default_factory=list)
+    worker_profiles_dropped: int = 0
     trace_events: list[RayTraceEvent] = field(default_factory=list)
     trace_events_dropped: int = 0
     throttle_snapshots: list[RayThrottleSnapshot] = field(default_factory=list)
+    throttle_snapshots_dropped: int = 0
 
     def __post_init__(self) -> None:
         validate_non_negative_int_field("total_rows", self.total_rows, field_label=_OBSERVABILITY_FIELD_LABEL)
@@ -189,8 +191,18 @@ class RayDatasetAnalysis:
             field_label=_OBSERVABILITY_FIELD_LABEL,
         )
         validate_non_negative_int_field(
+            "worker_profiles_dropped",
+            self.worker_profiles_dropped,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
             "trace_events_dropped",
             self.trace_events_dropped,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "throttle_snapshots_dropped",
+            self.throttle_snapshots_dropped,
             field_label=_OBSERVABILITY_FIELD_LABEL,
         )
 
@@ -238,15 +250,19 @@ class RayDatasetAnalysis:
                 "failed_blocks": self.failed_blocks,
                 "successful_blocks": self.successful_blocks,
                 "column_names": self.column_names,
+                "worker_profiles_dropped": self.worker_profiles_dropped,
                 "trace_events_dropped": self.trace_events_dropped,
+                "throttle_snapshots_dropped": self.throttle_snapshots_dropped,
             }
         if "worker_profiles" in sections:
             payload["worker_profiles"] = [profile.to_dict() for profile in self.worker_profiles]
+            payload["worker_profiles_dropped"] = self.worker_profiles_dropped
         if "trace_events" in sections:
             payload["trace_events"] = [event.to_dict() for event in self.trace_events]
             payload["trace_events_dropped"] = self.trace_events_dropped
         if "throttle_snapshots" in sections:
             payload["throttle_snapshots"] = [snapshot.to_dict() for snapshot in self.throttle_snapshots]
+            payload["throttle_snapshots_dropped"] = self.throttle_snapshots_dropped
         return payload
 
 

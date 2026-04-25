@@ -27,16 +27,27 @@ from data_designer.integrations.ray.observability import (
 class _RayObservabilityOptions:
     profile_workers: bool = False
     trace_enabled: bool = False
+    max_worker_profiles: int = 1000
+    max_throttle_snapshots: int = 1000
 
 
 class _RayMetricsCollector:
-    def __init__(self, max_trace_events: int = 1000) -> None:
+    def __init__(
+        self,
+        max_trace_events: int = 1000,
+        max_worker_profiles: int = 1000,
+        max_throttle_snapshots: int = 1000,
+    ) -> None:
         self._payloads: list[dict[str, Any]] = []
         self._worker_profiles: list[dict[str, Any]] = []
+        self._worker_profiles_dropped = 0
         self._trace_events: list[dict[str, Any]] = []
         self._trace_events_dropped = 0
         self._throttle_snapshots: list[dict[str, Any]] = []
+        self._throttle_snapshots_dropped = 0
         self._max_trace_events = max_trace_events
+        self._max_worker_profiles = max_worker_profiles
+        self._max_throttle_snapshots = max_throttle_snapshots
 
     def record(self, payload: dict[str, Any]) -> None:
         self._payloads.append(payload)
@@ -44,16 +55,24 @@ class _RayMetricsCollector:
     def record_observability(self, payload: dict[str, Any]) -> None:
         profile = payload.get("worker_profile")
         if isinstance(profile, dict):
-            self._worker_profiles.append(profile)
+            if len(self._worker_profiles) >= self._max_worker_profiles:
+                self._worker_profiles_dropped += 1
+            else:
+                self._worker_profiles.append(profile)
         for event in payload.get("trace_events", []) or []:
+            if not isinstance(event, dict):
+                continue
             if len(self._trace_events) >= self._max_trace_events:
                 self._trace_events_dropped += 1
                 continue
-            if isinstance(event, dict):
-                self._trace_events.append(event)
+            self._trace_events.append(event)
         for snapshot in payload.get("throttle_snapshots", []) or []:
-            if isinstance(snapshot, dict):
-                self._throttle_snapshots.append(snapshot)
+            if not isinstance(snapshot, dict):
+                continue
+            if len(self._throttle_snapshots) >= self._max_throttle_snapshots:
+                self._throttle_snapshots_dropped += 1
+                continue
+            self._throttle_snapshots.append(snapshot)
 
     def snapshot(self) -> list[dict[str, Any]]:
         return list(self._payloads)
@@ -61,17 +80,29 @@ class _RayMetricsCollector:
     def observability_snapshot(self) -> dict[str, Any]:
         return {
             "worker_profiles": list(self._worker_profiles),
+            "worker_profiles_dropped": self._worker_profiles_dropped,
             "trace_events": list(self._trace_events),
             "trace_events_dropped": self._trace_events_dropped,
             "throttle_snapshots": list(self._throttle_snapshots),
+            "throttle_snapshots_dropped": self._throttle_snapshots_dropped,
         }
 
 
-def _create_metrics_collector(ray: Any, *, max_trace_events: int = 1000) -> Any | None:
+def _create_metrics_collector(
+    ray: Any,
+    *,
+    max_trace_events: int = 1000,
+    max_worker_profiles: int = 1000,
+    max_throttle_snapshots: int = 1000,
+) -> Any | None:
     remote = getattr(ray, "remote", None)
     if not callable(remote):
         return None
-    return remote(_RayMetricsCollector).remote(max_trace_events=max_trace_events)
+    return remote(_RayMetricsCollector).remote(
+        max_trace_events=max_trace_events,
+        max_worker_profiles=max_worker_profiles,
+        max_throttle_snapshots=max_throttle_snapshots,
+    )
 
 
 def assemble_ray_dataset_analysis(
@@ -90,18 +121,22 @@ def assemble_ray_dataset_analysis(
         blocks=metrics.blocks,
         failed_blocks=metrics.failed_blocks,
         worker_profiles=worker_profiles,
+        worker_profiles_dropped=int(payload.get("worker_profiles_dropped", 0) or 0),
         trace_events=trace_events,
         trace_events_dropped=int(payload.get("trace_events_dropped", 0) or 0),
         throttle_snapshots=throttle_snapshots,
+        throttle_snapshots_dropped=int(payload.get("throttle_snapshots_dropped", 0) or 0),
     )
 
 
 def _has_observability_payload(payload: Mapping[str, Any]) -> bool:
     return bool(
         payload.get("worker_profiles")
+        or payload.get("worker_profiles_dropped")
         or payload.get("trace_events")
         or payload.get("trace_events_dropped")
         or payload.get("throttle_snapshots")
+        or payload.get("throttle_snapshots_dropped")
     )
 
 
