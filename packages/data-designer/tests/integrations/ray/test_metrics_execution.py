@@ -72,7 +72,7 @@ def test_ray_results_load_metrics_exposes_worker_aggregate(
     assert results.load_metrics() == RayDatasetMetrics(
         total_rows=5,
         blocks=2,
-        elapsed_seconds=3.0,
+        worker_elapsed_seconds=3.0,
         model_usage={
             "stub-model": {
                 "token_usage": {"input_tokens": 5, "output_tokens": 15, "total_tokens": 20},
@@ -108,7 +108,8 @@ def test_ray_results_load_metrics_preserves_zero_worker_total_rows(
 
     assert metrics.total_rows == 0
     assert metrics.blocks == 1
-    assert metrics.elapsed_seconds == 0.25
+    assert metrics.elapsed_seconds == 10.0
+    assert metrics.worker_elapsed_seconds == 0.25
 
 
 def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
@@ -187,7 +188,8 @@ def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
     assert results.load_dataset().to_pandas().to_dict(orient="records") == [{"id": 0}, {"id": 1}, {"id": 2}]
     assert metrics.total_rows == 3
     assert metrics.blocks == 2
-    assert metrics.elapsed_seconds == 1.5
+    assert metrics.elapsed_seconds > 0
+    assert metrics.worker_elapsed_seconds == 1.5
     assert metrics.model_usage == {
         "stub-model": {
             "token_usage": {"input_tokens": 6, "output_tokens": 8, "total_tokens": 14},
