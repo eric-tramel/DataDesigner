@@ -475,7 +475,18 @@ class DatasetBuilder:
         return scheduler, buffer_manager
 
     def process_preview(self, dataset: pd.DataFrame) -> pd.DataFrame:
-        df = self._processor_runner.run_post_batch(dataset.copy(), current_batch_number=None)
+        return self.process_block(dataset, current_batch_number=None)
+
+    def build_block(
+        self, *, num_records: int, current_batch_number: int | None = None
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Build one in-memory execution block and run block-level processors."""
+        raw_dataset = self.build_preview(num_records=num_records)
+        return raw_dataset, self.process_block(raw_dataset, current_batch_number=current_batch_number)
+
+    def process_block(self, dataset: pd.DataFrame, *, current_batch_number: int | None = None) -> pd.DataFrame:
+        """Run post-batch and after-generation processors for an in-memory block."""
+        df = self._processor_runner.run_post_batch(dataset.copy(), current_batch_number=current_batch_number)
         return self._processor_runner.run_after_generation_on_df(df)
 
     def _has_image_columns(self) -> bool:
