@@ -7,7 +7,7 @@ import json
 from enum import Enum
 from typing import Any, ClassVar, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from data_designer.config.base import ConfigBase, ProcessorConfig
 from data_designer.config.errors import InvalidConfigError
@@ -39,10 +39,14 @@ class ProcessorDistributedSafety(ConfigBase):
 
     Processor configs declare this as class-level metadata so execution backends
     can fail closed for processors that have not been reviewed for distributed
-    semantics.
+    semantics. Legacy ``ray_safe`` constructor input is accepted as a deprecated
+    alias for ``partition_safe`` to preserve compatibility with existing
+    processor plugins.
     """
 
-    ray_safe: bool = Field(description="Whether the processor is safe to run independently on Ray Data blocks.")
+    partition_safe: bool = Field(
+        description="Whether the processor is safe to run independently on distributed data partitions.",
+    )
     requires_global_order: bool = Field(
         default=False,
         description="Whether the processor requires a globally ordered or complete dataset view.",
@@ -55,6 +59,29 @@ class ProcessorDistributedSafety(ConfigBase):
         default=None,
         description="Human-readable explanation for unsafe or constrained distributed execution.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_legacy_ray_safe(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "ray_safe" not in data:
+            return data
+
+        values = dict(data)
+        ray_safe = values.pop("ray_safe")
+        partition_safe = values.get("partition_safe")
+        if partition_safe is not None and partition_safe != ray_safe:
+            raise ValueError("ray_safe is a deprecated alias for partition_safe and cannot disagree with it")
+        values["partition_safe"] = ray_safe
+        return values
+
+    @property
+    def ray_safe(self) -> bool:
+        """Deprecated compatibility alias for ``partition_safe``."""
+        return self.partition_safe
+
+    @ray_safe.setter
+    def ray_safe(self, value: bool) -> None:
+        self.partition_safe = value
 
 
 def get_processor_config_from_kwargs(processor_type: ProcessorType, **kwargs: Any) -> ProcessorConfig:
@@ -91,7 +118,7 @@ class DropColumnsProcessorConfig(ProcessorConfig):
     column_names: list[str] = Field(description="List of column names to drop from the output dataset.")
     processor_type: Literal[ProcessorType.DROP_COLUMNS] = ProcessorType.DROP_COLUMNS
     distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
-        ray_safe=True,
+        partition_safe=True,
         requires_global_order=False,
         side_effects=ProcessorSideEffect.BATCH_ARTIFACT,
         reason="Drops columns independently per batch; dropped-column artifacts are batch-local.",
@@ -139,10 +166,10 @@ class SchemaTransformProcessorConfig(ProcessorConfig):
     )
     processor_type: Literal[ProcessorType.SCHEMA_TRANSFORM] = ProcessorType.SCHEMA_TRANSFORM
     distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
-        ray_safe=False,
+        partition_safe=True,
         requires_global_order=False,
         side_effects=ProcessorSideEffect.DATASET_ARTIFACT,
-        reason="Writes processor output artifacts that RayBackend does not collect from worker-local storage.",
+        reason="Writes dataset-level processor output artifacts that require backend artifact collection.",
     )
 
     @field_validator("template")

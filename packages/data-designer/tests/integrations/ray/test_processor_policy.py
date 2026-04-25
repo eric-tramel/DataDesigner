@@ -23,6 +23,7 @@ from data_designer.config.processors import (
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
 from data_designer.interface.data_designer import DataDesigner
 
 
@@ -66,10 +67,28 @@ class MissingSafetyProcessorConfig(ProcessorConfig):
 class GlobalOrderProcessorConfig(ProcessorConfig):
     processor_type: Literal["global_order"] = "global_order"
     distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
-        ray_safe=True,
+        partition_safe=True,
         requires_global_order=True,
         side_effects=ProcessorSideEffect.NONE,
         reason="Requires a globally ordered dataset.",
+    )
+
+
+class PartitionUnsafeProcessorConfig(ProcessorConfig):
+    processor_type: Literal["partition_unsafe"] = "partition_unsafe"
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        partition_safe=False,
+        side_effects=ProcessorSideEffect.NONE,
+        reason="Requires cross-partition state.",
+    )
+
+
+class LegacyRaySafeProcessorConfig(ProcessorConfig):
+    processor_type: Literal["legacy_ray_safe"] = "legacy_ray_safe"
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        ray_safe=True,
+        side_effects=ProcessorSideEffect.NONE,
+        reason="Uses legacy compatibility metadata.",
     )
 
 
@@ -162,9 +181,8 @@ def test_ray_backend_rejects_schema_transform_processor_by_default(
 
     message = str(exc_info.value)
     assert "schema-transform (schema_transform)" in message
-    assert "ray_safe=False" in message
-    assert "side_effects=dataset_artifact" in message
-    assert "worker-local storage" in message
+    assert "side_effects=dataset_artifact unsupported by RayBackend" in message
+    assert "artifact collection" in message
     assert "allow_unsafe_processors=True" in message
     assert input_dataset.map_batches_kwargs is None
 
@@ -188,6 +206,25 @@ def test_ray_backend_rejects_processor_without_distributed_safety_metadata(
     assert input_dataset.map_batches_kwargs is None
 
 
+def test_ray_backend_rejects_partition_unsafe_processor_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    _install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(PartitionUnsafeProcessorConfig(name="partition-unsafe-processor"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend())
+
+    with pytest.raises(RayBackendConfigurationError, match="partition_safe=False") as exc_info:
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    assert "partition-unsafe-processor (partition_unsafe)" in str(exc_info.value)
+    assert input_dataset.map_batches_kwargs is None
+
+
 def test_ray_backend_rejects_global_order_processor_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -205,6 +242,13 @@ def test_ray_backend_rejects_global_order_processor_metadata(
 
     assert "global-order-processor (global_order)" in str(exc_info.value)
     assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_processor_policy_accepts_legacy_ray_safe_metadata(stub_model_configs: Any) -> None:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_processor(LegacyRaySafeProcessorConfig(name="legacy-processor"))
+
+    validate_ray_safe_processors(config_builder)
 
 
 def test_ray_backend_allow_unsafe_processors_bypasses_schema_transform_preflight(
