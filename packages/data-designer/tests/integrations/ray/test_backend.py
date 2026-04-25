@@ -29,6 +29,7 @@ from data_designer.integrations.ray import (
     RayExecutionOptions,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = pytest.mark.ray_fake
@@ -887,7 +888,7 @@ def test_seed_readers_are_cloned_without_attachment_state() -> None:
     assert reader.get_seed_dataset_size() == 1
     assert getattr(reader, "_duckdb_conn") is not None
 
-    clones = ray_backend_module._clone_seed_readers_for_worker([reader])
+    clones = ray_seed_planning.clone_seed_readers_for_worker([reader])
 
     assert len(clones) == 1
     assert clones[0] is not reader

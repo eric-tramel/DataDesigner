@@ -14,26 +14,21 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import CustomColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.run_config import RunConfig
-from data_designer.config.seed import IndexRange, PartitionBlock, SamplingStrategy, SeedConfig
-from data_designer.config.seed_source_dataframe import DataFrameSeedSource
+from data_designer.config.seed import SeedConfig
 from data_designer.engine.column_generators.utils.generator_classification import column_type_is_model_generated
 from data_designer.engine.dataset_builders.block_execution import BlockExecutionOptions, execute_dataset_block
 from data_designer.engine.resources.person_reader import PersonReader
-from data_designer.engine.resources.seed_reader import (
-    DataFrameSeedReader,
-    FileSystemSeedReader,
-    SeedReader,
-    SeedReaderRegistry,
-)
+from data_designer.engine.resources.seed_reader import SeedReader
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
+from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import (
     RayDatasetMetrics,
@@ -62,7 +57,6 @@ if TYPE_CHECKING:
 
 RayOutputMode = Literal["dataset", "arrow_refs"]
 RayObjectRefInputFormat = Literal["arrow", "pandas"]
-_RAY_RANGE_ID_COLUMN = "id"
 _RAY_INTERNAL_ROW_ID_COLUMN = "__data_designer_ray_row_id"
 
 
@@ -80,17 +74,11 @@ class _RayWorkerOptions:
 
 
 @dataclass(frozen=True)
-class _RaySeedWindow:
-    start: int
-    size: int
-
-
-@dataclass(frozen=True)
 class _RayExecutionPayload:
     config_json: str
     worker_options: _RayWorkerOptions
     use_input_dataset: bool
-    seed_window: _RaySeedWindow | None = None
+    seed_window: ray_seed_planning.RaySeedWindow | None = None
     seed_config: SeedConfig | None = None
     hidden_order_column: str | None = None
 
@@ -384,23 +372,18 @@ class RayBackend:
                 "range dataset. Remove override_num_blocks, target_block_size, min_blocks, max_blocks, "
                 "and read_concurrency when passing input_dataset."
             )
-        seed_window: _RaySeedWindow | None = None
+        seed_window: ray_seed_planning.RaySeedWindow | None = None
         if not use_input_dataset and seed_config is not None:
-            if _should_materialize_seed_on_driver(runtime_context=runtime_context, seed_config=seed_config):
-                input_dataset = ray.data.from_pandas(
-                    _materialize_seed_dataframe(
-                        runtime_context=runtime_context,
-                        seed_config=seed_config,
-                        num_records=num_records,
-                    )
-                )
+            seed_plan = ray_seed_planning.plan_seed_execution(
+                runtime_context=runtime_context,
+                seed_config=seed_config,
+                num_records=num_records,
+            )
+            if seed_plan.input_dataframe is not None:
+                input_dataset = ray.data.from_pandas(seed_plan.input_dataframe)
                 use_input_dataset = True
             else:
-                seed_window = _preflight_seed_window(
-                    runtime_context=runtime_context,
-                    seed_config=seed_config,
-                    num_records=num_records,
-                )
+                seed_window = seed_plan.seed_window
         if not self.allow_unsafe_processors:
             validate_ray_safe_processors(config_builder)
 
@@ -437,9 +420,9 @@ class RayBackend:
             worker_model_health_checks=self.worker_model_health_checks,
         )
         worker_seed_readers = (
-            [DataFrameSeedReader()]
+            ray_seed_planning.input_dataset_seed_readers()
             if use_input_dataset
-            else _clone_seed_readers_for_worker(runtime_context.seed_readers)
+            else ray_seed_planning.clone_seed_readers_for_worker(runtime_context.seed_readers)
         )
         worker_options = _RayWorkerOptions(
             model_providers=list(runtime_context.model_providers),
@@ -689,123 +672,6 @@ def _clone_config_builder_for_worker(
     return worker_config_builder
 
 
-def _preflight_seed_window(
-    *,
-    runtime_context: BackendRuntimeContext,
-    seed_config: SeedConfig,
-    num_records: int,
-) -> _RaySeedWindow:
-    if seed_config.sampling_strategy != SamplingStrategy.ORDERED:
-        raise RayBackendConfigurationError(
-            "RayBackend seed configs without input_dataset currently support only ordered sampling. "
-            "Pass the seed data as input_dataset or use the local backend for shuffled seed sampling."
-        )
-
-    try:
-        seed_reader = runtime_context.create_seed_reader_registry(
-            seed_readers=_clone_seed_readers_for_worker(runtime_context.seed_readers)
-        ).get_reader(seed_config.source, runtime_context.secret_resolver)
-        seed_dataset_size = seed_reader.get_seed_dataset_size()
-        index_range = _resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=seed_dataset_size)
-    except RayBackendConfigurationError:
-        raise
-    except Exception as exc:
-        raise RayBackendConfigurationError(
-            "RayBackend failed to preflight the seed config for partition offsets."
-        ) from exc
-
-    if num_records > index_range.size:
-        raise RayBackendConfigurationError(
-            "RayBackend seed configs without input_dataset require num_records to fit inside the selected seed "
-            f"range. Requested {num_records} records from {index_range.size} selected seed rows."
-        )
-    return _RaySeedWindow(start=index_range.start, size=index_range.size)
-
-
-def _should_materialize_seed_on_driver(*, runtime_context: BackendRuntimeContext, seed_config: SeedConfig) -> bool:
-    """Return whether Ray should treat a seed source as a materialized input dataset."""
-    try:
-        seed_reader = runtime_context.create_seed_reader_registry(
-            seed_readers=_clone_seed_readers_for_worker(runtime_context.seed_readers)
-        ).get_reader(seed_config.source, runtime_context.secret_resolver)
-    except Exception as exc:
-        raise RayBackendConfigurationError("RayBackend failed to inspect the seed reader for Ray planning.") from exc
-    return isinstance(seed_reader, FileSystemSeedReader)
-
-
-def _materialize_seed_dataframe(
-    *,
-    runtime_context: BackendRuntimeContext,
-    seed_config: SeedConfig,
-    num_records: int,
-) -> Any:
-    if seed_config.sampling_strategy != SamplingStrategy.ORDERED:
-        raise RayBackendConfigurationError(
-            "RayBackend driver-materialized filesystem seed configs currently support only ordered sampling. "
-            "Pass the seed data as input_dataset or use the local backend for shuffled seed sampling."
-        )
-
-    try:
-        seed_reader = runtime_context.create_seed_reader_registry(
-            seed_readers=_clone_seed_readers_for_worker(runtime_context.seed_readers)
-        ).get_reader(seed_config.source, runtime_context.secret_resolver)
-        seed_dataset_size = seed_reader.get_seed_dataset_size()
-        index_range = _resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=seed_dataset_size)
-    except RayBackendConfigurationError:
-        raise
-    except Exception as exc:
-        raise RayBackendConfigurationError("RayBackend failed to materialize the seed config for Ray input.") from exc
-
-    batch_reader = seed_reader.create_batch_reader(batch_size=num_records, index_range=index_range, shuffle=False)
-    output = lazy.pd.DataFrame()
-    empty_batch_reads = 0
-    while len(output) < num_records:
-        try:
-            seed_batch = batch_reader.read_next_batch().to_pandas().reset_index(drop=True)
-        except StopIteration:
-            batch_reader = seed_reader.create_batch_reader(
-                batch_size=num_records,
-                index_range=index_range,
-                shuffle=False,
-            )
-            continue
-
-        if len(seed_batch) == 0:
-            empty_batch_reads += 1
-            if empty_batch_reads > max(num_records * 2, 1):
-                raise RayBackendConfigurationError(
-                    "RayBackend filesystem seed materialization did not produce any rows after repeated reads."
-                )
-            continue
-        output = lazy.pd.concat([output, seed_batch], ignore_index=True)
-
-    return output.iloc[:num_records].reset_index(drop=True)
-
-
-def _resolve_seed_config_index_range(*, seed_config: SeedConfig, seed_dataset_size: int) -> IndexRange:
-    if seed_dataset_size <= 0:
-        raise RayBackendConfigurationError("RayBackend seed config resolved to an empty seed dataset.")
-    if seed_config.selection_strategy is None:
-        return IndexRange(start=0, end=seed_dataset_size - 1)
-    if isinstance(seed_config.selection_strategy, IndexRange):
-        if seed_config.selection_strategy.end >= seed_dataset_size:
-            raise RayBackendConfigurationError(
-                "RayBackend seed config selection_strategy is out of bounds for the seed dataset. "
-                f"Selection end={seed_config.selection_strategy.end}, seed rows={seed_dataset_size}."
-            )
-        return seed_config.selection_strategy
-    if isinstance(seed_config.selection_strategy, PartitionBlock):
-        if seed_config.selection_strategy.num_partitions > seed_dataset_size:
-            raise RayBackendConfigurationError(
-                "RayBackend seed config selection_strategy is out of bounds for the seed dataset. "
-                f"Partition count={seed_config.selection_strategy.num_partitions}, seed rows={seed_dataset_size}."
-            )
-        return seed_config.selection_strategy.to_index_range(seed_dataset_size)
-    raise RayBackendConfigurationError(
-        "RayBackend seed config uses an unsupported selection_strategy for partitioned execution."
-    )
-
-
 def _get_num_blocks(dataset: Any) -> int | None:
     num_blocks = getattr(dataset, "num_blocks", None)
     if not callable(num_blocks):
@@ -851,11 +717,11 @@ def _attach_hidden_row_id_column(ray: Any, dataset: Any, *, hidden_order_column:
 
 def _rename_range_id_column(batch: Any, *, hidden_order_column: str) -> Any:
     dataframe = _coerce_pandas_dataframe(batch)
-    if _RAY_RANGE_ID_COLUMN not in dataframe.columns:
+    if ray_seed_planning.RAY_RANGE_ID_COLUMN not in dataframe.columns:
         raise RayDatasetGenerationError(
-            f"RayBackend expected ray.data.range() batches to include {_RAY_RANGE_ID_COLUMN!r}."
+            f"RayBackend expected ray.data.range() batches to include {ray_seed_planning.RAY_RANGE_ID_COLUMN!r}."
         )
-    return lazy.pd.DataFrame({hidden_order_column: dataframe[_RAY_RANGE_ID_COLUMN].tolist()})
+    return lazy.pd.DataFrame({hidden_order_column: dataframe[ray_seed_planning.RAY_RANGE_ID_COLUMN].tolist()})
 
 
 def _dataset_from_arrow_refs(ray: Any, refs: list[Any]) -> Any:
@@ -900,7 +766,7 @@ def _compile_ray_execution_payload(
     config_builder: DataDesignerConfigBuilder,
     worker_options: _RayWorkerOptions,
     use_input_dataset: bool,
-    seed_window: _RaySeedWindow | None = None,
+    seed_window: ray_seed_planning.RaySeedWindow | None = None,
     hidden_order_column: str | None = None,
 ) -> _RayExecutionPayload:
     data_designer_config = config_builder.build()
@@ -1012,24 +878,6 @@ def _merge_driver_and_worker_metrics(
     )
 
 
-def _clone_seed_readers_for_worker(readers: Iterable[SeedReader]) -> list[SeedReader]:
-    clones = [_clone_seed_reader_for_worker(reader) for reader in readers]
-    seed_types = {reader.get_seed_type() for reader in clones}
-    dataframe_reader = DataFrameSeedReader()
-    if dataframe_reader.get_seed_type() not in seed_types:
-        clones.append(dataframe_reader)
-    return clones
-
-
-def _clone_seed_reader_for_worker(reader: SeedReader) -> SeedReader:
-    clone = copy.copy(reader)
-    clone._reset_attachment_state()
-    for attr in ("source", "secret_resolver"):
-        if hasattr(clone, attr):
-            delattr(clone, attr)
-    return clone
-
-
 class _RayBatchWorker:
     def __init__(
         self,
@@ -1048,10 +896,8 @@ class _RayBatchWorker:
         if self._observability_options.trace_enabled:
             run_config.async_trace = True
         seed_readers = copy.deepcopy(worker_options.seed_readers)
-        dataframe_seed_reader = DataFrameSeedReader()
-        seed_types = {reader.get_seed_type() for reader in seed_readers}
-        if execution_payload.use_input_dataset and dataframe_seed_reader.get_seed_type() not in seed_types:
-            seed_readers.append(dataframe_seed_reader)
+        if execution_payload.use_input_dataset:
+            seed_readers = ray_seed_planning.ensure_dataframe_seed_reader(seed_readers)
         self._worker_options: _RayWorkerOptions = replace(
             worker_options,
             seed_readers=seed_readers,
@@ -1281,15 +1127,12 @@ class _RayBatchWorker:
         if self._execution_payload.seed_window is not None:
             if self._execution_payload.seed_config is None:
                 raise RayDatasetGenerationError("RayBackend seed window was provided without a seed config.")
-            block_config.seed_config = SeedConfig(
-                source=DataFrameSeedSource(
-                    df=_read_seed_window_dataframe(
-                        seed_config=self._execution_payload.seed_config,
-                        worker_options=self._worker_options,
-                        dataframe=dataframe,
-                        seed_window=self._execution_payload.seed_window,
-                    )
-                )
+            block_config.seed_config = ray_seed_planning.create_seed_config_for_window(
+                seed_config=self._execution_payload.seed_config,
+                seed_readers=self._worker_options.seed_readers,
+                secret_resolver=self._worker_options.secret_resolver,
+                dataframe=dataframe,
+                seed_window=self._execution_payload.seed_window,
             )
         return block_config
 
@@ -1301,7 +1144,7 @@ def _generate_batch(
     config_builder: DataDesignerConfigBuilder | None = None,
     worker_options: _RayWorkerOptions | None = None,
     use_input_dataset: bool | None = None,
-    seed_window: _RaySeedWindow | None = None,
+    seed_window: ray_seed_planning.RaySeedWindow | None = None,
     hidden_order_column: str | None = None,
     metrics_collector: Any | None = None,
     observability_options: _RayObservabilityOptions | None = None,
@@ -1336,8 +1179,8 @@ def _get_hidden_order_values(dataframe: Any, *, hidden_order_column: str | None)
         return []
     if hidden_order_column in dataframe.columns:
         values = dataframe[hidden_order_column].tolist()
-    elif _RAY_RANGE_ID_COLUMN in dataframe.columns:
-        values = dataframe[_RAY_RANGE_ID_COLUMN].tolist()
+    elif ray_seed_planning.RAY_RANGE_ID_COLUMN in dataframe.columns:
+        values = dataframe[ray_seed_planning.RAY_RANGE_ID_COLUMN].tolist()
     else:
         raise RayDatasetGenerationError(
             "RayBackend preserve_order=True could not find the hidden row-id source column in a Ray worker batch."
@@ -1383,67 +1226,14 @@ def _metrics_from_block_result(
     )
 
 
-def _read_seed_window_dataframe(
-    *,
-    seed_config: SeedConfig,
-    worker_options: _RayWorkerOptions,
-    dataframe: Any,
-    seed_window: _RaySeedWindow,
-) -> Any:
-    row_offsets = _get_contiguous_range_offsets(dataframe)
-    index_range = IndexRange(
-        start=seed_window.start + row_offsets[0],
-        end=seed_window.start + row_offsets[-1],
-    )
-    if row_offsets[-1] >= seed_window.size:
-        raise RayDatasetGenerationError(
-            "RayBackend seed partition offset exceeded the selected seed range. "
-            f"Offset={row_offsets[-1]}, selected seed rows={seed_window.size}."
-        )
-
-    seed_reader = SeedReaderRegistry(readers=copy.deepcopy(worker_options.seed_readers)).get_reader(
-        seed_config.source,
-        worker_options.secret_resolver,
-    )
-    batch_reader = seed_reader.create_batch_reader(
-        batch_size=len(row_offsets),
-        index_range=index_range,
-        shuffle=False,
-    )
-    seed_dataframe = batch_reader.read_next_batch().to_pandas().reset_index(drop=True)
-    if len(seed_dataframe) != len(row_offsets):
-        raise RayDatasetGenerationError(
-            "RayBackend seed reader returned an unexpected row count for a partition offset. "
-            f"Expected {len(row_offsets)} rows, got {len(seed_dataframe)}."
-        )
-    return seed_dataframe
-
-
-def _get_contiguous_range_offsets(dataframe: Any) -> list[int]:
-    if _RAY_RANGE_ID_COLUMN not in dataframe.columns:
-        raise RayDatasetGenerationError(
-            f"RayBackend seed partition offsets require {_RAY_RANGE_ID_COLUMN!r} from ray.data.range()."
-        )
-    row_offsets = [int(value) for value in dataframe[_RAY_RANGE_ID_COLUMN].tolist()]
-    if not row_offsets:
-        raise RayDatasetGenerationError("RayBackend seed partition offsets received an empty Ray worker batch.")
-    expected_offsets = list(range(row_offsets[0], row_offsets[0] + len(row_offsets)))
-    if row_offsets != expected_offsets:
-        raise RayDatasetGenerationError(
-            "RayBackend seed partition offsets require contiguous ray.data.range() batches. "
-            f"Received offsets {row_offsets!r}."
-        )
-    return row_offsets
-
-
 def _format_worker_failure_message(*, dataframe: Any, exc: Exception) -> str:
     context_parts = [f"{len(dataframe)} input row(s)"]
     if _RAY_INTERNAL_ROW_ID_COLUMN in dataframe.columns:
         row_ids = [int(value) for value in dataframe[_RAY_INTERNAL_ROW_ID_COLUMN].tolist()]
         if row_ids:
             context_parts.append(f"logical rows {min(row_ids)}-{max(row_ids)}")
-    elif _RAY_RANGE_ID_COLUMN in dataframe.columns:
-        row_ids = [int(value) for value in dataframe[_RAY_RANGE_ID_COLUMN].tolist()]
+    elif ray_seed_planning.RAY_RANGE_ID_COLUMN in dataframe.columns:
+        row_ids = [int(value) for value in dataframe[ray_seed_planning.RAY_RANGE_ID_COLUMN].tolist()]
         if row_ids:
             context_parts.append(f"range rows {min(row_ids)}-{max(row_ids)}")
     task_context = _get_ray_task_context()
