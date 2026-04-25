@@ -22,7 +22,11 @@ from data_designer.integrations.ray.errors import (
 from data_designer.integrations.ray.llm import (
     RayDataLLMCapabilities,
     RayDataLLMIntegrationAssessment,
+    RayDataLLMStageCandidate,
+    RayDataLLMStageOptions,
+    RayDataLLMStagePlan,
     assess_ray_data_llm_integration,
+    plan_ray_data_llm_stage,
     probe_ray_data_llm_capabilities,
 )
 from data_designer.integrations.ray.metrics import (
@@ -55,6 +59,9 @@ __all__ = [
     "RayDataContextOptions",
     "RayDataLLMCapabilities",
     "RayDataLLMIntegrationAssessment",
+    "RayDataLLMStageCandidate",
+    "RayDataLLMStageOptions",
+    "RayDataLLMStagePlan",
     "RayDatasetAnalysis",
     "RayDatasetCreationResults",
     "RayDatasetGenerationError",
@@ -70,5 +77,6 @@ __all__ = [
     "RayWorkerMetrics",
     "RayWorkerProfile",
     "assess_ray_data_llm_integration",
+    "plan_ray_data_llm_stage",
     "probe_ray_data_llm_capabilities",
 ]

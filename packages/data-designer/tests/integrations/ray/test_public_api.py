@@ -21,6 +21,9 @@ def test_ray_package_root_exports_stable_public_api() -> None:
         "RayDataContextOptions",
         "RayDataLLMCapabilities",
         "RayDataLLMIntegrationAssessment",
+        "RayDataLLMStageCandidate",
+        "RayDataLLMStageOptions",
+        "RayDataLLMStagePlan",
         "RayDatasetAnalysis",
         "RayDatasetCreationResults",
         "RayDatasetGenerationError",
@@ -36,6 +39,7 @@ def test_ray_package_root_exports_stable_public_api() -> None:
         "RayWorkerMetrics",
         "RayWorkerProfile",
         "assess_ray_data_llm_integration",
+        "plan_ray_data_llm_stage",
         "probe_ray_data_llm_capabilities",
     }
 

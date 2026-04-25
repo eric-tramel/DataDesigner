@@ -35,6 +35,7 @@ from data_designer.integrations.ray import (
     RayBlockPlanning,
     RayDataCheckpointConfig,
     RayDataContextOptions,
+    RayDataLLMStageOptions,
     RayDatasetCreationResults,
     RayDatasetGenerationError,
     RayDatasetMetrics,
@@ -1306,6 +1307,74 @@ def test_ray_backend_leaves_local_provider_actor_pool_sizing_explicit(
 def test_ray_backend_rejects_actor_pool_with_map_concurrency() -> None:
     with pytest.raises(RayBackendConfigurationError, match="use_actor_pool"):
         RayBackend(use_actor_pool=True, map_concurrency=2)
+
+
+def test_ray_backend_exposes_llm_stage_plan_with_facade_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+
+    def generate_batch(batch: lazy.pd.DataFrame, **_: Any) -> lazy.pd.DataFrame:
+        return batch
+
+    monkeypatch.setattr(ray_backend_module, "_generate_batch", generate_batch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            preflight_model_health_check=False,
+            llm_stage_options=RayDataLLMStageOptions(
+                enabled=True,
+                model_source="local-model",
+                column_names=("text",),
+            ),
+        ),
+    )
+
+    results = designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert results.llm_stage_plan is not None
+    assert results.llm_stage_plan.enabled is True
+    assert results.llm_stage_plan.status in {"unavailable", "eligible"}
+    assert input_dataset.map_batches_kwargs is not None
+
+
+def test_ray_backend_llm_stage_can_fail_fast_when_fallback_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            preflight_model_health_check=False,
+            llm_stage_options=RayDataLLMStageOptions(
+                enabled=True,
+                model_source="local-model",
+                column_names=("missing_text_column",),
+                allow_model_facade_fallback=False,
+            ),
+        ),
+    )
+
+    with pytest.raises(RayBackendConfigurationError, match="Ray Data LLM stage"):
+        designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is None
 
 
 def test_ray_backend_driver_model_health_check_runs_once_and_workers_skip_by_default(
