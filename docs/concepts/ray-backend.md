@@ -36,6 +36,20 @@ artifacts/
 
 `distributed_artifact_writes=True` is the default. Use a cluster-visible artifact path when running Ray workers on multiple nodes, or set `distributed_artifact_writes=False` to force Ray Data write tasks onto the driver node.
 
+## Streaming Worker Chunks
+
+Set `output_chunk_rows` to have Ray workers emit generated output in smaller Ray Data chunks. For partition-local jobs without artifact capture, RayBackend now uses the engine async row-group path, so a worker can release each generated row group instead of first materializing the full `map_batches` output frame. If processor artifacts are being captured, or if hidden ordering would need to reconcile row-count-changing output, RayBackend falls back to the older materialized chunking path to preserve artifacts and ordering semantics.
+
+```python
+backend = RayBackend(
+    batch_size=4096,
+    output_chunk_rows=512,
+    output="dataset",
+)
+```
+
+The `scripts/benchmarks/benchmark_ray_streaming_out_of_core.py` benchmark accepts `--output-chunk-rows` to exercise this path against Ray Data streaming reads and Parquet writes.
+
 ## Actor Pool Defaults
 
 `RayBackend` uses provider-aware actor-pool defaults for model-generated columns. If you do not pass

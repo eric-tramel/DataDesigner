@@ -19,7 +19,12 @@ from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import SamplingStrategy
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
-from data_designer.engine.dataset_builders.block_execution import BlockExecutionResult
+from data_designer.engine.dataset_builders.block_execution import (
+    BlockExecutionChunk,
+    BlockExecutionChunkStream,
+    BlockExecutionResult,
+    BlockExecutionStreamSummary,
+)
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetGenerationError
@@ -191,6 +196,29 @@ def _block_result(*, dataframe: Any, input_rows: int, model_usage: dict[str, dic
     )
 
 
+def _block_chunk_stream(chunks: list[BlockExecutionChunk], *, input_rows: int) -> BlockExecutionChunkStream:
+    summary_holder: dict[str, BlockExecutionStreamSummary] = {}
+
+    def iterator() -> Any:
+        output_rows = 0
+        for chunk in chunks:
+            output_rows += chunk.output_rows
+            yield chunk
+        summary_holder["summary"] = BlockExecutionStreamSummary(
+            task_traces=[],
+            model_usage_stats={},
+            model_usage_deltas={},
+            processor_artifacts={},
+            input_rows=input_rows,
+            output_rows=output_rows,
+            dropped_rows=max(input_rows - output_rows, 0),
+            all_rows_dropped=input_rows > 0 and output_rows == 0,
+            partial_rows_dropped=0 < output_rows < input_rows,
+        )
+
+    return BlockExecutionChunkStream(iterator(), summary_holder)
+
+
 def test_ray_batch_worker_delegates_to_engine_block_api(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -230,6 +258,63 @@ def test_ray_batch_worker_delegates_to_engine_block_api(
     assert all(call["runtime_context"] is worker._worker_options for call in calls)
     assert all(call["options"].use_async is True for call in calls)
     assert all(call["data_designer_config"].seed_config is None for call in calls)
+
+
+def test_ray_batch_worker_uses_engine_block_stream_for_output_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+    )
+    payload = ray_backend_module._compile_ray_execution_payload(
+        config_builder=_input_expression_config_builder(stub_model_configs),
+        worker_options=_worker_options_from_designer(designer),
+        use_input_dataset=True,
+        output_chunk_rows=2,
+    )
+    calls: list[dict[str, Any]] = []
+
+    def execute_dataset_block_stream(**kwargs: Any) -> BlockExecutionChunkStream:
+        calls.append(kwargs)
+        chunks = [
+            BlockExecutionChunk(
+                dataframe=lazy.pd.DataFrame({"row": [0, 1]}),
+                raw_dataframe=lazy.pd.DataFrame({"row": [0, 1]}),
+                row_group=0,
+                input_start=0,
+                input_rows=2,
+                output_rows=2,
+            ),
+            BlockExecutionChunk(
+                dataframe=lazy.pd.DataFrame({"row": [2]}),
+                raw_dataframe=lazy.pd.DataFrame({"row": [2]}),
+                row_group=1,
+                input_start=2,
+                input_rows=1,
+                output_rows=1,
+            ),
+        ]
+        return _block_chunk_stream(chunks, input_rows=3)
+
+    monkeypatch.setattr(ray_backend_module, "execute_dataset_block_stream", execute_dataset_block_stream)
+    worker = ray_backend_module._RayBatchWorker(execution_payload=payload)
+
+    output = list(worker(lazy.pd.DataFrame({"x": [1, 2, 3], "label": ["a", "b", "c"]})))
+
+    assert [chunk.to_dict(orient="records") for chunk in output] == [[{"row": 0}, {"row": 1}], [{"row": 2}]]
+    assert len(calls) == 1
+    assert calls[0]["rows_per_chunk"] == 2
+    assert calls[0]["input_frame"].to_dict(orient="records") == [
+        {"x": 1, "label": "a"},
+        {"x": 2, "label": "b"},
+        {"x": 3, "label": "c"},
+    ]
 
 
 def test_worker_generation_pipeline_core_runs_without_metrics_actor_or_ray_runtime(

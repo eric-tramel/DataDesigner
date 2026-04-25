@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-blocks", type=int, default=DEFAULT_SOURCE_BLOCKS)
     parser.add_argument("--source-batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--output-chunk-rows", type=int, default=None)
     parser.add_argument("--stream-batch-size", type=int, default=DEFAULT_STREAM_BATCH_SIZE)
     parser.add_argument("--stream-sample-batches", type=int, default=3)
     parser.add_argument("--ray-cpus", type=int, default=DEFAULT_RAY_CPUS)
@@ -119,6 +120,7 @@ def _run_streaming_case(ray: Any, args: argparse.Namespace) -> dict[str, Any]:
             profile_workers=True,
             trace_enabled=args.trace_enabled,
             max_trace_events=args.max_trace_events,
+            output_chunk_rows=args.output_chunk_rows,
         ),
     )
     designer.set_run_config(
@@ -166,6 +168,7 @@ def _run_streaming_case(ray: Any, args: argparse.Namespace) -> dict[str, Any]:
             "source_blocks": args.source_blocks,
             "source_batch_size": args.source_batch_size,
             "batch_size": args.batch_size,
+            "output_chunk_rows": args.output_chunk_rows,
             "stream_batch_size": args.stream_batch_size,
             "stream_sample_batches": args.stream_sample_batches,
             "ray_cpus": args.ray_cpus,
@@ -388,6 +391,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, field_name)
         if value < 1:
             raise ValueError(f"--{field_name.replace('_', '-')} must be >= 1.")
+    if args.output_chunk_rows is not None and args.output_chunk_rows < 1:
+        raise ValueError("--output-chunk-rows must be >= 1 when provided.")
 
 
 def _emit(payload: dict[str, Any]) -> None:
