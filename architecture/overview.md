@@ -63,6 +63,7 @@ Users declare what their data should look like through config objects (columns, 
 - [Config Layer](config.md) — builder API, column types, model configs, plugin system
 - [Engine Layer](engine.md) — compilation, generators, registries
 - [Models](models.md) — model facade, adapters, retry/throttle
+- [Ray Data LLM](ray-data-llm.md) — evaluation of Ray Data LLM/vLLM placement
 - [Dataset Builders](dataset-builders.md) — sync/async orchestration, DAG, batching
 - [MCP](mcp.md) — tool execution, session pooling
 - [Sampling](sampling.md) — statistical generators, person/entity data
