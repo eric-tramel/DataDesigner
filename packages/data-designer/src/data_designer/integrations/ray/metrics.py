@@ -18,6 +18,12 @@ class RayWorkerMetrics:
     """Serializable metrics emitted by one Ray worker or processed Ray block."""
 
     total_rows: int = 0
+    input_rows: int = 0
+    output_rows: int = 0
+    dropped_rows: int = 0
+    all_rows_dropped: bool = False
+    partial_rows_dropped: bool = False
+    empty_input: bool = False
     blocks: int = 1
     failed_blocks: int = 0
     elapsed_seconds: float = 0.0
@@ -25,7 +31,15 @@ class RayWorkerMetrics:
     block_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.output_rows == 0 and self.total_rows > 0:
+            object.__setattr__(self, "output_rows", self.total_rows)
         _validate_non_negative_int("total_rows", self.total_rows)
+        _validate_non_negative_int("input_rows", self.input_rows)
+        _validate_non_negative_int("output_rows", self.output_rows)
+        _validate_non_negative_int("dropped_rows", self.dropped_rows)
+        _validate_bool("all_rows_dropped", self.all_rows_dropped)
+        _validate_bool("partial_rows_dropped", self.partial_rows_dropped)
+        _validate_bool("empty_input", self.empty_input)
         _validate_non_negative_int("blocks", self.blocks)
         _validate_non_negative_int("failed_blocks", self.failed_blocks)
         _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
@@ -46,6 +60,12 @@ class RayDatasetMetrics:
     """
 
     total_rows: int = 0
+    input_rows: int = 0
+    output_rows: int = 0
+    dropped_rows: int = 0
+    all_rows_dropped_blocks: int = 0
+    partial_rows_dropped_blocks: int = 0
+    empty_input_blocks: int = 0
     blocks: int = 0
     failed_blocks: int = 0
     elapsed_seconds: float = 0.0
@@ -53,7 +73,15 @@ class RayDatasetMetrics:
     throttle: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.output_rows == 0 and self.total_rows > 0:
+            object.__setattr__(self, "output_rows", self.total_rows)
         _validate_non_negative_int("total_rows", self.total_rows)
+        _validate_non_negative_int("input_rows", self.input_rows)
+        _validate_non_negative_int("output_rows", self.output_rows)
+        _validate_non_negative_int("dropped_rows", self.dropped_rows)
+        _validate_non_negative_int("all_rows_dropped_blocks", self.all_rows_dropped_blocks)
+        _validate_non_negative_int("partial_rows_dropped_blocks", self.partial_rows_dropped_blocks)
+        _validate_non_negative_int("empty_input_blocks", self.empty_input_blocks)
         _validate_non_negative_int("blocks", self.blocks)
         _validate_non_negative_int("failed_blocks", self.failed_blocks)
         _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
@@ -71,6 +99,12 @@ class RayDatasetMetrics:
 @dataclass(slots=True)
 class _MetricsAccumulator:
     total_rows: int = 0
+    input_rows: int = 0
+    output_rows: int = 0
+    dropped_rows: int = 0
+    all_rows_dropped_blocks: int = 0
+    partial_rows_dropped_blocks: int = 0
+    empty_input_blocks: int = 0
     blocks: int = 0
     failed_blocks: int = 0
     elapsed_seconds: float = 0.0
@@ -89,6 +123,12 @@ def aggregate_ray_metrics(worker_metrics: Iterable[RayMetricsPayload]) -> RayDat
     for payload in worker_metrics:
         metrics = normalize_ray_worker_metrics(payload)
         accumulator.total_rows += metrics.total_rows
+        accumulator.input_rows += metrics.input_rows
+        accumulator.output_rows += metrics.output_rows
+        accumulator.dropped_rows += metrics.dropped_rows
+        accumulator.all_rows_dropped_blocks += int(metrics.all_rows_dropped)
+        accumulator.partial_rows_dropped_blocks += int(metrics.partial_rows_dropped)
+        accumulator.empty_input_blocks += int(metrics.empty_input)
         accumulator.blocks += metrics.blocks
         accumulator.failed_blocks += metrics.failed_blocks
         accumulator.elapsed_seconds += metrics.elapsed_seconds
@@ -101,6 +141,12 @@ def aggregate_ray_metrics(worker_metrics: Iterable[RayMetricsPayload]) -> RayDat
 
     return RayDatasetMetrics(
         total_rows=accumulator.total_rows,
+        input_rows=accumulator.input_rows,
+        output_rows=accumulator.output_rows,
+        dropped_rows=accumulator.dropped_rows,
+        all_rows_dropped_blocks=accumulator.all_rows_dropped_blocks,
+        partial_rows_dropped_blocks=accumulator.partial_rows_dropped_blocks,
+        empty_input_blocks=accumulator.empty_input_blocks,
         blocks=accumulator.blocks,
         failed_blocks=accumulator.failed_blocks,
         elapsed_seconds=accumulator.elapsed_seconds,
@@ -113,6 +159,12 @@ def normalize_ray_worker_metrics(payload: RayMetricsPayload) -> RayWorkerMetrics
     if isinstance(payload, RayDatasetMetrics):
         return RayWorkerMetrics(
             total_rows=payload.total_rows,
+            input_rows=payload.input_rows,
+            output_rows=payload.output_rows,
+            dropped_rows=payload.dropped_rows,
+            all_rows_dropped=payload.all_rows_dropped_blocks > 0,
+            partial_rows_dropped=payload.partial_rows_dropped_blocks > 0,
+            empty_input=payload.empty_input_blocks > 0,
             blocks=payload.blocks,
             failed_blocks=payload.failed_blocks,
             elapsed_seconds=payload.elapsed_seconds,
@@ -126,6 +178,12 @@ def normalize_ray_worker_metrics(payload: RayMetricsPayload) -> RayWorkerMetrics
 
     return RayWorkerMetrics(
         total_rows=_coerce_int(payload, "total_rows", default=0),
+        input_rows=_coerce_int(payload, "input_rows", default=0),
+        output_rows=_coerce_int(payload, "output_rows", default=_coerce_int(payload, "total_rows", default=0)),
+        dropped_rows=_coerce_int(payload, "dropped_rows", default=0),
+        all_rows_dropped=_coerce_bool(payload, "all_rows_dropped", default=False),
+        partial_rows_dropped=_coerce_bool(payload, "partial_rows_dropped", default=False),
+        empty_input=_coerce_bool(payload, "empty_input", default=False),
         blocks=_coerce_int(payload, "blocks", default=1),
         failed_blocks=_coerce_int(payload, "failed_blocks", default=0),
         elapsed_seconds=_coerce_float(payload, "elapsed_seconds", default=0.0),
@@ -146,6 +204,13 @@ def _coerce_float(payload: Mapping[str, Any], field_name: str, *, default: float
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RayMetricsError(f"Ray metrics field {field_name!r} must be numeric.")
     return float(value)
+
+
+def _coerce_bool(payload: Mapping[str, Any], field_name: str, *, default: bool) -> bool:
+    value = payload.get(field_name, default)
+    if not isinstance(value, bool):
+        raise RayMetricsError(f"Ray metrics field {field_name!r} must be a boolean.")
+    return value
 
 
 def _coerce_model_usage(value: Any) -> ModelUsageSummary | None:
@@ -184,6 +249,11 @@ def _validate_non_negative_float(field_name: str, value: float) -> None:
         raise RayMetricsError(f"Ray metrics field {field_name!r} must be numeric.")
     if value < 0:
         raise RayMetricsError(f"Ray metrics field {field_name!r} must be non-negative.")
+
+
+def _validate_bool(field_name: str, value: bool) -> None:
+    if not isinstance(value, bool):
+        raise RayMetricsError(f"Ray metrics field {field_name!r} must be a boolean.")
 
 
 def _merge_model_usage(target: ModelUsageSummary, source: ModelUsageSummary) -> None:

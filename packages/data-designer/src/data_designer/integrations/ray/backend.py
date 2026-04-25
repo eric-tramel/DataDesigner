@@ -15,8 +15,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
-from pydantic import PrivateAttr
-
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import CustomColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
@@ -25,10 +23,8 @@ from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import IndexRange, PartitionBlock, SamplingStrategy, SeedConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.column_generators.utils.generator_classification import column_type_is_model_generated
-from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
-from data_designer.engine.model_provider import resolve_model_provider_registry
-from data_designer.engine.resources.person_reader import PersonReader, create_person_reader
-from data_designer.engine.resources.resource_provider import create_resource_provider
+from data_designer.engine.dataset_builders.block_execution import BlockExecutionOptions, execute_dataset_block
+from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import (
     DataFrameSeedReader,
     FileSystemSeedReader,
@@ -36,8 +32,7 @@ from data_designer.engine.resources.seed_reader import (
     SeedReaderRegistry,
 )
 from data_designer.engine.secret_resolver import SecretResolver
-from data_designer.engine.storage.artifact_storage import ArtifactStorage, BatchStage
-from data_designer.engine.storage.media_storage import StorageMode
+from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import (
     RayDatasetMetrics,
@@ -990,6 +985,12 @@ def _merge_driver_and_worker_metrics(
 ) -> RayDatasetMetrics:
     return RayDatasetMetrics(
         total_rows=worker_metrics.total_rows,
+        input_rows=worker_metrics.input_rows,
+        output_rows=worker_metrics.output_rows,
+        dropped_rows=worker_metrics.dropped_rows,
+        all_rows_dropped_blocks=worker_metrics.all_rows_dropped_blocks,
+        partial_rows_dropped_blocks=worker_metrics.partial_rows_dropped_blocks,
+        empty_input_blocks=worker_metrics.empty_input_blocks,
         blocks=worker_metrics.blocks,
         failed_blocks=worker_metrics.failed_blocks,
         elapsed_seconds=worker_metrics.elapsed_seconds,
@@ -1016,147 +1017,6 @@ def _clone_seed_reader_for_worker(reader: SeedReader) -> SeedReader:
     return clone
 
 
-class _InMemoryPreviewArtifactStorage(ArtifactStorage):
-    """ArtifactStorage implementation for Ray preview batches.
-
-    Ray workers use ``DatasetBuilder.build_preview()``, which returns the main
-    dataset in memory. Processor preview artifacts may still be written through
-    the storage interface, so this class keeps those frames in memory and avoids
-    per-block temporary filesystem setup.
-    """
-
-    _frames: dict[tuple[str, str, str], Any] = PrivateAttr(default_factory=dict)
-    _metadata: dict[str, Any] = PrivateAttr(default_factory=dict)
-
-    def __init__(self, *, dataset_name: str = "ray-block") -> None:
-        super().__init__(artifact_path=Path.cwd(), dataset_name=dataset_name)
-        self.set_media_storage_mode(StorageMode.DATAFRAME)
-
-    def clear(self) -> None:
-        self._frames.clear()
-        self._metadata.clear()
-
-    def load_dataset(self, batch_stage: BatchStage = BatchStage.FINAL_RESULT) -> Any:
-        frames = [self._copy_dataframe(frame) for _, frame in self._iter_stage_frames(batch_stage)]
-        if not frames:
-            return lazy.pd.DataFrame()
-        return lazy.pd.concat(frames, ignore_index=True)
-
-    def load_processor_dataset(self, processor_name: str) -> Any:
-        frames = [
-            self._copy_dataframe(frame)
-            for (stage, subfolder, parquet_file_name), frame in self._frames.items()
-            if stage == BatchStage.PROCESSORS_OUTPUTS.value
-            and (subfolder == processor_name or (not subfolder and Path(parquet_file_name).stem == processor_name))
-        ]
-        if not frames:
-            return lazy.pd.DataFrame()
-        return lazy.pd.concat(frames, ignore_index=True)
-
-    def list_processor_names(self) -> list[str]:
-        names = {
-            subfolder or Path(parquet_file_name).stem
-            for (stage, subfolder, parquet_file_name) in self._frames
-            if stage == BatchStage.PROCESSORS_OUTPUTS.value
-        }
-        return sorted(names)
-
-    def load_dataset_with_dropped_columns(self) -> Any:
-        dataset = self.load_dataset()
-        dropped = self.load_dataset(BatchStage.DROPPED_COLUMNS)
-        if len(dropped) == 0:
-            return dataset
-        return lazy.pd.concat([dataset, dropped], axis=1)
-
-    def move_partial_result_to_final_file_path(self, batch_number: int) -> Path:
-        partial_file_name = self.create_batch_file_path(batch_number, BatchStage.PARTIAL_RESULT).name
-        partial_key = (BatchStage.PARTIAL_RESULT.value, "", partial_file_name)
-        final_key = (BatchStage.FINAL_RESULT.value, "", partial_file_name)
-        frame = self._frames.pop(partial_key)
-        self._frames[final_key] = frame
-        return self.create_batch_file_path(batch_number, BatchStage.FINAL_RESULT)
-
-    def write_batch_to_parquet_file(
-        self,
-        batch_number: int,
-        dataframe: Any,
-        batch_stage: BatchStage,
-        subfolder: str | None = None,
-    ) -> Path:
-        file_path = self.create_batch_file_path(batch_number, batch_stage)
-        self.write_parquet_file(file_path.name, dataframe, batch_stage, subfolder=subfolder)
-        return file_path
-
-    def write_parquet_file(
-        self,
-        parquet_file_name: str,
-        dataframe: Any,
-        batch_stage: BatchStage,
-        subfolder: str | None = None,
-    ) -> Path:
-        subfolder = subfolder or ""
-        stage = self._stage_value(batch_stage)
-        self._frames[(stage, subfolder, parquet_file_name)] = self._copy_dataframe(dataframe)
-        stage_path = self._get_stage_path(batch_stage)
-        return stage_path / subfolder / parquet_file_name if subfolder else stage_path / parquet_file_name
-
-    def get_parquet_file_paths(self) -> list[str]:
-        return [
-            str(Path(self.final_dataset_folder_name) / parquet_file_name)
-            for (stage, _, parquet_file_name) in sorted(self._frames)
-            if stage == BatchStage.FINAL_RESULT.value
-        ]
-
-    def get_processor_file_paths(self) -> dict[str, list[str]]:
-        processor_files: dict[str, list[str]] = {}
-        for stage, subfolder, parquet_file_name in sorted(self._frames):
-            if stage != BatchStage.PROCESSORS_OUTPUTS.value:
-                continue
-            processor_name = subfolder or Path(parquet_file_name).stem
-            path_parts = [self.processors_outputs_folder_name]
-            if subfolder:
-                path_parts.append(subfolder)
-            path_parts.append(parquet_file_name)
-            processor_files.setdefault(processor_name, []).append(str(Path(*path_parts)))
-        return processor_files
-
-    def get_file_paths(self) -> dict[str, list[str] | dict[str, list[str]]]:
-        file_paths: dict[str, list[str] | dict[str, list[str]]] = {
-            "parquet-files": self.get_parquet_file_paths(),
-        }
-        processor_file_paths = self.get_processor_file_paths()
-        if processor_file_paths:
-            file_paths["processor-files"] = processor_file_paths
-        return file_paths
-
-    def read_metadata(self) -> dict[str, Any]:
-        return dict(self._metadata)
-
-    def write_metadata(self, metadata: dict[str, Any]) -> Path:
-        self._metadata = dict(metadata)
-        return self.metadata_file_path
-
-    def update_metadata(self, updates: dict[str, Any]) -> Path:
-        self._metadata.update(updates)
-        return self.metadata_file_path
-
-    def _iter_stage_frames(self, batch_stage: BatchStage) -> list[tuple[tuple[str, str, str], Any]]:
-        stage = self._stage_value(batch_stage)
-        return sorted((key, frame) for key, frame in self._frames.items() if key[0] == stage)
-
-    def _stage_value(self, batch_stage: BatchStage) -> str:
-        return BatchStage(batch_stage).value
-
-    def _copy_dataframe(self, dataframe: Any) -> Any:
-        copy_method = getattr(dataframe, "copy", None)
-        if not callable(copy_method):
-            return dataframe
-        try:
-            return copy_method(deep=True)
-        except TypeError:
-            return copy_method()
-
-
 class _RayBatchWorker:
     def __init__(
         self,
@@ -1170,42 +1030,26 @@ class _RayBatchWorker:
         self._metrics_collector: Any | None = metrics_collector
         self._observability_options: _RayObservabilityOptions = observability_options or _RayObservabilityOptions()
         self._base_config: DataDesignerConfig = DataDesignerConfig.model_validate_json(execution_payload.config_json)
-        self._artifact_storage: _InMemoryPreviewArtifactStorage = _InMemoryPreviewArtifactStorage()
         worker_options = execution_payload.worker_options
         run_config = copy.deepcopy(worker_options.run_config)
         if self._observability_options.trace_enabled:
             run_config.async_trace = True
-        self._seed_reader_registry: SeedReaderRegistry = SeedReaderRegistry(
-            readers=copy.deepcopy(worker_options.seed_readers)
-        )
+        seed_readers = copy.deepcopy(worker_options.seed_readers)
         dataframe_seed_reader = DataFrameSeedReader()
-        if (
-            execution_payload.use_input_dataset
-            and dataframe_seed_reader.get_seed_type() not in self._seed_reader_registry._readers
-        ):
-            self._seed_reader_registry.add_reader(dataframe_seed_reader)
-        self._resource_provider: Any = create_resource_provider(
-            artifact_storage=self._artifact_storage,
-            model_configs=self._base_config.model_configs or [],
-            secret_resolver=worker_options.secret_resolver,
-            model_provider_registry=resolve_model_provider_registry(
-                worker_options.model_providers,
-                worker_options.default_provider_name,
-            ),
-            seed_reader_registry=self._seed_reader_registry,
-            person_reader=worker_options.person_reader or create_person_reader(worker_options.managed_assets_path),
-            seed_dataset_source=None,
+        seed_types = {reader.get_seed_type() for reader in seed_readers}
+        if execution_payload.use_input_dataset and dataframe_seed_reader.get_seed_type() not in seed_types:
+            seed_readers.append(dataframe_seed_reader)
+        self._worker_options: _RayWorkerOptions = replace(
+            worker_options,
+            seed_readers=seed_readers,
             run_config=run_config,
-            mcp_providers=worker_options.mcp_providers,
-            tool_configs=self._base_config.tool_configs or [],
-            throttle_manager=worker_options.throttle_manager,
         )
 
     def __call__(self, batch: Any) -> Any:
         return _generate_batch(batch, worker=self, metrics_collector=self._metrics_collector)
 
     def close(self) -> None:
-        self._release_block_state()
+        return None
 
     def generate_batch(self, batch: Any) -> Any:
         start_time = time.perf_counter()
@@ -1246,7 +1090,15 @@ class _RayBatchWorker:
                 )
             _record_worker_metrics(
                 self._metrics_collector,
-                RayWorkerMetrics(total_rows=0, blocks=1, elapsed_seconds=elapsed_seconds, block_id=block_id),
+                RayWorkerMetrics(
+                    total_rows=0,
+                    input_rows=0,
+                    output_rows=0,
+                    empty_input=True,
+                    blocks=1,
+                    elapsed_seconds=elapsed_seconds,
+                    block_id=block_id,
+                ),
             )
             _record_worker_observability(
                 self._metrics_collector,
@@ -1256,19 +1108,14 @@ class _RayBatchWorker:
             )
             return dataframe
 
+        failure_metrics_recorded = False
         try:
             order_values = _get_hidden_order_values(
                 dataframe,
                 hidden_order_column=self._execution_payload.hidden_order_column,
             )
             block_config = self._create_block_config(dataframe)
-            self._attach_seed_reader(block_config)
-            model_usage_snapshot = self._resource_provider.model_registry.get_model_usage_snapshot()
-            builder = DatasetBuilder(
-                data_designer_config=block_config,
-                resource_provider=self._resource_provider,
-                use_async=True,
-            )
+            input_frame = _strip_internal_columns(dataframe) if self._execution_payload.use_input_dataset else None
             if observability_options.trace_enabled:
                 trace_events.append(
                     _create_trace_event(
@@ -1279,20 +1126,69 @@ class _RayBatchWorker:
                         worker_context=worker_context,
                     )
                 )
-            raw_dataset = builder.build_preview(num_records=num_records)
-            output = builder.process_preview(raw_dataset)
+            block_result = execute_dataset_block(
+                data_designer_config=block_config,
+                runtime_context=self._worker_options,
+                input_frame=input_frame,
+                num_records=num_records,
+                options=BlockExecutionOptions(use_async=True, dataset_name="ray-block"),
+            )
+            output = block_result.dataframe
+            elapsed_seconds = time.perf_counter() - start_time
+            model_usage = block_result.model_usage_stats or None
+            if block_result.all_rows_dropped:
+                if observability_options.trace_enabled:
+                    trace_events.append(
+                        _create_trace_event(
+                            block_id,
+                            "block_failed",
+                            start_time,
+                            row_count=num_records,
+                            worker_context=worker_context,
+                            details={
+                                "error_type": "AllRowsDropped",
+                                "error": "all input rows were dropped",
+                                "input_rows": block_result.input_rows,
+                                "output_rows": block_result.output_rows,
+                                "dropped_rows": block_result.dropped_rows,
+                            },
+                        )
+                    )
+                _record_worker_metrics(
+                    self._metrics_collector,
+                    _metrics_from_block_result(
+                        block_result,
+                        elapsed_seconds=elapsed_seconds,
+                        block_id=block_id,
+                        failed_blocks=1,
+                    ),
+                )
+                _record_worker_observability(
+                    self._metrics_collector,
+                    worker_profile=None,
+                    trace_events=trace_events,
+                    throttle_snapshots=[],
+                )
+                failure_metrics_recorded = True
+                raise RayDatasetGenerationError(
+                    _format_worker_failure_message(
+                        dataframe=dataframe,
+                        exc=RuntimeError(
+                            "all input rows were dropped during block execution "
+                            f"(input_rows={block_result.input_rows}, output_rows=0)"
+                        ),
+                    )
+                )
             if self._execution_payload.hidden_order_column is not None:
                 output = _append_hidden_order_column(
                     output,
                     order_values=order_values,
                     hidden_order_column=self._execution_payload.hidden_order_column,
                 )
-            elapsed_seconds = time.perf_counter() - start_time
-            model_usage = self._get_model_usage_delta(model_usage_snapshot, elapsed_seconds)
             if observability_options.trace_enabled:
                 trace_events.extend(
                     _task_traces_to_events(
-                        builder.task_traces,
+                        block_result.task_traces,
                         block_id=block_id,
                         worker_context=worker_context,
                     )
@@ -1304,17 +1200,20 @@ class _RayBatchWorker:
                         start_time,
                         row_count=len(output),
                         worker_context=worker_context,
-                        details={"output_columns": [str(column) for column in output.columns]},
+                        details={
+                            "output_columns": [str(column) for column in output.columns],
+                            "input_rows": block_result.input_rows,
+                            "output_rows": block_result.output_rows,
+                            "dropped_rows": block_result.dropped_rows,
+                        },
                     )
                 )
-            throttle_snapshots = _snapshot_worker_throttle(self._resource_provider.model_registry.throttle_manager)
+            throttle_snapshots = _snapshot_worker_throttle(self._worker_options.throttle_manager)
             _record_worker_metrics(
                 self._metrics_collector,
-                RayWorkerMetrics(
-                    total_rows=len(output),
-                    blocks=1,
+                _metrics_from_block_result(
+                    block_result,
                     elapsed_seconds=elapsed_seconds,
-                    model_usage=model_usage,
                     block_id=block_id,
                 ),
             )
@@ -1341,79 +1240,45 @@ class _RayBatchWorker:
                         details={"error_type": type(exc).__name__, "error": str(exc)},
                     )
                 )
-            _record_worker_metrics(
-                self._metrics_collector,
-                RayWorkerMetrics(
-                    total_rows=0,
-                    blocks=1,
-                    failed_blocks=1,
-                    elapsed_seconds=time.perf_counter() - start_time,
-                    block_id=block_id,
-                ),
-            )
-            _record_worker_observability(
-                self._metrics_collector,
-                worker_profile=None,
-                trace_events=trace_events,
-                throttle_snapshots=[],
-            )
+            if not failure_metrics_recorded:
+                _record_worker_metrics(
+                    self._metrics_collector,
+                    RayWorkerMetrics(
+                        total_rows=0,
+                        input_rows=num_records,
+                        output_rows=0,
+                        blocks=1,
+                        failed_blocks=1,
+                        elapsed_seconds=time.perf_counter() - start_time,
+                        block_id=block_id,
+                    ),
+                )
+                _record_worker_observability(
+                    self._metrics_collector,
+                    worker_profile=None,
+                    trace_events=trace_events,
+                    throttle_snapshots=[],
+                )
+            if isinstance(exc, RayDatasetGenerationError):
+                raise
             raise RayDatasetGenerationError(_format_worker_failure_message(dataframe=dataframe, exc=exc)) from exc
-        finally:
-            self._release_block_state()
 
     def _create_block_config(self, dataframe: Any) -> DataDesignerConfig:
         block_config = DataDesignerConfig.model_validate_json(self._execution_payload.config_json)
-        if self._execution_payload.use_input_dataset:
-            block_config.seed_config = SeedConfig(source=DataFrameSeedSource(df=_strip_internal_columns(dataframe)))
-        elif self._execution_payload.seed_window is not None:
+        if self._execution_payload.seed_window is not None:
             if self._execution_payload.seed_config is None:
                 raise RayDatasetGenerationError("RayBackend seed window was provided without a seed config.")
             block_config.seed_config = SeedConfig(
                 source=DataFrameSeedSource(
                     df=_read_seed_window_dataframe(
                         seed_config=self._execution_payload.seed_config,
-                        worker_options=self._execution_payload.worker_options,
+                        worker_options=self._worker_options,
                         dataframe=dataframe,
                         seed_window=self._execution_payload.seed_window,
                     )
                 )
             )
         return block_config
-
-    def _attach_seed_reader(self, block_config: DataDesignerConfig) -> None:
-        if block_config.seed_config is None:
-            self._resource_provider.seed_reader = None
-            return
-        self._resource_provider.seed_reader = self._seed_reader_registry.get_reader(
-            block_config.seed_config.source,
-            self._execution_payload.worker_options.secret_resolver,
-        )
-
-    def _get_model_usage_delta(
-        self,
-        model_usage_snapshot: Any,
-        elapsed_seconds: float,
-    ) -> dict[str, dict[str, Any]] | None:
-        usage_deltas = self._resource_provider.model_registry.get_usage_deltas(model_usage_snapshot)
-        if not usage_deltas:
-            return None
-        return {
-            model_name: usage_stats.get_usage_stats(total_time_elapsed=elapsed_seconds)
-            for model_name, usage_stats in usage_deltas.items()
-        }
-
-    def _release_block_state(self) -> None:
-        self._resource_provider.seed_reader = None
-        self._artifact_storage.clear()
-        _detach_seed_readers(self._seed_reader_registry._readers.values())
-
-
-def _detach_seed_readers(readers: Iterable[SeedReader]) -> None:
-    for reader in readers:
-        reader._reset_attachment_state()
-        for attr in ("source", "secret_resolver"):
-            if hasattr(reader, attr):
-                delattr(reader, attr)
 
 
 def _generate_batch(
@@ -1481,6 +1346,28 @@ def _append_hidden_order_column(
     output = output.copy()
     output[hidden_order_column] = order_values
     return output
+
+
+def _metrics_from_block_result(
+    block_result: Any,
+    *,
+    elapsed_seconds: float,
+    block_id: str,
+    failed_blocks: int = 0,
+) -> RayWorkerMetrics:
+    return RayWorkerMetrics(
+        total_rows=block_result.output_rows,
+        input_rows=block_result.input_rows,
+        output_rows=block_result.output_rows,
+        dropped_rows=block_result.dropped_rows,
+        all_rows_dropped=block_result.all_rows_dropped,
+        partial_rows_dropped=block_result.partial_rows_dropped,
+        blocks=1,
+        failed_blocks=failed_blocks,
+        elapsed_seconds=elapsed_seconds,
+        model_usage=block_result.model_usage_stats or None,
+        block_id=block_id,
+    )
 
 
 def _read_seed_window_dataframe(
