@@ -151,6 +151,25 @@ The optional Ray backend is a library scaling mode for trusted Ray clusters. It 
 model provider definitions, secret resolver state, seed-reader state, MCP provider definitions, and runtime settings
 to Ray workers so each worker can construct its local generation engine.
 
+Use option objects for Ray-specific planning and execution controls, while keeping common constructor arguments direct:
+
+```python
+from data_designer.integrations.ray import RayBackend, RayBlockPlanning, RayExecutionOptions
+
+backend = RayBackend(
+    batch_size=128,
+    output="dataset",
+    auto_init=False,
+    block_planning=RayBlockPlanning(target_block_size=10_000, min_blocks=4),
+    execution_options=RayExecutionOptions(num_cpus=1, concurrency=8),
+)
+```
+
+`batch_size`, `output`, and `auto_init` remain the direct constructor controls for common use. Older individual
+Ray planning and execution kwargs such as `override_num_blocks`, `read_concurrency`, `num_cpus`, and
+`map_concurrency` are still accepted as compatibility shims, but do not combine them with `block_planning` or
+`execution_options`; effective mixed values raise a configuration error. Prefer the option objects for new code.
+
 Use Ray only when the driver and workers are inside the same trusted operational boundary, such as a single-tenant
 cluster or a managed cluster with equivalent isolation. A Ray worker may receive provider endpoint configuration and
 may be able to resolve API keys through the configured `SecretResolver` or worker environment. Treat every Ray worker

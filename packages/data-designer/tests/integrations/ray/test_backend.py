@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -348,6 +349,41 @@ def test_ray_backend_rejects_grouped_block_planning_conflicts() -> None:
 def test_ray_backend_rejects_grouped_execution_option_conflicts() -> None:
     with pytest.raises(RayBackendConfigurationError, match="execution_options"):
         RayBackend(execution_options=RayExecutionOptions(), num_cpus=1)
+
+
+def test_ray_backend_constructor_signature_keeps_option_objects_primary() -> None:
+    parameters = inspect.signature(RayBackend).parameters
+
+    assert "block_planning" in parameters
+    assert "execution_options" in parameters
+    assert "batch_size" in parameters
+    assert "output" in parameters
+    assert "auto_init" in parameters
+    assert "override_num_blocks" not in parameters
+    assert "num_cpus" not in parameters
+
+
+def test_ray_backend_accepts_legacy_option_kwargs_as_compatibility_shims() -> None:
+    backend = RayBackend(
+        override_num_blocks=3,
+        read_concurrency=2,
+        num_cpus=0.5,
+        map_concurrency=4,
+        ray_remote_args={"resources": {"token_bucket": 1}},
+    )
+
+    assert backend.block_planning == RayBlockPlanning(override_num_blocks=3, read_concurrency=2)
+    assert backend.execution_options == RayExecutionOptions(
+        num_cpus=0.5,
+        concurrency=4,
+        ray_remote_args={"resources": {"token_bucket": 1}},
+    )
+    assert backend.ray_remote_args == {"resources": {"token_bucket": 1}}
+
+
+def test_ray_backend_rejects_unknown_legacy_option_kwargs() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="unsupported Ray option arguments: unknown"):
+        RayBackend(unknown=1)
 
 
 def test_ray_backend_propagates_execution_resource_options(
