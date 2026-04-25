@@ -15,7 +15,8 @@ from data_designer.config.column_configs import ExpressionColumnConfig, LLMTextC
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.processors import SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
-from data_designer.config.seed_source import DirectorySeedSource
+from data_designer.config.seed import IndexRange, SamplingStrategy
+from data_designer.config.seed_source import DirectorySeedSource, FileContentsSeedSource, LocalFileSeedSource
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
@@ -991,7 +992,7 @@ def test_ray_backend_arrow_refs_dataset_rebuild_falls_back_to_items(monkeypatch:
     ]
 
 
-def test_ray_backend_materializes_filesystem_seed_reader_fanout_as_input_dataset(
+def test_ray_backend_hydrates_filesystem_seed_reader_fanout_with_ray_data(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     stub_model_providers: Any,
@@ -1021,12 +1022,177 @@ def test_ray_backend_materializes_filesystem_seed_reader_fanout_as_input_dataset
 
     output_df = designer.create(config_builder, num_records=3).load_dataset().to_pandas()
 
-    assert fake_ray.data.from_pandas_input is not None
+    assert fake_ray.data.from_pandas_input is None
+    assert fake_ray.data.from_items_input == [
+        {"relative_path": "a.txt"},
+        {"relative_path": "b.txt"},
+    ]
     assert fake_ray.data.range_kwargs is None
     assert output_df.to_dict(orient="records") == [
         {"relative_path": "a.txt", "line_index": 0, "line": "alpha", "line_label": "a.txt:0:alpha"},
         {"relative_path": "a.txt", "line_index": 1, "line": "beta", "line_label": "a.txt:1:beta"},
         {"relative_path": "b.txt", "line_index": 0, "line": "gamma", "line_label": "b.txt:0:gamma"},
+    ]
+
+
+def test_ray_backend_reads_local_file_seed_with_ray_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    seed_path = tmp_path / "seed.csv"
+    lazy.pd.DataFrame({"value": [1, 2, 3], "label": ["a", "b", "c"]}).to_csv(seed_path, index=False)
+
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    config_builder.with_seed_dataset(LocalFileSeedSource(path=str(seed_path)))
+    config_builder.add_column(ExpressionColumnConfig(name="value_label", expr="{{ value }}:{{ label }}"))
+    designer = DataDesigner(
+        artifact_path=tmp_path / "artifacts",
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2),
+    )
+
+    output_df = designer.create(config_builder, num_records=5).load_dataset().to_pandas()
+
+    assert fake_ray.data.read_csv_input == str(seed_path)
+    assert fake_ray.data.read_csv_kwargs == {"partitioning": None}
+    assert fake_ray.data.from_pandas_input is None
+    assert output_df.to_dict(orient="records") == [
+        {"value": 1, "label": "a", "value_label": "1:a"},
+        {"value": 2, "label": "b", "value_label": "2:b"},
+        {"value": 3, "label": "c", "value_label": "3:c"},
+        {"value": 1, "label": "a", "value_label": "1:a"},
+        {"value": 2, "label": "b", "value_label": "2:b"},
+    ]
+
+
+def test_ray_backend_applies_local_file_seed_range_without_leaking_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    seed_path = tmp_path / "seed.jsonl"
+    lazy.pd.DataFrame({"value": [10, 20, 30, 40], "label": ["a", "b", "c", "d"]}).to_json(
+        seed_path,
+        orient="records",
+        lines=True,
+    )
+
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    config_builder.with_seed_dataset(
+        LocalFileSeedSource(path=str(seed_path)),
+        selection_strategy=IndexRange(start=1, end=2),
+    )
+    config_builder.add_column(ExpressionColumnConfig(name="value_label", expr="{{ value }}:{{ label }}"))
+    designer = DataDesigner(
+        artifact_path=tmp_path / "artifacts",
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2),
+    )
+
+    output_df = designer.create(config_builder, num_records=3).load_dataset().to_pandas()
+
+    assert fake_ray.data.read_json_input == str(seed_path)
+    assert fake_ray.data.read_json_kwargs == {"lines": True, "partitioning": None}
+    assert fake_ray.data.from_pandas_input is None
+    assert "__data_designer_ray_seed_ordinal" not in output_df.columns
+    assert output_df.to_dict(orient="records") == [
+        {"value": 20, "label": "b", "value_label": "20:b"},
+        {"value": 30, "label": "c", "value_label": "30:c"},
+        {"value": 20, "label": "b", "value_label": "20:b"},
+    ]
+
+
+def test_ray_backend_rejects_shuffled_ray_native_local_file_seed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    seed_path = tmp_path / "seed.csv"
+    lazy.pd.DataFrame({"value": [1, 2]}).to_csv(seed_path, index=False)
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    config_builder.with_seed_dataset(
+        LocalFileSeedSource(path=str(seed_path)),
+        sampling_strategy=SamplingStrategy.SHUFFLE,
+    )
+    config_builder.add_column(ExpressionColumnConfig(name="value_copy", expr="{{ value }}"))
+    designer = DataDesigner(
+        artifact_path=tmp_path / "artifacts",
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2),
+    )
+
+    with pytest.raises(RayBackendConfigurationError, match="local-file seed ingestion.*ordered sampling"):
+        designer.create(config_builder, num_records=1)
+
+    assert fake_ray.data.read_csv_input is None
+    assert fake_ray.data.from_pandas_input is None
+
+
+def test_ray_backend_reads_file_contents_seed_with_ray_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    (seed_dir / "a.txt").write_text("alpha", encoding="utf-8")
+    (seed_dir / "b.txt").write_text("beta", encoding="utf-8")
+
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    config_builder.with_seed_dataset(FileContentsSeedSource(path=str(seed_dir), file_pattern="*.txt"))
+    config_builder.add_column(ExpressionColumnConfig(name="content_label", expr="{{ file_name }}:{{ content }}"))
+    designer = DataDesigner(
+        artifact_path=tmp_path / "artifacts",
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2),
+    )
+
+    output_df = designer.create(config_builder, num_records=3).load_dataset().to_pandas()
+
+    assert fake_ray.data.read_binary_files_input == [
+        str(seed_dir / "a.txt"),
+        str(seed_dir / "b.txt"),
+    ]
+    assert fake_ray.data.read_binary_files_kwargs == {"include_paths": True, "partitioning": None}
+    assert fake_ray.data.from_pandas_input is None
+    assert output_df.to_dict(orient="records") == [
+        {
+            "source_kind": "file_contents",
+            "source_path": str(seed_dir / "a.txt"),
+            "relative_path": "a.txt",
+            "file_name": "a.txt",
+            "content": "alpha",
+            "content_label": "a.txt:alpha",
+        },
+        {
+            "source_kind": "file_contents",
+            "source_path": str(seed_dir / "b.txt"),
+            "relative_path": "b.txt",
+            "file_name": "b.txt",
+            "content": "beta",
+            "content_label": "b.txt:beta",
+        },
+        {
+            "source_kind": "file_contents",
+            "source_path": str(seed_dir / "a.txt"),
+            "relative_path": "a.txt",
+            "file_name": "a.txt",
+            "content": "alpha",
+            "content_label": "a.txt:alpha",
+        },
     ]
 
 

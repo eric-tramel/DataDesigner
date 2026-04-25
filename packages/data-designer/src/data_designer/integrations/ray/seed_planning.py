@@ -6,22 +6,28 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.seed import IndexRange, PartitionBlock, SamplingStrategy, SeedConfig
+from data_designer.config.seed_source import FileContentsSeedSource
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.resources.seed_reader import (
     DataFrameSeedReader,
+    FileContentsSeedReader,
     FileSystemSeedReader,
+    LocalFileSeedReader,
     SeedReader,
     SeedReaderRegistry,
+    create_seed_reader_output_dataframe,
 )
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.interface.backends import BackendRuntimeContext
 
 RAY_RANGE_ID_COLUMN = "id"
+RAY_SEED_ORDINAL_COLUMN = "__data_designer_ray_seed_ordinal"
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,7 @@ class RaySeedWindow:
 @dataclass(frozen=True)
 class RaySeedPlan:
     input_dataframe: Any | None = None
+    input_dataset: Any | None = None
     seed_window: RaySeedWindow | None = None
 
 
@@ -41,7 +48,38 @@ def plan_seed_execution(
     runtime_context: BackendRuntimeContext,
     seed_config: SeedConfig,
     num_records: int,
+    ray: Any | None = None,
 ) -> RaySeedPlan:
+    seed_reader = _get_detached_seed_reader(runtime_context=runtime_context, seed_config=seed_config)
+    if ray is not None and isinstance(seed_reader, LocalFileSeedReader):
+        return RaySeedPlan(
+            input_dataset=create_ray_local_file_seed_dataset(
+                ray=ray,
+                seed_reader=seed_reader,
+                seed_config=seed_config,
+                num_records=num_records,
+            )
+        )
+    if ray is not None and isinstance(seed_reader, FileContentsSeedReader):
+        return RaySeedPlan(
+            input_dataset=create_ray_file_contents_seed_dataset(
+                ray=ray,
+                seed_reader=seed_reader,
+                seed_config=seed_config,
+                num_records=num_records,
+            )
+        )
+    if ray is not None and isinstance(seed_reader, FileSystemSeedReader):
+        return RaySeedPlan(
+            input_dataset=create_ray_filesystem_seed_dataset(
+                ray=ray,
+                seed_reader=seed_reader,
+                seed_config=seed_config,
+                num_records=num_records,
+                secret_resolver=runtime_context.secret_resolver,
+            )
+        )
+
     if should_materialize_seed_on_driver(runtime_context=runtime_context, seed_config=seed_config):
         return RaySeedPlan(
             input_dataframe=materialize_seed_dataframe(
@@ -57,6 +95,276 @@ def plan_seed_execution(
             num_records=num_records,
         )
     )
+
+
+def create_ray_local_file_seed_dataset(
+    *,
+    ray: Any,
+    seed_reader: LocalFileSeedReader,
+    seed_config: SeedConfig,
+    num_records: int,
+) -> Any:
+    """Create a Ray Dataset for an ordered local structured-file seed."""
+    if seed_config.sampling_strategy != SamplingStrategy.ORDERED:
+        raise RayBackendConfigurationError(
+            "RayBackend Ray-native local-file seed ingestion currently supports only ordered sampling. "
+            "Use input_dataset for shuffled Ray-native seeds or the local backend for shuffled seed sampling."
+        )
+    seed_dataset_size = seed_reader.get_seed_dataset_size()
+    index_range = resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=seed_dataset_size)
+    _validate_no_seed_ordinal_column(seed_reader.get_column_names())
+    dataset = _read_local_file_seed_dataset(ray, seed_reader.get_dataset_uri())
+    return _apply_ordered_seed_selection_and_cycling(
+        ray=ray,
+        dataset=dataset,
+        seed_dataset_size=seed_dataset_size,
+        index_range=index_range,
+        num_records=num_records,
+    )
+
+
+def create_ray_file_contents_seed_dataset(
+    *,
+    ray: Any,
+    seed_reader: FileContentsSeedReader,
+    seed_config: SeedConfig,
+    num_records: int,
+) -> Any:
+    """Create a Ray Dataset for ordered file-content seeds without driver content reads."""
+    if seed_config.sampling_strategy != SamplingStrategy.ORDERED:
+        raise RayBackendConfigurationError(
+            "RayBackend Ray-native file-content seed ingestion currently supports only ordered sampling. "
+            "Use input_dataset for shuffled Ray-native seeds or the local backend for shuffled seed sampling."
+        )
+    source = seed_reader.source
+    if not isinstance(source, FileContentsSeedSource):
+        raise RayBackendConfigurationError("RayBackend file-content seed ingestion expected FileContentsSeedSource.")
+    context = seed_reader.create_filesystem_context(source.runtime_path)
+    relative_paths = seed_reader.get_matching_relative_paths(
+        context=context,
+        file_pattern=source.file_pattern,
+        recursive=source.recursive,
+    )
+    index_range = resolve_seed_config_index_range(seed_config=seed_config, seed_dataset_size=len(relative_paths))
+    absolute_paths = [str(context.root_path / relative_path) for relative_path in relative_paths]
+    dataset = ray.data.read_binary_files(
+        absolute_paths,
+        include_paths=True,
+        partitioning=None,
+    ).map_batches(
+        _file_contents_seed_batch_to_dataframe,
+        fn_kwargs={"root_path": str(context.root_path), "encoding": source.encoding},
+        batch_format="pandas",
+    )
+    return _apply_ordered_seed_selection_and_cycling(
+        ray=ray,
+        dataset=dataset,
+        seed_dataset_size=len(relative_paths),
+        index_range=index_range,
+        num_records=num_records,
+    )
+
+
+def create_ray_filesystem_seed_dataset(
+    *,
+    ray: Any,
+    seed_reader: FileSystemSeedReader[Any],
+    seed_config: SeedConfig,
+    num_records: int,
+    secret_resolver: SecretResolver,
+) -> Any:
+    """Create a Ray Dataset that hydrates filesystem seed manifest rows on workers."""
+    if seed_config.sampling_strategy != SamplingStrategy.ORDERED:
+        raise RayBackendConfigurationError(
+            "RayBackend Ray-native filesystem seed ingestion currently supports only ordered sampling. "
+            "Use input_dataset for shuffled Ray-native seeds or the local backend for shuffled seed sampling."
+        )
+    manifest_dataframe = _filesystem_manifest_dataframe(seed_reader)
+    index_range = resolve_seed_config_index_range(
+        seed_config=seed_config,
+        seed_dataset_size=len(manifest_dataframe),
+    )
+    output_columns = seed_reader.get_output_column_names()
+    _validate_no_seed_ordinal_column(output_columns)
+    manifest_dataset = ray.data.from_items(manifest_dataframe.to_dict(orient="records"))
+    selected_manifest_dataset = _apply_ordered_seed_selection_and_cycling(
+        ray=ray,
+        dataset=manifest_dataset,
+        seed_dataset_size=len(manifest_dataframe),
+        index_range=index_range,
+        num_records=num_records,
+    )
+    return selected_manifest_dataset.map_batches(
+        _hydrate_filesystem_seed_manifest_batch,
+        fn_kwargs={
+            "seed_reader": seed_reader,
+            "seed_source": seed_reader.source,
+            "secret_resolver": secret_resolver,
+            "output_columns": output_columns,
+        },
+        batch_format="pandas",
+    ).limit(num_records)
+
+
+def _filesystem_manifest_dataframe(seed_reader: FileSystemSeedReader[Any]) -> Any:
+    context = seed_reader.create_filesystem_context(seed_reader.source.runtime_path)
+    manifest = seed_reader.build_manifest(context=context)
+    manifest_dataframe = manifest.copy() if isinstance(manifest, lazy.pd.DataFrame) else lazy.pd.DataFrame(manifest)
+    if manifest_dataframe.empty:
+        raise RayBackendConfigurationError(
+            f"RayBackend filesystem seed source at {seed_reader.source.runtime_path} did not produce any rows."
+        )
+    return manifest_dataframe
+
+
+def _hydrate_filesystem_seed_manifest_batch(
+    batch: Any,
+    *,
+    seed_reader: FileSystemSeedReader[Any],
+    seed_source: Any,
+    secret_resolver: SecretResolver,
+    output_columns: list[str],
+) -> Any:
+    reader = _clone_seed_reader_for_worker(seed_reader)
+    reader.attach(seed_source, secret_resolver)
+    context = reader.create_filesystem_context(seed_source.runtime_path)
+    hydrated_records = reader._hydrate_rows(
+        manifest_rows=lazy.pd.DataFrame(batch).to_dict(orient="records"),
+        context=context,
+    )
+    return create_seed_reader_output_dataframe(records=hydrated_records, output_columns=output_columns)
+
+
+def _read_local_file_seed_dataset(ray: Any, dataset_uri: str) -> Any:
+    normalized_uri = dataset_uri.lower()
+    read_kwargs: dict[str, Any] = {"partitioning": None}
+    if _path_matches_suffix(normalized_uri, ".parquet"):
+        return ray.data.read_parquet(dataset_uri, **read_kwargs)
+    if _path_matches_suffix(normalized_uri, ".csv"):
+        return ray.data.read_csv(dataset_uri, **read_kwargs)
+    if _path_matches_suffix(normalized_uri, ".jsonl"):
+        return ray.data.read_json(dataset_uri, lines=True, **read_kwargs)
+    if _path_matches_suffix(normalized_uri, ".json"):
+        return ray.data.read_json(dataset_uri, lines=False, **read_kwargs)
+    raise RayBackendConfigurationError(
+        "RayBackend Ray-native local-file seed ingestion supports parquet, csv, json, and jsonl seed files."
+    )
+
+
+def _path_matches_suffix(path: str, suffix: str) -> bool:
+    return path.endswith((suffix, f"{suffix}'")) or f"*{suffix}" in path
+
+
+def _apply_ordered_seed_selection_and_cycling(
+    *,
+    ray: Any,
+    dataset: Any,
+    seed_dataset_size: int,
+    index_range: IndexRange,
+    num_records: int,
+) -> Any:
+    if num_records < 0:
+        raise RayBackendConfigurationError("RayBackend seed num_records must be non-negative.")
+    selected = _select_seed_dataset_range(
+        ray=ray,
+        dataset=dataset,
+        seed_dataset_size=seed_dataset_size,
+        index_range=index_range,
+    )
+    return _cycle_seed_dataset(selected, selected_size=index_range.size, num_records=num_records)
+
+
+def _select_seed_dataset_range(
+    *,
+    ray: Any,
+    dataset: Any,
+    seed_dataset_size: int,
+    index_range: IndexRange,
+) -> Any:
+    if index_range.start == 0 and index_range.end == seed_dataset_size - 1:
+        return dataset
+    ordinal_dataset = ray.data.range(seed_dataset_size).map_batches(
+        _rename_range_id_to_seed_ordinal,
+        batch_format="pandas",
+    )
+    return (
+        dataset.zip(ordinal_dataset)
+        .filter(
+            _row_in_seed_index_range,
+            fn_kwargs={"start": index_range.start, "end": index_range.end},
+        )
+        .drop_columns([RAY_SEED_ORDINAL_COLUMN])
+    )
+
+
+def _cycle_seed_dataset(dataset: Any, *, selected_size: int, num_records: int) -> Any:
+    if selected_size <= 0:
+        raise RayBackendConfigurationError("RayBackend seed config resolved to an empty selected seed range.")
+    if num_records <= selected_size:
+        return dataset.limit(num_records)
+    full_repetitions, remainder = divmod(num_records, selected_size)
+    pieces = [dataset for _ in range(full_repetitions)]
+    if remainder:
+        pieces.append(dataset.limit(remainder))
+    if not pieces:
+        return dataset.limit(0)
+    return pieces[0].union(*pieces[1:]) if len(pieces) > 1 else pieces[0]
+
+
+def _rename_range_id_to_seed_ordinal(batch: Any) -> Any:
+    dataframe = lazy.pd.DataFrame(batch)
+    if RAY_RANGE_ID_COLUMN not in dataframe.columns:
+        raise RayDatasetGenerationError(
+            f"RayBackend expected ray.data.range() batches to include {RAY_RANGE_ID_COLUMN!r}."
+        )
+    return lazy.pd.DataFrame({RAY_SEED_ORDINAL_COLUMN: dataframe[RAY_RANGE_ID_COLUMN].tolist()})
+
+
+def _row_in_seed_index_range(row: dict[str, Any], *, start: int, end: int) -> bool:
+    ordinal = int(row[RAY_SEED_ORDINAL_COLUMN])
+    return start <= ordinal <= end
+
+
+def _file_contents_seed_batch_to_dataframe(batch: Any, *, root_path: str, encoding: str) -> Any:
+    dataframe = lazy.pd.DataFrame(batch)
+    path_column = _first_present_column(dataframe, ("path", "paths"))
+    bytes_column = _first_present_column(dataframe, ("bytes", "data", "item"))
+    records: list[dict[str, Any]] = []
+    root = Path(root_path).resolve()
+    for row in dataframe.to_dict(orient="records"):
+        source_path = Path(str(row[path_column])).resolve()
+        try:
+            relative_path = source_path.relative_to(root).as_posix()
+        except ValueError:
+            relative_path = source_path.name
+        payload = row[bytes_column]
+        content = (
+            bytes(payload).decode(encoding) if isinstance(payload, (bytes, bytearray, memoryview)) else str(payload)
+        )
+        records.append(
+            {
+                "source_kind": "file_contents",
+                "source_path": str(source_path),
+                "relative_path": relative_path,
+                "file_name": source_path.name,
+                "content": content,
+            }
+        )
+    return lazy.pd.DataFrame(records)
+
+
+def _first_present_column(dataframe: Any, names: tuple[str, ...]) -> str:
+    for name in names:
+        if name in dataframe.columns:
+            return name
+    raise RayDatasetGenerationError(f"RayBackend file-content seed ingestion expected one of {names!r}.")
+
+
+def _validate_no_seed_ordinal_column(column_names: Sequence[str]) -> None:
+    if RAY_SEED_ORDINAL_COLUMN in column_names:
+        raise RayBackendConfigurationError(
+            f"RayBackend Ray-native seed ingestion reserves column {RAY_SEED_ORDINAL_COLUMN!r}."
+        )
 
 
 def preflight_seed_window(

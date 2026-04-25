@@ -6,6 +6,8 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
+from glob import glob
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -104,6 +106,50 @@ class FakeRayDataset:
         zipped.repartition_calls = list(self.repartition_calls)
         return zipped
 
+    def filter(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
+        fn_kwargs = kwargs.get("fn_kwargs") or {}
+        blocks: list[lazy.pd.DataFrame] = []
+        for block in self.blocks:
+            block_df = coerce_pandas_dataframe(block)
+            rows = [row for row in block_df.to_dict(orient="records") if fn(row, **fn_kwargs)]
+            blocks.append(lazy.pd.DataFrame(rows, columns=list(block_df.columns)))
+        filtered = FakeRayDataset(
+            blocks,
+            data_module=self.data_module,
+            reverse_mapped_blocks=self.reverse_mapped_blocks,
+        )
+        filtered.repartition_calls = list(self.repartition_calls)
+        return filtered
+
+    def limit(self, limit: int) -> FakeRayDataset:
+        remaining = limit
+        blocks: list[lazy.pd.DataFrame] = []
+        for block in self.blocks:
+            block_df = coerce_pandas_dataframe(block)
+            if remaining <= 0:
+                break
+            selected = block_df.iloc[:remaining].reset_index(drop=True)
+            blocks.append(selected)
+            remaining -= len(selected)
+        if not blocks and self.blocks:
+            blocks = [coerce_pandas_dataframe(self.blocks[0]).iloc[:0].reset_index(drop=True)]
+        limited = FakeRayDataset(
+            blocks,
+            data_module=self.data_module,
+            reverse_mapped_blocks=self.reverse_mapped_blocks,
+        )
+        limited.repartition_calls = list(self.repartition_calls)
+        return limited
+
+    def union(self, *others: FakeRayDataset) -> FakeRayDataset:
+        unioned = FakeRayDataset(
+            [*self.blocks, *(block for other in others for block in other.blocks)],
+            data_module=self.data_module,
+            reverse_mapped_blocks=self.reverse_mapped_blocks,
+        )
+        unioned.repartition_calls = list(self.repartition_calls)
+        return unioned
+
     def to_arrow_refs(self) -> list[Any]:
         if self.data_module is None:
             return list(self.blocks)
@@ -159,6 +205,14 @@ class FakeRayDataModule:
         self.from_pandas_input: Any | None = None
         self.from_items_input: list[Any] | None = None
         self.from_items_kwargs: dict[str, Any] | None = None
+        self.read_binary_files_input: Any | None = None
+        self.read_binary_files_kwargs: dict[str, Any] | None = None
+        self.read_csv_input: Any | None = None
+        self.read_csv_kwargs: dict[str, Any] | None = None
+        self.read_json_input: Any | None = None
+        self.read_json_kwargs: dict[str, Any] | None = None
+        self.read_parquet_input: Any | None = None
+        self.read_parquet_kwargs: dict[str, Any] | None = None
         self.range_blocks = range_blocks
         self.reverse_mapped_blocks = reverse_mapped_blocks
         self.range_kwargs: dict[str, Any] | None = None
@@ -214,6 +268,34 @@ class FakeRayDataModule:
     def from_pandas_refs(self, refs: list[Any]) -> FakeRayDataset:
         self.from_pandas_refs_input = refs
         return self.dataset(list(refs))
+
+    def read_binary_files(self, paths: Any, **kwargs: Any) -> FakeRayDataset:
+        self.read_binary_files_input = paths
+        self.read_binary_files_kwargs = dict(kwargs)
+        include_paths = bool(kwargs.get("include_paths"))
+        records: list[dict[str, Any]] = []
+        for path in _expand_paths(paths):
+            record = {"bytes": path.read_bytes()}
+            if include_paths:
+                record["path"] = str(path)
+            records.append(record)
+        return self.dataset([lazy.pd.DataFrame(records)])
+
+    def read_csv(self, paths: Any, **kwargs: Any) -> FakeRayDataset:
+        self.read_csv_input = paths
+        self.read_csv_kwargs = dict(kwargs)
+        return self.dataset([_read_pandas_files(paths, lambda path: lazy.pd.read_csv(path))])
+
+    def read_json(self, paths: Any, **kwargs: Any) -> FakeRayDataset:
+        self.read_json_input = paths
+        self.read_json_kwargs = dict(kwargs)
+        lines = bool(kwargs.get("lines"))
+        return self.dataset([_read_pandas_files(paths, lambda path: lazy.pd.read_json(path, lines=lines))])
+
+    def read_parquet(self, paths: Any, **kwargs: Any) -> FakeRayDataset:
+        self.read_parquet_input = paths
+        self.read_parquet_kwargs = dict(kwargs)
+        return self.dataset([_read_pandas_files(paths, lambda path: lazy.pd.read_parquet(path))])
 
     def validate_map_batches_kwargs(self, kwargs: dict[str, Any]) -> None:
         if not self.validate_map_batches:
@@ -348,3 +430,20 @@ def coerce_pandas_dataframe(value: Any) -> lazy.pd.DataFrame:
     if callable(to_pandas):
         return to_pandas()
     return value
+
+
+def _expand_paths(paths: Any) -> list[Path]:
+    raw_paths = [paths] if isinstance(paths, str) else list(paths)
+    expanded: list[Path] = []
+    for raw_path in raw_paths:
+        path = str(raw_path)
+        matches = sorted(glob(path)) if "*" in path else [path]
+        expanded.extend(Path(match) for match in matches)
+    return expanded
+
+
+def _read_pandas_files(paths: Any, read_file: Any) -> lazy.pd.DataFrame:
+    dataframes = [read_file(path) for path in _expand_paths(paths)]
+    if not dataframes:
+        return lazy.pd.DataFrame()
+    return lazy.pd.concat(dataframes, ignore_index=True)
