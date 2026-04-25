@@ -16,3 +16,8 @@ uv run pytest packages/data-designer/tests/integrations/ray -m ray_fake
 DATA_DESIGNER_RUN_REAL_RAY_SMOKE=1 uv run pytest packages/data-designer/tests/integrations/ray -m "ray_real_smoke and not ray_live_provider"
 DATA_DESIGNER_RUN_REAL_RAY_SMOKE=1 OPENAI_API_KEY=... uv run pytest packages/data-designer/tests/integrations/ray -m ray_live_provider
 ```
+
+The real-Ray smoke fixtures own local `ray.init`/`ray.shutdown`, use isolated test temp paths for artifacts, keep Ray
+runtime state under a short `/tmp/dd-ray-*` path for macOS socket compatibility, disable the dashboard, and set
+`RAY_ENABLE_UV_RUN_RUNTIME_ENV=0` before importing Ray when the caller has not provided a value. They also centralize
+the macOS sandbox compatibility patch for Ray process discovery and restore it after each test.

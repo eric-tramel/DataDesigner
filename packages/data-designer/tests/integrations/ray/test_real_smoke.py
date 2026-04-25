@@ -6,9 +6,7 @@
 from __future__ import annotations
 
 import copy
-import importlib
 import importlib.util
-import os
 from pathlib import Path
 from typing import Any
 
@@ -26,18 +24,16 @@ from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend
 from data_designer.interface.data_designer import DataDesigner
 
-REAL_RAY_SMOKE_ENV = "DATA_DESIGNER_RUN_REAL_RAY_SMOKE"
-OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
-
 pytestmark = pytest.mark.ray_real_smoke
 
 
 def test_real_ray_markdown_seed_recipe_arrow_refs_smoke(
     tmp_path: Path,
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    ray = _require_real_ray()
     recipe = _load_recipe("docs/assets/recipes/plugin_development/markdown_seed_reader.py")
     seed_dir = tmp_path / "markdown"
     seed_dir.mkdir()
@@ -45,165 +41,122 @@ def test_real_ray_markdown_seed_recipe_arrow_refs_smoke(
     input_df = _markdown_sections_dataframe(recipe, seed_dir)
     input_blocks = [input_df.iloc[:2].reset_index(drop=True), input_df.iloc[2:].reset_index(drop=True)]
 
-    _init_local_ray(ray)
-    try:
-        input_dataset = ray.data.from_pandas(input_blocks)
-        config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
-        config_builder.add_column(
-            ExpressionColumnConfig(
-                name="section_summary",
-                expr="{{ file_name }} :: {{ section_header }}",
-            )
+    input_dataset = local_ray.data.from_pandas(input_blocks)
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(
+        ExpressionColumnConfig(
+            name="section_summary",
+            expr="{{ file_name }} :: {{ section_header }}",
         )
-        managed_assets_path = tmp_path / "managed-assets"
-        managed_assets_path.mkdir()
-        designer = DataDesigner(
-            artifact_path=tmp_path / "artifacts",
-            model_providers=stub_model_providers,
-            secret_resolver=PlaintextResolver(),
-            managed_assets_path=managed_assets_path,
-            backend=RayBackend(batch_size=2, output="arrow_refs"),
-        )
+    )
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(batch_size=2, output="arrow_refs"),
+    )
 
-        results = designer.create(config_builder, input_dataset=input_dataset)
-        refs = results.output
-        output_df = results.load_dataset().to_pandas()
-        metrics = results.load_metrics()
+    results = designer.create(config_builder, input_dataset=input_dataset)
+    refs = results.output
+    output_df = results.load_dataset().to_pandas()
+    metrics = results.load_metrics()
 
-        assert results.to_arrow_refs() == refs
-        assert len(refs) == metrics.blocks
-        assert metrics.total_rows == len(input_df)
-        assert metrics.failed_blocks == 0
-        assert output_df["section_summary"].notna().all()
-        assert output_df["section_summary"].str.contains("::").all()
-    finally:
-        ray.shutdown()
+    assert results.to_arrow_refs() == refs
+    assert len(refs) == metrics.blocks
+    assert metrics.total_rows == len(input_df)
+    assert metrics.failed_blocks == 0
+    assert output_df["section_summary"].notna().all()
+    assert output_df["section_summary"].str.contains("::").all()
 
 
 @pytest.mark.ray_live_provider
-def test_real_ray_text_to_python_openai_recipe_smoke(tmp_path: Path) -> None:
-    ray = _require_real_ray()
-    if not os.environ.get(OPENAI_API_KEY_ENV):
-        pytest.skip(f"{OPENAI_API_KEY_ENV} is required for the OpenAI-backed Ray smoke test.")
-
+def test_real_ray_text_to_python_openai_recipe_smoke(
+    live_provider_local_ray: Any,
+    real_ray_smoke_paths: Any,
+) -> None:
     resolve_seed_default_model_settings()
     recipe = _load_recipe("docs/assets/recipes/code_generation/text_to_python.py")
     config_builder = _single_llm_text_to_python_config(recipe)
     provider = _builtin_provider("openai")
 
-    _init_local_ray(ray)
-    try:
-        managed_assets_path = tmp_path / "managed-assets"
-        managed_assets_path.mkdir()
-        designer = DataDesigner(
-            artifact_path=tmp_path / "artifacts",
-            model_providers=[provider],
-            managed_assets_path=managed_assets_path,
-            backend=RayBackend(batch_size=1, output="arrow_refs"),
-        )
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=[provider],
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(batch_size=1, output="arrow_refs"),
+    )
 
-        results = designer.create(config_builder, num_records=1)
-        refs = results.output
-        output_df = results.load_dataset().to_pandas()
-        metrics = results.load_metrics()
-        metrics_payload = metrics.to_dict()
+    results = designer.create(config_builder, num_records=1)
+    refs = results.output
+    output_df = results.load_dataset().to_pandas()
+    metrics = results.load_metrics()
+    metrics_payload = metrics.to_dict()
 
-        assert results.to_arrow_refs() == refs
-        assert len(refs) == metrics.blocks
-        assert metrics.total_rows == 1
-        assert metrics.failed_blocks == 0
-        assert output_df["instruction"].notna().all()
-        assert output_df["instruction"].astype(str).str.len().min() > 0
-        assert metrics_payload["model_usage"]
-    finally:
-        ray.shutdown()
+    assert results.to_arrow_refs() == refs
+    assert len(refs) == metrics.blocks
+    assert metrics.total_rows == 1
+    assert metrics.failed_blocks == 0
+    assert output_df["instruction"].notna().all()
+    assert output_df["instruction"].astype(str).str.len().min() > 0
+    assert metrics_payload["model_usage"]
 
 
 def test_real_ray_streaming_out_of_core_parquet_smoke(
     tmp_path: Path,
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    ray = _require_real_ray()
     num_records = 32
     source_blocks = 8
 
-    _init_local_ray(ray)
-    try:
-        input_dataset = ray.data.range(num_records, override_num_blocks=source_blocks)
-        config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
-        config_builder.add_column(ExpressionColumnConfig(name="ticket_key", expr="tenant-{{ id }}::ticket-{{ id }}"))
-        config_builder.add_column(ExpressionColumnConfig(name="routing_key", expr="support::{{ id }}"))
-        config_builder.add_column(
-            ExpressionColumnConfig(
-                name="audit_record",
-                expr="{{ ticket_key }}::customer-{{ id }}::{{ routing_key }}",
-            )
+    input_dataset = local_ray.data.range(num_records, override_num_blocks=source_blocks)
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="ticket_key", expr="tenant-{{ id }}::ticket-{{ id }}"))
+    config_builder.add_column(ExpressionColumnConfig(name="routing_key", expr="support::{{ id }}"))
+    config_builder.add_column(
+        ExpressionColumnConfig(
+            name="audit_record",
+            expr="{{ ticket_key }}::customer-{{ id }}::{{ routing_key }}",
         )
-        managed_assets_path = tmp_path / "managed-assets"
-        managed_assets_path.mkdir()
-        designer = DataDesigner(
-            artifact_path=tmp_path / "artifacts",
-            model_providers=stub_model_providers,
-            secret_resolver=PlaintextResolver(),
-            managed_assets_path=managed_assets_path,
-            backend=RayBackend(
-                batch_size=4,
-                output="dataset",
-                profile_workers=True,
-                trace_enabled=True,
-                max_trace_events=64,
-            ),
-        )
+    )
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(
+            batch_size=4,
+            output="dataset",
+            profile_workers=True,
+            trace_enabled=True,
+            max_trace_events=64,
+        ),
+    )
 
-        results = designer.create(config_builder, input_dataset=input_dataset, num_records=num_records)
-        parquet_dir = tmp_path / "ray-streaming-output"
-        results.dataset.write_parquet(str(parquet_dir))
+    results = designer.create(config_builder, input_dataset=input_dataset, num_records=num_records)
+    parquet_dir = tmp_path / "ray-streaming-output"
+    results.dataset.write_parquet(str(parquet_dir))
 
-        persisted = ray.data.read_parquet(str(parquet_dir))
-        metrics = results.load_metrics()
-        analysis = results.load_analysis()
-        sample_batches = persisted.iter_batches(batch_size=5, batch_format="pandas")
-        sample = next(iter(sample_batches))
+    persisted = local_ray.data.read_parquet(str(parquet_dir))
+    metrics = results.load_metrics()
+    analysis = results.load_analysis()
+    sample_batches = persisted.iter_batches(batch_size=5, batch_format="pandas")
+    sample = next(iter(sample_batches))
 
-        assert persisted.count() == num_records
-        assert metrics.total_rows == num_records
-        assert metrics.blocks == source_blocks
-        assert metrics.failed_blocks == 0
-        assert analysis is not None
-        assert analysis.total_rows == num_records
-        assert analysis.worker_profiles
-        assert analysis.trace_events
-        assert sample["ticket_key"].notna().all()
-        assert sample["routing_key"].str.contains("::").all()
-        assert list(parquet_dir.glob("*.parquet"))
-    finally:
-        ray.shutdown()
-
-
-def _require_real_ray() -> Any:
-    if os.environ.get(REAL_RAY_SMOKE_ENV) != "1":
-        pytest.skip(f"Set {REAL_RAY_SMOKE_ENV}=1 to run real-Ray smoke tests.")
-    return pytest.importorskip("ray")
-
-
-def _init_local_ray(ray: Any) -> None:
-    _patch_ray_sandbox_process_discovery()
-    ray.init(address="local", num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
-
-
-def _patch_ray_sandbox_process_discovery() -> None:
-    node_module = importlib.import_module("ray._private.node")
-
-    def _sandbox_safe_system_processes(self: Any) -> str:
-        all_processes = getattr(self, "all_processes", {})
-        pids: list[str] = []
-        for processes in all_processes.values():
-            if processes:
-                pids.append(str(processes[0].process.pid))
-        return ",".join(pids)
-
-    node_module.Node._get_system_processes_for_resource_isolation = _sandbox_safe_system_processes
+    assert persisted.count() == num_records
+    assert metrics.total_rows == num_records
+    assert metrics.blocks == source_blocks
+    assert metrics.failed_blocks == 0
+    assert analysis is not None
+    assert analysis.total_rows == num_records
+    assert analysis.worker_profiles
+    assert analysis.trace_events
+    assert sample["ticket_key"].notna().all()
+    assert sample["routing_key"].str.contains("::").all()
+    assert list(parquet_dir.glob("*.parquet"))
 
 
 def _repo_root() -> Path:
