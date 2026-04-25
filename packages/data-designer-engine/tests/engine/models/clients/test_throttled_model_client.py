@@ -228,6 +228,158 @@ async def test_acompletion_rate_limit_calls_release_rate_limited(
     assert state.blocked_until > 0
 
 
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    ("outcome", "expected_release"),
+    [
+        ("success", "success"),
+        ("rate_limit", "rate_limited"),
+        ("failure", "failure"),
+    ],
+)
+async def test_async_throttled_client_uses_async_release_methods(
+    inner_client: MagicMock,
+    outcome: str,
+    expected_release: str,
+) -> None:
+    class AsyncReleaseThrottleManager:
+        def __init__(self) -> None:
+            self.release_events: list[str] = []
+
+        def register(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            alias: str,
+            max_parallel_requests: int,
+        ) -> None:
+            pass
+
+        def try_acquire(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            now: float | None = None,
+        ) -> float:
+            return 0.0
+
+        def acquire_sync(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            timeout: float = 300.0,
+        ) -> None:
+            pass
+
+        async def acquire_async(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            timeout: float = 300.0,
+        ) -> None:
+            pass
+
+        def release_success(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            now: float | None = None,
+        ) -> None:
+            raise AssertionError("sync release_success should not run")
+
+        async def release_success_async(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            now: float | None = None,
+        ) -> None:
+            self.release_events.append("success")
+
+        def release_rate_limited(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            retry_after: float | None = None,
+            now: float | None = None,
+        ) -> None:
+            raise AssertionError("sync release_rate_limited should not run")
+
+        async def release_rate_limited_async(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            retry_after: float | None = None,
+            now: float | None = None,
+        ) -> None:
+            self.release_events.append("rate_limited")
+
+        def release_failure(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            now: float | None = None,
+        ) -> None:
+            raise AssertionError("sync release_failure should not run")
+
+        async def release_failure_async(
+            self,
+            *,
+            provider_name: str,
+            model_id: str,
+            domain: ThrottleDomain,
+            now: float | None = None,
+        ) -> None:
+            self.release_events.append("failure")
+
+    throttle_manager = AsyncReleaseThrottleManager()
+    if outcome == "rate_limit":
+        inner_client.acompletion = AsyncMock(
+            side_effect=ProviderError(
+                kind=ProviderErrorKind.RATE_LIMIT,
+                message="429",
+                status_code=429,
+                retry_after=3.0,
+            )
+        )
+    elif outcome == "failure":
+        inner_client.acompletion = AsyncMock(side_effect=RuntimeError("boom"))
+
+    client = ThrottledModelClient(
+        inner=inner_client,
+        throttle_manager=throttle_manager,
+        provider_name=PROVIDER,
+        model_id=MODEL_ID,
+    )
+
+    if outcome == "success":
+        await client.acompletion(ChatCompletionRequest(model=MODEL_ID, messages=[]))
+    elif outcome == "rate_limit":
+        with pytest.raises(ProviderError, match="429"):
+            await client.acompletion(ChatCompletionRequest(model=MODEL_ID, messages=[]))
+    else:
+        with pytest.raises(RuntimeError, match="boom"):
+            await client.acompletion(ChatCompletionRequest(model=MODEL_ID, messages=[]))
+
+    assert throttle_manager.release_events == [expected_release]
+
+
 # --- Non-rate-limit ProviderError: release_failure ---
 
 

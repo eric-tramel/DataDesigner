@@ -208,6 +208,12 @@ class FakeObjectRef:
     def __init__(self, value: Any) -> None:
         self.value = value
 
+    def __await__(self) -> Any:
+        async def _value() -> Any:
+            return self.value
+
+        return _value().__await__()
+
 
 class FakeRemoteMethod:
     def __init__(self, method: Any) -> None:

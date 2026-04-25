@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
+import inspect
 import time
 from typing import Any
 
@@ -16,6 +18,8 @@ from data_designer.engine.models.clients.throttle_manager import (
     ThrottleManager,
 )
 from data_designer.integrations.ray.errors import RayDatasetGenerationError
+
+_RAY_GET_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="dd-ray-throttle")
 
 
 class RayThrottleCoordinator:
@@ -151,6 +155,25 @@ class RayThrottleManagerProxy:
             )
         )
 
+    async def try_acquire_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> float:
+        return float(
+            await _ray_get_async(
+                self._coordinator.try_acquire.remote(
+                    provider_name=provider_name,
+                    model_id=model_id,
+                    domain=domain,
+                    now=now,
+                )
+            )
+        )
+
     def acquire_sync(
         self,
         *,
@@ -180,7 +203,7 @@ class RayThrottleManagerProxy:
         timeout: float = DEFAULT_ACQUIRE_TIMEOUT,
     ) -> None:
         deadline = time.monotonic() + timeout
-        wait = self.try_acquire(provider_name=provider_name, model_id=model_id, domain=domain)
+        wait = await self.try_acquire_async(provider_name=provider_name, model_id=model_id, domain=domain)
         while wait != 0.0:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or wait > remaining:
@@ -189,7 +212,7 @@ class RayThrottleManagerProxy:
                     f"for {provider_name}/{model_id} [{domain.value}]"
                 )
             await asyncio.sleep(min(wait, remaining, CAPACITY_POLL_INTERVAL))
-            wait = self.try_acquire(provider_name=provider_name, model_id=model_id, domain=domain)
+            wait = await self.try_acquire_async(provider_name=provider_name, model_id=model_id, domain=domain)
 
     def release_success(
         self,
@@ -200,6 +223,23 @@ class RayThrottleManagerProxy:
         now: float | None = None,
     ) -> None:
         _ray_get(
+            self._coordinator.release_success.remote(
+                provider_name=provider_name,
+                model_id=model_id,
+                domain=domain,
+                now=now,
+            )
+        )
+
+    async def release_success_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None:
+        await _ray_get_async(
             self._coordinator.release_success.remote(
                 provider_name=provider_name,
                 model_id=model_id,
@@ -227,6 +267,25 @@ class RayThrottleManagerProxy:
             )
         )
 
+    async def release_rate_limited_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        retry_after: float | None = None,
+        now: float | None = None,
+    ) -> None:
+        await _ray_get_async(
+            self._coordinator.release_rate_limited.remote(
+                provider_name=provider_name,
+                model_id=model_id,
+                domain=domain,
+                retry_after=retry_after,
+                now=now,
+            )
+        )
+
     def release_failure(
         self,
         *,
@@ -236,6 +295,23 @@ class RayThrottleManagerProxy:
         now: float | None = None,
     ) -> None:
         _ray_get(
+            self._coordinator.release_failure.remote(
+                provider_name=provider_name,
+                model_id=model_id,
+                domain=domain,
+                now=now,
+            )
+        )
+
+    async def release_failure_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None:
+        await _ray_get_async(
             self._coordinator.release_failure.remote(
                 provider_name=provider_name,
                 model_id=model_id,
@@ -260,5 +336,17 @@ def create_ray_throttle_manager(ray: Any, run_config: RunConfig) -> RayThrottleM
 def _ray_get(ref: Any) -> Any:
     try:
         return importlib.import_module("ray").get(ref)
+    except Exception as exc:
+        raise RayDatasetGenerationError("RayBackend global provider throttle coordination failed.") from exc
+
+
+async def _ray_get_async(ref: Any) -> Any:
+    try:
+        if inspect.isawaitable(ref):
+            return await ref
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_RAY_GET_EXECUTOR, _ray_get, ref)
+    except RayDatasetGenerationError:
+        raise
     except Exception as exc:
         raise RayDatasetGenerationError("RayBackend global provider throttle coordination failed.") from exc

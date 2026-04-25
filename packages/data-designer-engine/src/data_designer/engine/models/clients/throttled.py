@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 from typing import TYPE_CHECKING
 
@@ -175,26 +176,18 @@ class ThrottledModelClient(ModelClient):
         except ProviderError as exc:
             exc_to_reraise = exc
             try:
-                self._release_on_provider_error(domain, exc)
+                await self._arelease_on_provider_error(domain, exc)
             except Exception:
                 logger.exception("ThrottleManager release failed; permit may leak")
         except BaseException as exc:
             exc_to_reraise = exc
             try:
-                self._tm.release_failure(
-                    provider_name=self._provider_name,
-                    model_id=self._model_id,
-                    domain=domain,
-                )
+                await self._release_failure_async(domain)
             except Exception:
                 logger.exception("ThrottleManager release failed; permit may leak")
         else:
             try:
-                self._tm.release_success(
-                    provider_name=self._provider_name,
-                    model_id=self._model_id,
-                    domain=domain,
-                )
+                await self._release_success_async(domain)
             except Exception:
                 logger.exception("ThrottleManager release_success failed")
         if exc_to_reraise is not None:
@@ -216,6 +209,50 @@ class ThrottledModelClient(ModelClient):
                 model_id=self._model_id,
                 domain=domain,
             )
+
+    async def _arelease_on_provider_error(self, domain: ThrottleDomain, exc: ProviderError) -> None:
+        if exc.kind == ProviderErrorKind.RATE_LIMIT:
+            await self._release_rate_limited_async(domain, retry_after=exc.retry_after)
+        else:
+            await self._release_failure_async(domain)
+
+    async def _release_success_async(self, domain: ThrottleDomain) -> None:
+        await self._call_async_release(
+            "release_success_async",
+            "release_success",
+            provider_name=self._provider_name,
+            model_id=self._model_id,
+            domain=domain,
+        )
+
+    async def _release_rate_limited_async(self, domain: ThrottleDomain, *, retry_after: float | None) -> None:
+        await self._call_async_release(
+            "release_rate_limited_async",
+            "release_rate_limited",
+            provider_name=self._provider_name,
+            model_id=self._model_id,
+            domain=domain,
+            retry_after=retry_after,
+        )
+
+    async def _release_failure_async(self, domain: ThrottleDomain) -> None:
+        await self._call_async_release(
+            "release_failure_async",
+            "release_failure",
+            provider_name=self._provider_name,
+            model_id=self._model_id,
+            domain=domain,
+        )
+
+    async def _call_async_release(self, async_method_name: str, sync_method_name: str, **kwargs: object) -> None:
+        async_method = getattr(self._tm, async_method_name, None)
+        if callable(async_method):
+            result = async_method(**kwargs)
+            if inspect.isawaitable(result):
+                await result
+            return
+        sync_method = getattr(self._tm, sync_method_name)
+        sync_method(**kwargs)
 
     @staticmethod
     def _image_domain(request: ImageGenerationRequest) -> ThrottleDomain:
