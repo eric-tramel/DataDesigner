@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 import types
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Iterator
 
 import pytest
 
@@ -29,6 +31,115 @@ class FakeMapBatchesCall:
         return dict(self.kwargs.get("fn_kwargs") or {})
 
 
+@dataclass
+class FakeExecutionResources:
+    cpu: float | None = None
+    gpu: float | None = None
+    object_store_memory: float | None = None
+    memory: float | None = None
+    _for_limits: bool = False
+
+    @classmethod
+    def for_limits(
+        cls,
+        cpu: float | None = None,
+        gpu: float | None = None,
+        object_store_memory: float | None = None,
+        memory: float | None = None,
+    ) -> FakeExecutionResources:
+        return cls(
+            cpu=cpu,
+            gpu=gpu,
+            object_store_memory=object_store_memory,
+            memory=memory,
+            _for_limits=True,
+        )
+
+    @classmethod
+    def zero(cls) -> FakeExecutionResources:
+        return cls(cpu=0, gpu=0, object_store_memory=0, memory=0)
+
+    def to_resource_dict(self) -> dict[str, float]:
+        resources: dict[str, float] = {}
+        for field_name in ("cpu", "gpu", "object_store_memory", "memory"):
+            value = getattr(self, field_name)
+            if value is not None:
+                resources[field_name] = value
+        return resources
+
+
+@dataclass
+class FakeExecutionOptions:
+    resource_limits: FakeExecutionResources = field(default_factory=FakeExecutionResources.for_limits)
+    exclude_resources: FakeExecutionResources = field(default_factory=FakeExecutionResources.zero)
+    preserve_order: bool = False
+    actor_locality_enabled: bool = True
+    verbose_progress: bool | None = None
+
+    def validate(self) -> None:
+        limits = self.resource_limits.to_resource_dict()
+        excluded = {key: value for key, value in self.exclude_resources.to_resource_dict().items() if value}
+        overlapping = sorted(set(limits).intersection(excluded))
+        if overlapping:
+            raise ValueError(f"overlapping resources: {overlapping}")
+
+
+@dataclass
+class FakeCheckpointConfig:
+    id_column: str | None = None
+    checkpoint_path: str | None = None
+    delete_checkpoint_on_success: bool = True
+    filter_num_threads: int = 3
+    write_num_threads: int = 3
+
+
+@dataclass
+class FakeDataContext:
+    execution_options: FakeExecutionOptions = field(default_factory=FakeExecutionOptions)
+    verbose_stats_logs: bool = False
+    enable_progress_bars: bool = True
+    enable_operator_progress_bars: bool = True
+    log_internal_stack_trace_to_stdout: bool = False
+    raise_original_map_exception: bool = False
+    max_errored_blocks: int = 0
+    _checkpoint_config: FakeCheckpointConfig | None = None
+
+    _current: ClassVar[FakeDataContext | None] = None
+
+    @staticmethod
+    def get_current() -> FakeDataContext:
+        if FakeDataContext._current is None:
+            FakeDataContext._current = FakeDataContext()
+        return FakeDataContext._current
+
+    @staticmethod
+    @contextmanager
+    def current(context: FakeDataContext) -> Iterator[None]:
+        previous = FakeDataContext.get_current()
+        FakeDataContext._current = context
+        try:
+            yield
+        finally:
+            FakeDataContext._current = previous
+
+    def copy(self) -> FakeDataContext:
+        return copy.deepcopy(self)
+
+    @property
+    def checkpoint_config(self) -> FakeCheckpointConfig | None:
+        return self._checkpoint_config
+
+    @checkpoint_config.setter
+    def checkpoint_config(self, value: FakeCheckpointConfig | dict[str, Any] | None) -> None:
+        if value is None or isinstance(value, FakeCheckpointConfig):
+            self._checkpoint_config = value
+            return
+        if isinstance(value, dict):
+            self._checkpoint_config = FakeCheckpointConfig(**value)
+            return
+        raise TypeError("checkpoint_config must be a FakeCheckpointConfig, dict, or None")
+
+
 class FakeRayDataset:
     def __init__(
         self,
@@ -36,10 +147,12 @@ class FakeRayDataset:
         *,
         data_module: FakeRayDataModule | None = None,
         reverse_mapped_blocks: bool = False,
+        data_context: FakeDataContext | None = None,
     ) -> None:
         self.blocks = blocks
         self.data_module = data_module
         self.reverse_mapped_blocks = reverse_mapped_blocks
+        self.data_context = data_context
         self.map_batches_kwargs: dict[str, Any] | None = None
         self.map_batches_fn: Any | None = None
         self.map_batches_calls: list[FakeMapBatchesCall] = []
@@ -51,13 +164,14 @@ class FakeRayDataset:
         self.map_batches_kwargs = kwargs
         self.map_batches_fn = fn
         self.map_batches_calls.append(FakeMapBatchesCall(fn=fn, kwargs=dict(kwargs)))
-        blocks = map_batches_blocks(fn, self.blocks, kwargs)
+        blocks = map_batches_blocks(fn, self.blocks, kwargs, data_context=self.data_context)
         if self.reverse_mapped_blocks:
             blocks.reverse()
         mapped = FakeRayDataset(
             blocks,
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
         )
         mapped.repartition_calls = list(self.repartition_calls)
         return mapped
@@ -84,6 +198,7 @@ class FakeRayDataset:
             ),
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
         )
         repartitioned.repartition_calls = list(self.repartition_calls)
         return repartitioned
@@ -102,6 +217,7 @@ class FakeRayDataset:
             blocks,
             data_module=self.data_module or other.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context or other.data_context,
         )
         zipped.repartition_calls = list(self.repartition_calls)
         return zipped
@@ -117,6 +233,7 @@ class FakeRayDataset:
             blocks,
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
         )
         filtered.repartition_calls = list(self.repartition_calls)
         return filtered
@@ -137,6 +254,7 @@ class FakeRayDataset:
             blocks,
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
         )
         limited.repartition_calls = list(self.repartition_calls)
         return limited
@@ -146,6 +264,7 @@ class FakeRayDataset:
             [*self.blocks, *(block for other in others for block in other.blocks)],
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
         )
         unioned.repartition_calls = list(self.repartition_calls)
         return unioned
@@ -165,7 +284,7 @@ class FakeRayDataset:
 
     def sort(self, column: str) -> FakeRayDataset:
         sorted_df = self.to_pandas().sort_values(column, kind="stable").reset_index(drop=True)
-        sorted_dataset = FakeRayDataset([sorted_df], data_module=self.data_module)
+        sorted_dataset = FakeRayDataset([sorted_df], data_module=self.data_module, data_context=self.data_context)
         sorted_dataset.repartition_calls = list(self.repartition_calls)
         return sorted_dataset
 
@@ -174,6 +293,7 @@ class FakeRayDataset:
             [coerce_pandas_dataframe(block).drop(columns=columns) for block in self.blocks],
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
         )
         dropped.repartition_calls = list(self.repartition_calls)
         return dropped
@@ -218,6 +338,9 @@ class FakeRayDataModule:
         self.range_kwargs: dict[str, Any] | None = None
         self.ref_blocks: dict[str, lazy.pd.DataFrame] = {}
         self.validate_map_batches = validate_map_batches
+        self.DataContext = FakeDataContext
+        self.ExecutionResources = FakeExecutionResources
+        self.latest_dataset_context: FakeDataContext | None = None
 
     def dataset(
         self,
@@ -225,12 +348,15 @@ class FakeRayDataModule:
         *,
         reverse_mapped_blocks: bool | None = None,
     ) -> FakeRayDataset:
+        data_context = FakeDataContext.get_current().copy()
+        self.latest_dataset_context = data_context
         return FakeRayDataset(
             blocks,
             data_module=self,
             reverse_mapped_blocks=self.reverse_mapped_blocks
             if reverse_mapped_blocks is None
             else reverse_mapped_blocks,
+            data_context=data_context,
         )
 
     def ActorPoolStrategy(self, **kwargs: Any) -> FakeActorPoolStrategy:
@@ -363,6 +489,7 @@ def install_fake_ray(
     with_remote: bool = False,
     initialized: bool = True,
 ) -> types.ModuleType:
+    FakeDataContext._current = FakeDataContext()
     fake_ray = types.ModuleType("ray")
     fake_ray.data = data_module or FakeRayDataModule()
     fake_ray.is_initialized = lambda: initialized
@@ -382,11 +509,28 @@ def fake_ray_get(ref: Any) -> Any:
     return ref
 
 
-def map_batches_blocks(fn: Any, blocks: list[Any], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
+def map_batches_blocks(
+    fn: Any,
+    blocks: list[Any],
+    kwargs: dict[str, Any],
+    *,
+    data_context: FakeDataContext | None = None,
+) -> list[lazy.pd.DataFrame]:
     fn_kwargs = kwargs.get("fn_kwargs") or {}
     fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
     map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
-    return [coerce_pandas_dataframe(map_fn(coerce_pandas_dataframe(block), **fn_kwargs)) for block in blocks]
+    mapped_blocks: list[lazy.pd.DataFrame] = []
+    failed_blocks = 0
+    max_errored_blocks = data_context.max_errored_blocks if data_context is not None else 0
+    for block in blocks:
+        try:
+            mapped_blocks.append(coerce_pandas_dataframe(map_fn(coerce_pandas_dataframe(block), **fn_kwargs)))
+        except Exception:
+            failed_blocks += 1
+            if max_errored_blocks < 0 or failed_blocks <= max_errored_blocks:
+                continue
+            raise
+    return mapped_blocks
 
 
 def repartition_blocks(

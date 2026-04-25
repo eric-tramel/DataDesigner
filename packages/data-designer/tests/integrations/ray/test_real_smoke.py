@@ -22,7 +22,7 @@ from data_designer.config.default_model_settings import (
 )
 from data_designer.config.seed_source import LocalFileSeedSource
 from data_designer.engine.secret_resolver import PlaintextResolver
-from data_designer.integrations.ray import RayBackend, RayInputRepartition
+from data_designer.integrations.ray import RayBackend, RayDataContextOptions, RayExecutionResources, RayInputRepartition
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = pytest.mark.ray_real_smoke
@@ -223,6 +223,47 @@ def test_real_ray_local_file_seed_ingestion_smoke(
         {"x": 1, "label": "a", "x_label": "1-a"},
         {"x": 2, "label": "b", "x_label": "2-b"},
     ]
+
+
+def test_real_ray_data_context_controls_smoke(
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    current_context = local_ray.data.DataContext.get_current()
+    current_context.enable_progress_bars = True
+    current_context.max_errored_blocks = 0
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="id_label", expr="row-{{ id }}"))
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(
+            batch_size=2,
+            output="dataset",
+            data_context_options=RayDataContextOptions(
+                resource_limits=RayExecutionResources(cpu=1),
+                enable_progress_bars=False,
+                max_errored_blocks=0,
+            ),
+        ),
+    )
+
+    results = designer.create(config_builder, num_records=4)
+    output_df = results.load_dataset().to_pandas().sort_values("id").reset_index(drop=True)
+    metrics = results.load_metrics()
+
+    assert output_df.to_dict(orient="records") == [
+        {"id": 0, "id_label": "row-0"},
+        {"id": 1, "id_label": "row-1"},
+        {"id": 2, "id_label": "row-2"},
+        {"id": 3, "id_label": "row-3"},
+    ]
+    assert metrics.failed_blocks == 0
+    assert local_ray.data.DataContext.get_current().enable_progress_bars is True
 
 
 def _repo_root() -> Path:

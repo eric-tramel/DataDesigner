@@ -29,7 +29,10 @@ from data_designer.integrations.ray.observability import (
 )
 from data_designer.integrations.ray.options import (
     RayBlockPlanning,
+    RayDataCheckpointConfig,
+    RayDataContextOptions,
     RayExecutionOptions,
+    RayExecutionResources,
     RayInputRepartition,
 )
 
@@ -37,11 +40,14 @@ __all__ = [
     "RayBackend",
     "RayBackendConfigurationError",
     "RayBlockPlanning",
+    "RayDataCheckpointConfig",
+    "RayDataContextOptions",
     "RayDatasetAnalysis",
     "RayDatasetCreationResults",
     "RayDatasetGenerationError",
     "RayDatasetMetrics",
     "RayExecutionOptions",
+    "RayExecutionResources",
     "RayInputRepartition",
     "RayIntegrationError",
     "RayMetricsError",
