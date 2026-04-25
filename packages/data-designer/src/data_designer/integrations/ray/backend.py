@@ -300,13 +300,14 @@ class RayBackend:
         max_trace_events: int = 1000,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
-            raise ValueError("RayBackend output must be 'dataset' or 'arrow_refs'.")
+            raise RayBackendConfigurationError("RayBackend output must be 'dataset' or 'arrow_refs'.")
         if object_ref_format not in ("arrow", "pandas"):
-            raise ValueError("RayBackend object_ref_format must be 'arrow' or 'pandas'.")
+            raise RayBackendConfigurationError("RayBackend object_ref_format must be 'arrow' or 'pandas'.")
+        _validate_ray_backend_batch_size(batch_size)
         if order_column is not None and order_column == "":
-            raise ValueError("RayBackend order_column must be a non-empty string when provided.")
+            raise RayBackendConfigurationError("RayBackend order_column must be a non-empty string when provided.")
         if max_trace_events < 0:
-            raise ValueError("RayBackend max_trace_events must be non-negative.")
+            raise RayBackendConfigurationError("RayBackend max_trace_events must be non-negative.")
         self.block_planning = _resolve_block_planning(
             block_planning,
             override_num_blocks=override_num_blocks,
@@ -418,7 +419,7 @@ class RayBackend:
             dataset = _attach_hidden_row_id_column(ray, dataset, hidden_order_column=hidden_order_column)
         input_blocks = _get_num_blocks(dataset)
         metrics_collector = _create_metrics_collector(ray, max_trace_events=self.max_trace_events)
-        batch_size = self.batch_size or runtime_context.run_config.buffer_size
+        batch_size = self.batch_size if self.batch_size is not None else runtime_context.run_config.buffer_size
         observability_options = _RayObservabilityOptions(
             profile_workers=self.profile_workers,
             trace_enabled=self.trace_enabled,
@@ -563,7 +564,9 @@ def _resolve_block_planning(
         value is not None
         for value in (override_num_blocks, target_block_size, min_blocks, max_blocks, read_concurrency)
     ):
-        raise ValueError("RayBackend block_planning cannot be combined with individual block planning arguments.")
+        raise RayBackendConfigurationError(
+            "RayBackend block_planning cannot be combined with individual block planning arguments."
+        )
     if block_planning is not None:
         return block_planning
     return RayBlockPlanning(
@@ -573,6 +576,13 @@ def _resolve_block_planning(
         max_blocks=max_blocks,
         read_concurrency=read_concurrency,
     )
+
+
+def _validate_ray_backend_batch_size(batch_size: int | None) -> None:
+    if batch_size is None:
+        return
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise RayBackendConfigurationError("RayBackend batch_size must be a positive integer or None.")
 
 
 def _resolve_execution_options(
@@ -607,7 +617,9 @@ def _resolve_execution_options(
         actor_pool_initial_size,
     )
     if execution_options is not None and (use_actor_pool or any(value is not None for value in explicit_values)):
-        raise ValueError("RayBackend execution_options cannot be combined with individual Ray execution arguments.")
+        raise RayBackendConfigurationError(
+            "RayBackend execution_options cannot be combined with individual Ray execution arguments."
+        )
     if execution_options is not None:
         return execution_options
     return RayExecutionOptions(

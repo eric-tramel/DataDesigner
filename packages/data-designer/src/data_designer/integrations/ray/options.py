@@ -8,7 +8,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from data_designer.integrations.ray.errors import RayBackendConfigurationError
+
 RayMapConcurrency = int | tuple[int, int] | tuple[int, int, int]
+_DATA_DESIGNER_OWNED_MAP_BATCHES_KEYS = frozenset(
+    {
+        "batch_format",
+        "batch_size",
+        "fn",
+        "fn_args",
+        "fn_constructor_args",
+        "fn_constructor_kwargs",
+        "fn_kwargs",
+        "zero_copy_batch",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,14 +62,14 @@ class RayBlockPlanning:
         if self.override_num_blocks is not None and any(
             value is not None for value in (self.target_block_size, self.min_blocks, self.max_blocks)
         ):
-            raise ValueError(
+            raise RayBackendConfigurationError(
                 "RayBlockPlanning override_num_blocks cannot be combined with target_block_size, "
                 "min_blocks, or max_blocks."
             )
         if self.min_blocks is not None and self.max_blocks is not None and self.min_blocks > self.max_blocks:
-            raise ValueError("RayBlockPlanning min_blocks must be less than or equal to max_blocks.")
+            raise RayBackendConfigurationError("RayBlockPlanning min_blocks must be less than or equal to max_blocks.")
         if self.target_block_size is None and (self.min_blocks is not None or self.max_blocks is not None):
-            raise ValueError("RayBlockPlanning min_blocks and max_blocks require target_block_size.")
+            raise RayBackendConfigurationError("RayBlockPlanning min_blocks and max_blocks require target_block_size.")
 
     @property
     def has_explicit_controls(self) -> bool:
@@ -74,7 +88,7 @@ class RayBlockPlanning:
     def resolve(self, *, num_records: int) -> RayResolvedBlockPlan:
         """Resolve configured planning controls for a concrete record count."""
         if num_records < 0:
-            raise ValueError("RayBlockPlanning num_records must be non-negative.")
+            raise RayBackendConfigurationError("RayBlockPlanning num_records must be non-negative.")
         if self.override_num_blocks is not None:
             return RayResolvedBlockPlan(
                 override_num_blocks=self.override_num_blocks,
@@ -122,32 +136,48 @@ class RayExecutionOptions:
         _validate_optional_positive_number("memory", self.memory)
         _validate_resources(self.resources)
         if isinstance(self.scheduling_strategy, str) and not self.scheduling_strategy:
-            raise ValueError("RayExecutionOptions scheduling_strategy must be non-empty when provided.")
+            raise RayBackendConfigurationError(
+                "RayExecutionOptions scheduling_strategy must be non-empty when provided."
+            )
         if self.compute is not None and self.use_actor_pool:
-            raise ValueError("RayExecutionOptions compute cannot be combined with use_actor_pool=True.")
+            raise RayBackendConfigurationError(
+                "RayExecutionOptions compute cannot be combined with use_actor_pool=True."
+            )
         if self.compute is not None and self.concurrency is not None:
-            raise ValueError("RayExecutionOptions compute cannot be combined with concurrency.")
+            raise RayBackendConfigurationError("RayExecutionOptions compute cannot be combined with concurrency.")
+        if self.use_actor_pool and self.concurrency is not None:
+            raise RayBackendConfigurationError(
+                "RayExecutionOptions use_actor_pool=True cannot be combined with concurrency."
+            )
         _validate_map_concurrency(self.concurrency)
         _validate_optional_positive_int("actor_pool_min_size", self.actor_pool_min_size)
         _validate_optional_positive_int("actor_pool_max_size", self.actor_pool_max_size)
         _validate_optional_positive_int("actor_pool_initial_size", self.actor_pool_initial_size)
         if self.actor_pool_min_size is not None and not self.use_actor_pool:
-            raise ValueError("RayExecutionOptions actor_pool_min_size requires use_actor_pool=True.")
+            raise RayBackendConfigurationError("RayExecutionOptions actor_pool_min_size requires use_actor_pool=True.")
         if self.actor_pool_max_size is not None and not self.use_actor_pool:
-            raise ValueError("RayExecutionOptions actor_pool_max_size requires use_actor_pool=True.")
+            raise RayBackendConfigurationError("RayExecutionOptions actor_pool_max_size requires use_actor_pool=True.")
         if self.actor_pool_initial_size is not None and not self.use_actor_pool:
-            raise ValueError("RayExecutionOptions actor_pool_initial_size requires use_actor_pool=True.")
+            raise RayBackendConfigurationError(
+                "RayExecutionOptions actor_pool_initial_size requires use_actor_pool=True."
+            )
         if (
             self.actor_pool_min_size is not None
             and self.actor_pool_max_size is not None
             and self.actor_pool_min_size > self.actor_pool_max_size
         ):
-            raise ValueError("RayExecutionOptions actor_pool_min_size must be less than or equal to max_size.")
+            raise RayBackendConfigurationError(
+                "RayExecutionOptions actor_pool_min_size must be less than or equal to max_size."
+            )
         if self.actor_pool_initial_size is not None:
             if self.actor_pool_min_size is not None and self.actor_pool_initial_size < self.actor_pool_min_size:
-                raise ValueError("RayExecutionOptions actor_pool_initial_size must be at least actor_pool_min_size.")
+                raise RayBackendConfigurationError(
+                    "RayExecutionOptions actor_pool_initial_size must be at least actor_pool_min_size."
+                )
             if self.actor_pool_max_size is not None and self.actor_pool_initial_size > self.actor_pool_max_size:
-                raise ValueError("RayExecutionOptions actor_pool_initial_size must be at most actor_pool_max_size.")
+                raise RayBackendConfigurationError(
+                    "RayExecutionOptions actor_pool_initial_size must be at most actor_pool_max_size."
+                )
         _validate_remote_arg_conflicts(self)
 
     def to_map_batches_kwargs(self, ray: Any | None = None) -> dict[str, Any]:
@@ -166,7 +196,9 @@ class RayExecutionOptions:
             kwargs.update(dict(self.ray_remote_args))
         if self.use_actor_pool:
             if ray is None:
-                raise ValueError("RayExecutionOptions use_actor_pool=True requires an imported ray module.")
+                raise RayBackendConfigurationError(
+                    "RayExecutionOptions use_actor_pool=True requires an imported ray module."
+                )
             kwargs["compute"] = _create_actor_pool_strategy(ray, self)
         return kwargs
 
@@ -175,21 +207,21 @@ def _validate_optional_positive_int(field_name: str, value: int | None) -> None:
     if value is None:
         return
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"Ray option {field_name} must be a positive integer.")
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a positive integer.")
 
 
 def _validate_optional_non_negative_number(field_name: str, value: float | None) -> None:
     if value is None:
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        raise ValueError(f"Ray option {field_name} must be a non-negative number.")
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a non-negative number.")
 
 
 def _validate_optional_positive_number(field_name: str, value: float | None) -> None:
     if value is None:
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise ValueError(f"Ray option {field_name} must be a positive number.")
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a positive number.")
 
 
 def _validate_resources(resources: Mapping[str, float] | None) -> None:
@@ -197,7 +229,7 @@ def _validate_resources(resources: Mapping[str, float] | None) -> None:
         return
     for name, value in resources.items():
         if not isinstance(name, str) or not name:
-            raise ValueError("RayExecutionOptions resource names must be non-empty strings.")
+            raise RayBackendConfigurationError("RayExecutionOptions resource names must be non-empty strings.")
         _validate_optional_positive_number(f"resources[{name!r}]", value)
 
 
@@ -208,13 +240,19 @@ def _validate_map_concurrency(value: RayMapConcurrency | None) -> None:
         _validate_optional_positive_int("concurrency", value)
         return
     if not isinstance(value, tuple) or len(value) not in (2, 3):
-        raise ValueError("RayExecutionOptions concurrency must be a positive integer or a 2/3-item tuple.")
+        raise RayBackendConfigurationError(
+            "RayExecutionOptions concurrency must be a positive integer or a 2/3-item tuple."
+        )
     for index, item in enumerate(value):
         _validate_optional_positive_int(f"concurrency[{index}]", item)
     if value[0] > value[1]:
-        raise ValueError("RayExecutionOptions concurrency minimum must be less than or equal to maximum.")
+        raise RayBackendConfigurationError(
+            "RayExecutionOptions concurrency minimum must be less than or equal to maximum."
+        )
     if len(value) == 3 and not value[0] <= value[2] <= value[1]:
-        raise ValueError("RayExecutionOptions concurrency initial size must be within the min/max range.")
+        raise RayBackendConfigurationError(
+            "RayExecutionOptions concurrency initial size must be within the min/max range."
+        )
 
 
 def _validate_remote_arg_conflicts(options: RayExecutionOptions) -> None:
@@ -235,15 +273,24 @@ def _validate_remote_arg_conflicts(options: RayExecutionOptions) -> None:
     )
     if conflicts:
         conflict_list = ", ".join(conflicts)
-        raise ValueError(
+        raise RayBackendConfigurationError(
             f"RayExecutionOptions received duplicate explicit and ray_remote_args values: {conflict_list}."
+        )
+    reserved_keys = sorted(_DATA_DESIGNER_OWNED_MAP_BATCHES_KEYS.intersection(options.ray_remote_args))
+    if reserved_keys:
+        reserved_list = ", ".join(reserved_keys)
+        raise RayBackendConfigurationError(
+            "RayExecutionOptions ray_remote_args cannot override DataDesigner-owned map_batches arguments: "
+            f"{reserved_list}."
         )
 
 
 def _create_actor_pool_strategy(ray: Any, options: RayExecutionOptions) -> Any:
     actor_pool_strategy = getattr(ray.data, "ActorPoolStrategy", None)
     if not callable(actor_pool_strategy):
-        raise ValueError("RayExecutionOptions use_actor_pool=True requires ray.data.ActorPoolStrategy.")
+        raise RayBackendConfigurationError(
+            "RayExecutionOptions use_actor_pool=True requires ray.data.ActorPoolStrategy."
+        )
     kwargs: dict[str, int] = {}
     _set_if_not_none(kwargs, "min_size", options.actor_pool_min_size or 1)
     _set_if_not_none(kwargs, "max_size", options.actor_pool_max_size)
