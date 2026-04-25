@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 
 RayOutputMode = Literal["dataset", "arrow_refs"]
 RayObjectRefInputFormat = Literal["arrow", "pandas"]
+RayDatasetSourceKind = Literal["range", "input_dataset", "object_refs", "driver_materialized_seed", "seed_window"]
 _RAY_INTERNAL_ROW_ID_COLUMN = "__data_designer_ray_row_id"
 
 
@@ -87,6 +88,66 @@ class _RayExecutionPayload:
 class _RayObservabilityOptions:
     profile_workers: bool = False
     trace_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class RayDatasetSource:
+    """Resolved Ray Dataset input for a planned job."""
+
+    kind: RayDatasetSourceKind
+    dataset: Any
+    external_input_dataset: bool
+    use_input_dataset: bool
+
+
+@dataclass(frozen=True)
+class RayOrderingMode:
+    """Resolved ordering behavior for Ray output blocks."""
+
+    order_column: str | None = None
+    hidden_order_column: str | None = None
+    drop_order_column: bool = False
+    keep_internal_order_column: bool = False
+
+    @property
+    def requires_hidden_row_ids(self) -> bool:
+        """Return whether input rows need a driver-attached hidden row id."""
+        return self.hidden_order_column is not None
+
+    def apply(self, dataset: Any) -> Any:
+        """Apply resolved output ordering to a Ray Dataset."""
+        order_column = self.order_column or self.hidden_order_column
+        if order_column is None:
+            return dataset
+        ordered = dataset.sort(order_column)
+        if self.hidden_order_column is not None and order_column == self.hidden_order_column:
+            if self.keep_internal_order_column:
+                return ordered
+            return ordered.drop_columns([self.hidden_order_column])
+        if self.drop_order_column:
+            return ordered.drop_columns([order_column])
+        return ordered
+
+
+@dataclass(frozen=True)
+class RayJobPlan:
+    """Driver-resolved Ray execution plan.
+
+    The plan owns all state needed after driver planning so execution does not
+    re-read backend attributes or runtime context.
+    """
+
+    dataset_source: RayDatasetSource
+    block_plan: Any | None
+    worker_payload: _RayExecutionPayload
+    map_batches_kwargs: dict[str, Any]
+    ordering_mode: RayOrderingMode
+    metrics_collector: Any | None
+    throttle_manager: Any | None
+    observability_options: _RayObservabilityOptions
+    output: RayOutputMode
+    num_records: int
+    input_blocks: int | None
 
 
 class RayDatasetCreationResults:
@@ -359,104 +420,33 @@ class RayBackend:
                 )
             ray.init()
 
-        external_input_dataset = input_dataset is not None
-        use_input_dataset = external_input_dataset
-        seed_config = config_builder.get_seed_config()
-        if use_input_dataset and seed_config is not None:
-            raise RayBackendConfigurationError(
-                "RayBackend input_dataset is used as the seed dataset; remove the existing seed config."
-            )
-        if use_input_dataset and self.block_planning.has_explicit_controls:
-            raise RayBackendConfigurationError(
-                "RayBackend block planning controls apply only when RayBackend creates a from-scratch "
-                "range dataset. Remove override_num_blocks, target_block_size, min_blocks, max_blocks, "
-                "and read_concurrency when passing input_dataset."
-            )
-        seed_window: ray_seed_planning.RaySeedWindow | None = None
-        if not use_input_dataset and seed_config is not None:
-            seed_plan = ray_seed_planning.plan_seed_execution(
-                runtime_context=runtime_context,
-                seed_config=seed_config,
-                num_records=num_records,
-            )
-            if seed_plan.input_dataframe is not None:
-                input_dataset = ray.data.from_pandas(seed_plan.input_dataframe)
-                use_input_dataset = True
-            else:
-                seed_window = seed_plan.seed_window
-        if not self.allow_unsafe_processors:
-            validate_ray_safe_processors(config_builder)
-
-        model_aliases = _model_health_check_aliases(config_builder)
-        if self.preflight_model_health_check:
-            _run_driver_model_health_check(runtime_context, config_builder, model_aliases)
-
-        block_plan = self.block_planning.resolve(num_records=num_records) if input_dataset is None else None
-        dataset = self._resolve_input_dataset(
-            ray,
-            input_dataset=input_dataset,
+        plan = RayDriverPlanner(backend=self, ray=ray).plan(
+            runtime_context=runtime_context,
+            config_builder=config_builder,
             num_records=num_records,
-            block_plan=block_plan,
+            input_dataset=input_dataset,
         )
-        hidden_order_column = _RAY_INTERNAL_ROW_ID_COLUMN if self.preserve_order and self.order_column is None else None
-        if hidden_order_column is not None and use_input_dataset:
-            dataset = _attach_hidden_row_id_column(ray, dataset, hidden_order_column=hidden_order_column)
-        input_blocks = _get_num_blocks(dataset)
-        metrics_collector = _create_metrics_collector(ray, max_trace_events=self.max_trace_events)
-        batch_size = self.batch_size if self.batch_size is not None else runtime_context.run_config.buffer_size
-        observability_options = _RayObservabilityOptions(
-            profile_workers=self.profile_workers,
-            trace_enabled=self.trace_enabled,
+        result_dataset, mapped, output = self._execute_plan(ray, plan)
+        metrics = _create_driver_metrics(
+            plan,
+            mapped=mapped,
+            output=output,
+            elapsed_seconds=time.perf_counter() - start_time,
         )
-        throttle_manager = (
-            create_ray_throttle_manager(ray, runtime_context.run_config)
-            if self.global_provider_throttling
-            and config_builder.model_configs
-            and callable(getattr(ray, "remote", None))
-            else None
-        )
-        worker_config_builder = _clone_config_builder_for_worker(
-            config_builder,
-            worker_model_health_checks=self.worker_model_health_checks,
-        )
-        worker_seed_readers = (
-            ray_seed_planning.input_dataset_seed_readers()
-            if use_input_dataset
-            else ray_seed_planning.clone_seed_readers_for_worker(runtime_context.seed_readers)
-        )
-        worker_options = _RayWorkerOptions(
-            model_providers=list(runtime_context.model_providers),
-            default_provider_name=runtime_context.default_provider_name,
-            secret_resolver=runtime_context.secret_resolver,
-            seed_readers=worker_seed_readers,
-            managed_assets_path=str(runtime_context.managed_assets_path),
-            person_reader=runtime_context.person_reader,
-            mcp_providers=list(runtime_context.mcp_providers),
-            run_config=runtime_context.run_config,
-            throttle_manager=throttle_manager,
-        )
-        execution_payload = _compile_ray_execution_payload(
-            config_builder=worker_config_builder,
-            worker_options=worker_options,
-            use_input_dataset=use_input_dataset,
-            seed_window=seed_window,
-            hidden_order_column=hidden_order_column,
+        return RayDatasetCreationResults(
+            dataset=result_dataset,
+            config_builder=config_builder,
+            metrics=metrics,
+            ray=ray,
+            metrics_collector=plan.metrics_collector,
+            throttle_manager=plan.throttle_manager,
+            output=output,
+            observability_options=plan.observability_options,
         )
 
-        map_batches_kwargs: dict[str, Any] = {
-            "fn_constructor_kwargs": {
-                "execution_payload": execution_payload,
-                "metrics_collector": metrics_collector,
-                "observability_options": observability_options,
-            },
-            "batch_size": batch_size,
-            "batch_format": "pandas",
-            "zero_copy_batch": self.zero_copy_batch,
-        }
-        map_batches_kwargs.update(self.execution_options.to_map_batches_kwargs(ray))
-
+    def _execute_plan(self, ray: Any, plan: RayJobPlan) -> tuple[Any, Any, Any | None]:
         try:
-            mapped = dataset.map_batches(_RayBatchWorker, **map_batches_kwargs)
+            mapped = plan.dataset_source.dataset.map_batches(_RayBatchWorker, **plan.map_batches_kwargs)
         except RayDatasetGenerationError:
             raise
         except Exception as exc:
@@ -465,14 +455,14 @@ class RayBackend:
             ) from exc
 
         try:
-            mapped = self._apply_ordering(mapped, hidden_order_column=hidden_order_column)
+            mapped = plan.ordering_mode.apply(mapped)
         except RayDatasetGenerationError:
             raise
         except Exception as exc:
             raise RayDatasetGenerationError("RayBackend failed while applying Ray output ordering.") from exc
 
         try:
-            output = mapped.to_arrow_refs() if self.output == "arrow_refs" else None
+            output = mapped.to_arrow_refs() if plan.output == "arrow_refs" else None
             result_dataset = _dataset_from_arrow_refs(ray, output) if output is not None else mapped
         except RayDatasetGenerationError:
             raise
@@ -480,23 +470,7 @@ class RayBackend:
             raise RayDatasetGenerationError(
                 "RayBackend failed while materializing Ray output blocks for output='arrow_refs'."
             ) from exc
-
-        output_blocks = len(output) if output is not None else _get_num_blocks(mapped)
-        metrics = RayDatasetMetrics(
-            total_rows=num_records if not external_input_dataset else 0,
-            blocks=output_blocks or input_blocks or (block_plan.planned_blocks if block_plan is not None else 0) or 0,
-            elapsed_seconds=time.perf_counter() - start_time,
-        )
-        return RayDatasetCreationResults(
-            dataset=result_dataset,
-            config_builder=config_builder,
-            metrics=metrics,
-            ray=ray,
-            metrics_collector=metrics_collector,
-            throttle_manager=throttle_manager,
-            output=output,
-            observability_options=observability_options,
-        )
+        return result_dataset, mapped, output
 
     def _resolve_input_dataset(
         self,
@@ -521,18 +495,186 @@ class RayBackend:
             "containing PyArrow tables or pandas DataFrames."
         )
 
-    def _apply_ordering(self, dataset: Any, *, hidden_order_column: str | None) -> Any:
-        order_column = self.order_column or hidden_order_column
-        if order_column is None:
-            return dataset
-        ordered = dataset.sort(order_column)
-        if hidden_order_column is not None and order_column == hidden_order_column:
-            if self.keep_internal_order_column:
-                return ordered
-            return ordered.drop_columns([hidden_order_column])
-        if self.drop_order_column:
-            return ordered.drop_columns([order_column])
-        return ordered
+
+class RayDriverPlanner:
+    """Resolve driver-side Ray backend state into a job plan."""
+
+    def __init__(self, *, backend: RayBackend, ray: Any) -> None:
+        self._backend = backend
+        self._ray = ray
+
+    def plan(
+        self,
+        *,
+        runtime_context: BackendRuntimeContext,
+        config_builder: DataDesignerConfigBuilder,
+        num_records: int,
+        input_dataset: Any | None = None,
+    ) -> RayJobPlan:
+        external_input_dataset = input_dataset is not None
+        use_input_dataset = external_input_dataset
+        dataset_source_kind = _initial_dataset_source_kind(input_dataset)
+        seed_config = config_builder.get_seed_config()
+        if use_input_dataset and seed_config is not None:
+            raise RayBackendConfigurationError(
+                "RayBackend input_dataset is used as the seed dataset; remove the existing seed config."
+            )
+        if use_input_dataset and self._backend.block_planning.has_explicit_controls:
+            raise RayBackendConfigurationError(
+                "RayBackend block planning controls apply only when RayBackend creates a from-scratch "
+                "range dataset. Remove override_num_blocks, target_block_size, min_blocks, max_blocks, "
+                "and read_concurrency when passing input_dataset."
+            )
+
+        seed_window: ray_seed_planning.RaySeedWindow | None = None
+        if not use_input_dataset and seed_config is not None:
+            seed_plan = ray_seed_planning.plan_seed_execution(
+                runtime_context=runtime_context,
+                seed_config=seed_config,
+                num_records=num_records,
+            )
+            if seed_plan.input_dataframe is not None:
+                input_dataset = self._ray.data.from_pandas(seed_plan.input_dataframe)
+                use_input_dataset = True
+                dataset_source_kind = "driver_materialized_seed"
+            else:
+                seed_window = seed_plan.seed_window
+                dataset_source_kind = "seed_window"
+
+        if not self._backend.allow_unsafe_processors:
+            validate_ray_safe_processors(config_builder)
+
+        model_aliases = _model_health_check_aliases(config_builder)
+        if self._backend.preflight_model_health_check:
+            _run_driver_model_health_check(runtime_context, config_builder, model_aliases)
+
+        block_plan = self._backend.block_planning.resolve(num_records=num_records) if input_dataset is None else None
+        dataset = self._backend._resolve_input_dataset(
+            self._ray,
+            input_dataset=input_dataset,
+            num_records=num_records,
+            block_plan=block_plan,
+        )
+        ordering_mode = RayOrderingMode(
+            order_column=self._backend.order_column,
+            hidden_order_column=(
+                _RAY_INTERNAL_ROW_ID_COLUMN
+                if self._backend.preserve_order and self._backend.order_column is None
+                else None
+            ),
+            drop_order_column=self._backend.drop_order_column,
+            keep_internal_order_column=self._backend.keep_internal_order_column,
+        )
+        if ordering_mode.requires_hidden_row_ids and use_input_dataset:
+            dataset = _attach_hidden_row_id_column(
+                self._ray,
+                dataset,
+                hidden_order_column=_RAY_INTERNAL_ROW_ID_COLUMN,
+            )
+
+        metrics_collector = _create_metrics_collector(self._ray, max_trace_events=self._backend.max_trace_events)
+        observability_options = _RayObservabilityOptions(
+            profile_workers=self._backend.profile_workers,
+            trace_enabled=self._backend.trace_enabled,
+        )
+        throttle_manager = self._create_throttle_manager(runtime_context, config_builder)
+        worker_config_builder = _clone_config_builder_for_worker(
+            config_builder,
+            worker_model_health_checks=self._backend.worker_model_health_checks,
+        )
+        worker_seed_readers = (
+            ray_seed_planning.input_dataset_seed_readers()
+            if use_input_dataset
+            else ray_seed_planning.clone_seed_readers_for_worker(runtime_context.seed_readers)
+        )
+        worker_options = _RayWorkerOptions(
+            model_providers=list(runtime_context.model_providers),
+            default_provider_name=runtime_context.default_provider_name,
+            secret_resolver=runtime_context.secret_resolver,
+            seed_readers=worker_seed_readers,
+            managed_assets_path=str(runtime_context.managed_assets_path),
+            person_reader=runtime_context.person_reader,
+            mcp_providers=list(runtime_context.mcp_providers),
+            run_config=runtime_context.run_config,
+            throttle_manager=throttle_manager,
+        )
+        execution_payload = _compile_ray_execution_payload(
+            config_builder=worker_config_builder,
+            worker_options=worker_options,
+            use_input_dataset=use_input_dataset,
+            seed_window=seed_window,
+            hidden_order_column=ordering_mode.hidden_order_column,
+        )
+
+        map_batches_kwargs: dict[str, Any] = {
+            "fn_constructor_kwargs": {
+                "execution_payload": execution_payload,
+                "metrics_collector": metrics_collector,
+                "observability_options": observability_options,
+            },
+            "batch_size": self._backend.batch_size
+            if self._backend.batch_size is not None
+            else runtime_context.run_config.buffer_size,
+            "batch_format": "pandas",
+            "zero_copy_batch": self._backend.zero_copy_batch,
+        }
+        map_batches_kwargs.update(self._backend.execution_options.to_map_batches_kwargs(self._ray))
+
+        return RayJobPlan(
+            dataset_source=RayDatasetSource(
+                kind=dataset_source_kind,
+                dataset=dataset,
+                external_input_dataset=external_input_dataset,
+                use_input_dataset=use_input_dataset,
+            ),
+            block_plan=block_plan,
+            worker_payload=execution_payload,
+            map_batches_kwargs=map_batches_kwargs,
+            ordering_mode=ordering_mode,
+            metrics_collector=metrics_collector,
+            throttle_manager=throttle_manager,
+            observability_options=observability_options,
+            output=self._backend.output,
+            num_records=num_records,
+            input_blocks=_get_num_blocks(dataset),
+        )
+
+    def _create_throttle_manager(
+        self,
+        runtime_context: BackendRuntimeContext,
+        config_builder: DataDesignerConfigBuilder,
+    ) -> Any | None:
+        if not self._backend.global_provider_throttling:
+            return None
+        if not config_builder.model_configs:
+            return None
+        if not callable(getattr(self._ray, "remote", None)):
+            return None
+        return create_ray_throttle_manager(self._ray, runtime_context.run_config)
+
+
+def _initial_dataset_source_kind(input_dataset: Any | None) -> RayDatasetSourceKind:
+    if input_dataset is None:
+        return "range"
+    if hasattr(input_dataset, "map_batches"):
+        return "input_dataset"
+    return "object_refs"
+
+
+def _create_driver_metrics(
+    plan: RayJobPlan,
+    *,
+    mapped: Any,
+    output: Any | None,
+    elapsed_seconds: float,
+) -> RayDatasetMetrics:
+    output_blocks = len(output) if output is not None else _get_num_blocks(mapped)
+    planned_blocks = plan.block_plan.planned_blocks if plan.block_plan is not None else 0
+    return RayDatasetMetrics(
+        total_rows=0 if plan.dataset_source.external_input_dataset else plan.num_records,
+        blocks=output_blocks or plan.input_blocks or planned_blocks or 0,
+        elapsed_seconds=elapsed_seconds,
+    )
 
 
 def _resolve_block_planning(
