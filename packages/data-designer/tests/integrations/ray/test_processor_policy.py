@@ -19,6 +19,8 @@ from data_designer.config.processors import (
     ProcessorSideEffect,
     SchemaTransformProcessorConfig,
 )
+from data_designer.engine.processing.processors.base import Processor
+from data_designer.engine.processing.processors.registry import ProcessorRegistry
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError
 from data_designer.integrations.ray import backend as ray_backend_module
@@ -58,6 +60,31 @@ class LegacyRaySafeProcessorConfig(ProcessorConfig):
         side_effects=ProcessorSideEffect.NONE,
         reason="Uses legacy compatibility metadata.",
     )
+
+
+class AfterGenerationProcessorConfig(ProcessorConfig):
+    processor_type: Literal["ray_after_generation_test"] = "ray_after_generation_test"
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        partition_safe=True,
+        side_effects=ProcessorSideEffect.NONE,
+        reason="Metadata is otherwise safe, but the implementation needs the final dataset.",
+    )
+
+
+class AfterGenerationProcessor(Processor[AfterGenerationProcessorConfig]):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("RayBackend validation must not instantiate processors.")
+
+    def process_after_generation(self, data: Any) -> Any:
+        return data
+
+
+ProcessorRegistry.register(
+    "ray_after_generation_test",
+    AfterGenerationProcessor,
+    AfterGenerationProcessorConfig,
+    False,
+)
 
 
 def _managed_assets_path(tmp_path: Path) -> Path:
@@ -145,6 +172,69 @@ def test_ray_backend_rejects_schema_transform_processor_by_default(
     assert "artifact collection" in message
     assert "allow_unsafe_processors=True" in message
     assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_backend_rejects_after_generation_processor_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(AfterGenerationProcessorConfig(name="custom-after-generation"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend())
+
+    with pytest.raises(RayBackendConfigurationError, match="process_after_generation") as exc_info:
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    message = str(exc_info.value)
+    assert "custom-after-generation (ray_after_generation_test)" in message
+    assert "AfterGenerationProcessor.process_after_generation" in message
+    assert "allow_unsafe_processors=True" not in message
+    assert input_dataset.map_batches_kwargs is None
+    assert input_dataset.map_batches_calls == []
+
+
+def test_ray_backend_allow_unsafe_processors_does_not_bypass_after_generation_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(AfterGenerationProcessorConfig(name="custom-after-generation"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend(allow_unsafe_processors=True))
+
+    with pytest.raises(RayBackendConfigurationError, match="process_after_generation"):
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is None
+    assert input_dataset.map_batches_calls == []
+
+
+def test_ray_backend_after_generation_guard_runs_before_input_dataset_map_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(AfterGenerationProcessorConfig(name="custom-after-generation"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend())
+
+    def fail_map_batches(*_: Any, **__: Any) -> FakeRayDataset:
+        raise AssertionError("map_batches must not run before RayBackend processor validation.")
+
+    monkeypatch.setattr(input_dataset, "map_batches", fail_map_batches)
+
+    with pytest.raises(RayBackendConfigurationError, match="process_after_generation"):
+        designer.create(config_builder, input_dataset=input_dataset)
 
 
 def test_ray_backend_rejects_processor_without_distributed_safety_metadata(
