@@ -27,7 +27,10 @@ from data_designer.integrations.ray.observability_collection import (
     _RayObservabilityOptions,
 )
 from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, resolve_ray_backend_options
-from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
+from data_designer.integrations.ray.processor_policy import (
+    validate_no_ray_after_generation_processors,
+    validate_ray_safe_processors,
+)
 from data_designer.integrations.ray.results import RayResultArtifacts
 from data_designer.integrations.ray.throttling import create_ray_throttle_manager
 from data_designer.integrations.ray.worker_pipeline import (
@@ -431,6 +434,7 @@ class RayDriverPlanner:
                 seed_window = seed_plan.seed_window
                 dataset_source_kind = "seed_window"
 
+        validate_no_ray_after_generation_processors(config_builder)
         if not self._backend.allow_unsafe_processors:
             validate_ray_safe_processors(config_builder)
 
