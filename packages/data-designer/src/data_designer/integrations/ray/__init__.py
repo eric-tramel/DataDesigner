@@ -10,6 +10,7 @@ debugging, but they are intentionally excluded from the package root surface.
 
 from __future__ import annotations
 
+from data_designer.integrations.ray.artifact_output import DataDesignerRayDatasink
 from data_designer.integrations.ray.backend import RayBackend, RayDatasetCreationResults
 from data_designer.integrations.ray.errors import (
     RayBackendConfigurationError,
@@ -34,6 +35,7 @@ from data_designer.integrations.ray.options import (
 )
 
 __all__ = [
+    "DataDesignerRayDatasink",
     "RayBackend",
     "RayBackendConfigurationError",
     "RayBlockPlanning",

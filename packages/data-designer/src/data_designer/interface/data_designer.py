@@ -512,6 +512,7 @@ class DataDesigner(DataDesignerInterface[DatasetCreationResults]):
             secret_resolver=self._secret_resolver,
             seed_readers=tuple(self._seed_reader_registry._readers.values()),
             managed_assets_path=self._managed_assets_path,
+            artifact_path=self._artifact_path,
             person_reader=self._person_reader,
             mcp_providers=tuple(self._mcp_providers),
             run_config=self._run_config,

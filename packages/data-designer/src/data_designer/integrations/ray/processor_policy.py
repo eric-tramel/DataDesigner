@@ -10,7 +10,7 @@ from data_designer.engine.processing.processors.base import Processor
 from data_designer.engine.registry.data_designer_registry import DataDesignerRegistry
 from data_designer.integrations.ray.errors import RayBackendConfigurationError
 
-_RAY_SUPPORTED_SIDE_EFFECTS = frozenset(
+_RAY_ALWAYS_SUPPORTED_SIDE_EFFECTS = frozenset(
     {
         ProcessorSideEffect.NONE.value,
         ProcessorSideEffect.BATCH_ARTIFACT.value,
@@ -18,13 +18,19 @@ _RAY_SUPPORTED_SIDE_EFFECTS = frozenset(
 )
 
 
-def validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> None:
+def validate_ray_safe_processors(
+    config_builder: DataDesignerConfigBuilder,
+    *,
+    allow_dataset_artifacts: bool = False,
+) -> None:
     """Validate configured processor capabilities against Ray execution constraints."""
     unsupported: list[str] = []
     for processor in config_builder.get_processor_configs():
         safety = _get_distributed_safety(processor)
-        if safety is None or not _is_supported_by_ray(safety):
-            unsupported.append(_format_processor_violation(processor, safety))
+        if safety is None or not _is_supported_by_ray(safety, allow_dataset_artifacts=allow_dataset_artifacts):
+            unsupported.append(
+                _format_processor_violation(processor, safety, allow_dataset_artifacts=allow_dataset_artifacts)
+            )
 
     if not unsupported:
         return
@@ -33,8 +39,8 @@ def validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> N
         "RayBackend supports only processors whose distributed_safety metadata is compatible "
         "with partitioned execution. "
         f"Unsupported processor(s): {'; '.join(unsupported)}. "
-        "Review the processor's partition safety and side-effect metadata, or pass "
-        "allow_unsafe_processors=True to bypass this experimental guard."
+        "Enable write_artifacts=True for dataset artifact processors, review the processor's partition safety "
+        "and side-effect metadata, or pass allow_unsafe_processors=True to bypass this experimental guard."
     )
 
 
@@ -75,15 +81,30 @@ def _get_distributed_safety(processor: ProcessorConfig) -> ProcessorDistributedS
     return None
 
 
-def _is_supported_by_ray(safety: ProcessorDistributedSafety) -> bool:
+def _is_supported_by_ray(
+    safety: ProcessorDistributedSafety,
+    *,
+    allow_dataset_artifacts: bool,
+) -> bool:
     return (
         safety.partition_safe
         and not safety.requires_global_order
-        and safety.side_effects in _RAY_SUPPORTED_SIDE_EFFECTS
+        and _side_effect_is_supported(safety.side_effects, allow_dataset_artifacts=allow_dataset_artifacts)
     )
 
 
-def _format_processor_violation(processor: ProcessorConfig, safety: ProcessorDistributedSafety | None) -> str:
+def _side_effect_is_supported(side_effect: ProcessorSideEffect, *, allow_dataset_artifacts: bool) -> bool:
+    if side_effect in _RAY_ALWAYS_SUPPORTED_SIDE_EFFECTS:
+        return True
+    return allow_dataset_artifacts and side_effect == ProcessorSideEffect.DATASET_ARTIFACT.value
+
+
+def _format_processor_violation(
+    processor: ProcessorConfig,
+    safety: ProcessorDistributedSafety | None,
+    *,
+    allow_dataset_artifacts: bool,
+) -> str:
     label = _format_processor_label(processor)
     if safety is None:
         return f"{label}: missing distributed_safety metadata"
@@ -93,7 +114,7 @@ def _format_processor_violation(processor: ProcessorConfig, safety: ProcessorDis
         reasons.append("partition_safe=False")
     if safety.requires_global_order:
         reasons.append("requires_global_order=True")
-    if safety.side_effects in _RAY_SUPPORTED_SIDE_EFFECTS:
+    if _side_effect_is_supported(safety.side_effects, allow_dataset_artifacts=allow_dataset_artifacts):
         reasons.append(f"side_effects={safety.side_effects}")
     else:
         reasons.append(f"side_effects={safety.side_effects} unsupported by RayBackend")

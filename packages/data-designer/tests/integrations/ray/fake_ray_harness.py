@@ -44,6 +44,7 @@ class FakeRayDataset:
         self.map_batches_fn: Any | None = None
         self.map_batches_calls: list[FakeMapBatchesCall] = []
         self.repartition_calls: list[dict[str, Any]] = []
+        self.write_datasink_kwargs: dict[str, Any] | None = None
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         if self.data_module is not None:
@@ -61,6 +62,24 @@ class FakeRayDataset:
         )
         mapped.repartition_calls = list(self.repartition_calls)
         return mapped
+
+    def write_datasink(
+        self,
+        datasink: Any,
+        *,
+        ray_remote_args: dict[str, Any] | None = None,
+        concurrency: int | None = None,
+    ) -> None:
+        self.write_datasink_kwargs = {"ray_remote_args": ray_remote_args, "concurrency": concurrency}
+        if self.data_module is not None:
+            self.data_module.write_datasink_kwargs = dict(self.write_datasink_kwargs)
+        datasink.on_write_start(schema=None)
+        write_returns = []
+        for task_idx, block in enumerate(self.blocks):
+            write_return = datasink.write([coerce_pandas_dataframe(block)], types.SimpleNamespace(task_idx=task_idx))
+            if write_return is not None:
+                write_returns.append(write_return)
+        datasink.on_write_complete(types.SimpleNamespace(write_returns=write_returns))
 
     def repartition(
         self,
@@ -213,6 +232,7 @@ class FakeRayDataModule:
         self.read_json_kwargs: dict[str, Any] | None = None
         self.read_parquet_input: Any | None = None
         self.read_parquet_kwargs: dict[str, Any] | None = None
+        self.write_datasink_kwargs: dict[str, Any] | None = None
         self.range_blocks = range_blocks
         self.reverse_mapped_blocks = reverse_mapped_blocks
         self.range_kwargs: dict[str, Any] | None = None

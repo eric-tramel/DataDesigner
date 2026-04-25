@@ -27,6 +27,7 @@ from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import SeedReader
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
+from data_designer.integrations.ray.artifact_output import append_ray_artifact_columns
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayTraceEvent
@@ -71,6 +72,7 @@ class _RayExecutionPayload:
     seed_window: ray_seed_planning.RaySeedWindow | None = None
     seed_config: SeedConfig | None = None
     hidden_order_column: str | None = None
+    capture_artifacts: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,8 @@ class _RayWorkerGenerationPipeline:
             generation_result,
             throttle_manager=self._worker_options.throttle_manager,
         )
+        if self._execution_payload.capture_artifacts:
+            return append_ray_artifact_columns(generation_result.dataframe, generation_result.block_result)
         return generation_result.dataframe
 
     def create_block_config(self, dataframe: Any) -> DataDesignerConfig:
@@ -472,6 +476,7 @@ def _compile_ray_execution_payload(
     use_input_dataset: bool,
     seed_window: ray_seed_planning.RaySeedWindow | None = None,
     hidden_order_column: str | None = None,
+    capture_artifacts: bool = False,
 ) -> _RayExecutionPayload:
     data_designer_config = config_builder.build()
     payload_seed_config = data_designer_config.seed_config if seed_window is not None else None
@@ -487,6 +492,7 @@ def _compile_ray_execution_payload(
         seed_window=seed_window,
         seed_config=payload_seed_config,
         hidden_order_column=hidden_order_column,
+        capture_artifacts=capture_artifacts,
     )
     _validate_worker_payload_serializable(payload)
     return payload
