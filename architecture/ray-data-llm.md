@@ -2,7 +2,7 @@
 
 Issue: [#52](https://github.com/eric-tramel/DataDesigner/issues/52)  
 Date: 2026-04-25  
-Status: planning hook implemented; narrow opt-in execution prototype implemented
+Status: planning hook implemented; narrow opt-in execution prototype implemented; live benchmark harness added
 
 ## Decision
 
@@ -17,7 +17,7 @@ The safe slice is a capability and planning hook plus a tightly bounded executio
 - vLLM engine arguments own GPU execution details such as tensor/pipeline parallelism and distributed executor backend selection. See <https://docs.vllm.ai/en/latest/configuration/engine_args/>.
 - vLLM and Ray Serve can expose OpenAI-compatible HTTP APIs; those already fit DataDesigner through `ModelProvider(provider_type="openai")`. See <https://docs.vllm.ai/en/latest/serving/openai_compatible_server/>.
 
-Local package introspection for this evaluation found `ray` and `vllm` were not installed in the worker environment, so no live GPU benchmark was run.
+Local package introspection for the original execution prototype found `ray.data.llm` optional dependencies and `vllm` were not installed in the worker environment, so no live GPU benchmark was run in PR #132.
 
 ## Fit Analysis
 
@@ -83,8 +83,33 @@ The Ray Data LLM processor preprocess function builds OpenAI-style chat messages
 - No planner rewrite or GPU benchmark in this PR.
 - No usage-stat parity, trace parity, MCP/tool loop support, structured parsing, or processor support in the execution prototype.
 
+## Benchmark Harness
+
+`scripts/benchmarks/benchmark_ray_data_llm_vllm.py` now provides the explicit verification harness for [issue #118](https://github.com/eric-tramel/DataDesigner/issues/118). It compares:
+
+- `ray-openai-vllm`: existing `RayBackend` worker execution through `ModelFacade` and an OpenAI-compatible local vLLM server/provider.
+- `ray-data-llm`: `RayBackend` with `RayDataLLMStageOptions(enabled=True, execute=True)` using a Ray Data LLM `vLLMEngineProcessorConfig`.
+
+The harness is live opt-in through `--run-live` or `DATA_DESIGNER_RUN_RAY_DATA_LLM_VLLM_BENCHMARK=1`, probes optional `ray.data.llm` and `vllm` imports before execution, can require visible NVIDIA GPUs with `--require-gpu`, and can either fail or emit a skipped JSON report when prerequisites are missing. CI covers the command behavior with fake Ray Data LLM and fake OpenAI-compatible provider wiring, so base installs still do not require vLLM.
+
+Example live run:
+
+```bash
+DATA_DESIGNER_RUN_RAY_DATA_LLM_VLLM_BENCHMARK=1 \
+uv run --all-packages --extra ray python scripts/benchmarks/benchmark_ray_data_llm_vllm.py \
+  --model-source meta-llama/Llama-3.1-8B-Instruct \
+  --provider-endpoint http://127.0.0.1:8000/v1 \
+  --provider-model meta-llama/Llama-3.1-8B-Instruct \
+  --num-records 128 \
+  --batch-size 16 \
+  --ray-data-llm-concurrency 1,2 \
+  --engine-kwargs-json '{"tensor_parallel_size": 1}' \
+  --require-gpu \
+  --output-json /tmp/dd-ray-data-llm-vllm-benchmark.json
+```
+
 ## Follow-Up Recommendation
 
-[Issue #118](https://github.com/eric-tramel/DataDesigner/issues/118) tracks a RayBackend-only proof of concept and benchmark. The POC should compare the existing RayBackend plus OpenAI-compatible vLLM server path against a Ray Data LLM processor stage for a single independent text column, then expand only if the result preserves usage stats, errors, ordering, dropped-row behavior, and observability.
+[Issue #118](https://github.com/eric-tramel/DataDesigner/issues/118) should be closable after this harness is run in a real GPU/vLLM environment and records a successful comparison, or if any live-only parity gaps discovered by that run are split into concrete follow-up issues.
 
 The remaining validation step needs an environment with `ray.data.llm` optional dependencies, vLLM, GPU resources, and a real local model source. Local package introspection on the current development environment found `ray.data.llm` imports fail because optional dependencies such as `boto3` are absent, so local tests use a fake Ray Data LLM processor and the real path fails fast when those optional dependencies are unavailable.
