@@ -7,10 +7,9 @@ import copy
 import importlib
 import os
 import pickle
-import socket
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -30,7 +29,17 @@ from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayWorkerMetrics
-from data_designer.integrations.ray.observability import RayThrottleSnapshot, RayTraceEvent, RayWorkerProfile
+from data_designer.integrations.ray.observability import RayTraceEvent
+from data_designer.integrations.ray.observability_collection import (
+    _create_trace_event,
+    _get_ray_worker_context,
+    _profile_worker_output,
+    _RayObservabilityOptions,
+    _record_worker_metrics,
+    _record_worker_observability,
+    _snapshot_worker_throttle,
+    _task_traces_to_events,
+)
 
 if TYPE_CHECKING:
     from data_designer.config.mcp import MCPProviderT
@@ -62,12 +71,6 @@ class _RayExecutionPayload:
     seed_window: ray_seed_planning.RaySeedWindow | None = None
     seed_config: SeedConfig | None = None
     hidden_order_column: str | None = None
-
-
-@dataclass(frozen=True)
-class _RayObservabilityOptions:
-    profile_workers: bool = False
-    trace_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -612,246 +615,6 @@ def _get_ray_task_context() -> str | None:
             continue
         context_values.append(f"{attr}={value}")
     return ", ".join(context_values) if context_values else None
-
-
-def _record_worker_observability(
-    metrics_collector: Any | None,
-    *,
-    worker_profile: RayWorkerProfile | None,
-    trace_events: list[RayTraceEvent],
-    throttle_snapshots: list[RayThrottleSnapshot],
-) -> None:
-    if metrics_collector is None:
-        return
-    payload = {
-        "worker_profile": worker_profile.to_dict() if worker_profile is not None else None,
-        "trace_events": [event.to_dict() for event in trace_events],
-        "throttle_snapshots": [snapshot.to_dict() for snapshot in throttle_snapshots],
-    }
-    importlib.import_module("ray").get(metrics_collector.record_observability.remote(payload))
-
-
-def _record_worker_metrics(metrics_collector: Any | None, metrics: RayWorkerMetrics) -> None:
-    if metrics_collector is None:
-        return
-    importlib.import_module("ray").get(metrics_collector.record.remote(metrics.to_dict()))
-
-
-def _profile_worker_output(
-    output: Any, *, block_id: str, model_usage: dict[str, dict[str, Any]] | None
-) -> RayWorkerProfile:
-    warnings: list[str] = []
-    try:
-        columns = [str(column) for column in output.columns]
-        column_dtypes = {str(column): str(dtype) for column, dtype in output.dtypes.items()}
-        non_null_counts = {str(column): int(value) for column, value in output.notna().sum().to_dict().items()}
-        null_counts = {str(column): int(value) for column, value in output.isna().sum().to_dict().items()}
-        memory_usage_bytes = int(output.memory_usage(deep=True).sum())
-    except Exception as exc:
-        columns = []
-        column_dtypes = {}
-        non_null_counts = {}
-        null_counts = {}
-        memory_usage_bytes = None
-        warnings.append(f"Failed to profile Ray worker output: {type(exc).__name__}: {exc}")
-    return RayWorkerProfile(
-        block_id=block_id,
-        total_rows=len(output),
-        columns=columns,
-        column_dtypes=column_dtypes,
-        non_null_counts=non_null_counts,
-        null_counts=null_counts,
-        memory_usage_bytes=memory_usage_bytes,
-        model_usage=model_usage,
-        warnings=warnings,
-    )
-
-
-def _snapshot_worker_throttle(throttle_manager: Any | None) -> list[RayThrottleSnapshot]:
-    if throttle_manager is None:
-        return []
-    snapshot = getattr(throttle_manager, "snapshot", None)
-    if not callable(snapshot):
-        return []
-    try:
-        payload = snapshot()
-    except Exception:
-        return []
-    if not isinstance(payload, Mapping):
-        return []
-    global_caps = _effective_max_by_throttle_key(payload.get("global_caps"))
-    domains = payload.get("domains")
-    if not isinstance(domains, list):
-        return []
-    snapshots: list[RayThrottleSnapshot] = []
-    for domain_payload in domains:
-        if not isinstance(domain_payload, Mapping):
-            continue
-        provider_name = domain_payload.get("provider_name")
-        model_id = domain_payload.get("model_id")
-        domain = domain_payload.get("domain")
-        if not all(isinstance(value, str) for value in (provider_name, model_id, domain)):
-            continue
-        effective_max = _safe_optional_int_mapping(domain_payload, "effective_max")
-        if effective_max is None:
-            effective_max = global_caps.get((provider_name, model_id))
-        snapshots.append(
-            RayThrottleSnapshot(
-                provider_name=provider_name,
-                model_id=model_id,
-                domain=domain,
-                current_limit=_safe_int_mapping(domain_payload, "current_limit"),
-                effective_max=effective_max,
-                in_flight=_safe_int_mapping(domain_payload, "in_flight"),
-                waiters=_safe_int_mapping(domain_payload, "waiters"),
-                rate_limit_ceiling=_safe_int_mapping(domain_payload, "rate_limit_ceiling"),
-                consecutive_rate_limits=_safe_int_mapping(
-                    domain_payload,
-                    "consecutive_rate_limits",
-                    fallback_field_name="consecutive_429s",
-                ),
-            )
-        )
-    return snapshots
-
-
-def _effective_max_by_throttle_key(global_caps: Any) -> dict[tuple[str, str], int]:
-    if not isinstance(global_caps, list):
-        return {}
-    effective_by_key: dict[tuple[str, str], int] = {}
-    for cap_payload in global_caps:
-        if not isinstance(cap_payload, Mapping):
-            continue
-        provider_name = cap_payload.get("provider_name")
-        model_id = cap_payload.get("model_id")
-        effective_max = cap_payload.get("effective_max")
-        if (
-            isinstance(provider_name, str)
-            and isinstance(model_id, str)
-            and isinstance(effective_max, int)
-            and not isinstance(effective_max, bool)
-            and effective_max >= 0
-        ):
-            effective_by_key[(provider_name, model_id)] = effective_max
-    return effective_by_key
-
-
-def _task_traces_to_events(
-    task_traces: list[Any],
-    *,
-    block_id: str,
-    worker_context: dict[str, Any],
-) -> list[RayTraceEvent]:
-    events: list[RayTraceEvent] = []
-    for task_trace in task_traces:
-        dispatched_at = _safe_float_attr(task_trace, "dispatched_at")
-        slot_acquired_at = _safe_float_attr(task_trace, "slot_acquired_at")
-        completed_at = _safe_float_attr(task_trace, "completed_at")
-        elapsed_seconds = max(completed_at - dispatched_at, 0.0) if completed_at > 0 and dispatched_at > 0 else 0.0
-        wait_seconds = max(slot_acquired_at - dispatched_at, 0.0) if slot_acquired_at > 0 and dispatched_at > 0 else 0.0
-        run_seconds = max(completed_at - slot_acquired_at, 0.0) if completed_at > 0 and slot_acquired_at > 0 else 0.0
-        events.append(
-            RayTraceEvent(
-                block_id=block_id,
-                event_type="engine_task",
-                timestamp_seconds=time.time(),
-                elapsed_seconds=elapsed_seconds,
-                row_count=0,
-                worker_hostname=worker_context["worker_hostname"],
-                worker_pid=worker_context["worker_pid"],
-                ray_task_id=worker_context.get("ray_task_id"),
-                ray_node_id=worker_context.get("ray_node_id"),
-                details={
-                    "column": getattr(task_trace, "column", None),
-                    "row_group": getattr(task_trace, "row_group", None),
-                    "row_index": getattr(task_trace, "row_index", None),
-                    "task_type": getattr(task_trace, "task_type", None),
-                    "status": getattr(task_trace, "status", None),
-                    "error": getattr(task_trace, "error", None),
-                    "queue_wait_seconds": wait_seconds,
-                    "run_seconds": run_seconds,
-                },
-            )
-        )
-    return events
-
-
-def _create_trace_event(
-    block_id: str,
-    event_type: str,
-    start_time: float,
-    *,
-    row_count: int,
-    worker_context: dict[str, Any],
-    details: dict[str, Any] | None = None,
-) -> RayTraceEvent:
-    return RayTraceEvent(
-        block_id=block_id,
-        event_type=event_type,
-        timestamp_seconds=time.time(),
-        elapsed_seconds=time.perf_counter() - start_time,
-        row_count=row_count,
-        worker_hostname=worker_context["worker_hostname"],
-        worker_pid=worker_context["worker_pid"],
-        ray_task_id=worker_context.get("ray_task_id"),
-        ray_node_id=worker_context.get("ray_node_id"),
-        details=details,
-    )
-
-
-def _get_ray_worker_context() -> dict[str, Any]:
-    context: dict[str, Any] = {
-        "worker_hostname": socket.gethostname(),
-        "worker_pid": os.getpid(),
-        "ray_task_id": None,
-        "ray_node_id": None,
-    }
-    try:
-        ray = importlib.import_module("ray")
-        get_runtime_context = getattr(ray, "get_runtime_context", None)
-        runtime_context = get_runtime_context() if callable(get_runtime_context) else None
-    except Exception:
-        runtime_context = None
-    if runtime_context is None:
-        return context
-    context["ray_task_id"] = _runtime_context_value(runtime_context, "get_task_id")
-    context["ray_node_id"] = _runtime_context_value(runtime_context, "get_node_id")
-    return context
-
-
-def _runtime_context_value(runtime_context: Any, method_name: str) -> str | None:
-    method = getattr(runtime_context, method_name, None)
-    if not callable(method):
-        return None
-    try:
-        value = method()
-    except Exception:
-        return None
-    return str(value) if value is not None else None
-
-
-def _safe_int_mapping(
-    payload: Mapping[str, Any],
-    field_name: str,
-    *,
-    fallback_field_name: str | None = None,
-) -> int:
-    value = payload.get(field_name)
-    if value is None and fallback_field_name is not None:
-        value = payload.get(fallback_field_name)
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-
-def _safe_optional_int_mapping(payload: Mapping[str, Any], field_name: str) -> int | None:
-    value = payload.get(field_name)
-    if value is None:
-        return None
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-
-def _safe_float_attr(value: Any, attr_name: str) -> float:
-    attr = getattr(value, attr_name, 0.0)
-    return float(attr) if isinstance(attr, (int, float)) and not isinstance(attr, bool) and attr >= 0 else 0.0
 
 
 def _coerce_pandas_dataframe(batch: Any) -> Any:

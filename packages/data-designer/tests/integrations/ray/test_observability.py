@@ -21,7 +21,7 @@ from data_designer.integrations.ray import (
     RayTraceEvent,
     RayWorkerProfile,
 )
-from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray import observability_collection as ray_observability_collection
 from data_designer.integrations.ray.observability import normalize_ray_trace_event, normalize_ray_worker_profile
 
 pytestmark = pytest.mark.ray_fake
@@ -31,7 +31,7 @@ def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(
     tmp_path: Path,
     stub_sampler_only_config_builder: DataDesignerConfigBuilder,
 ) -> None:
-    collector = ray_backend_module._RayMetricsCollector(max_trace_events=1)
+    collector = ray_observability_collection._RayMetricsCollector(max_trace_events=1)
     collector.record({"total_rows": 2, "blocks": 1, "elapsed_seconds": 0.5, "block_id": "block-a"})
     collector.record_observability(
         {
@@ -101,7 +101,7 @@ def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(
 def test_ray_results_load_analysis_returns_none_without_observability_payload(
     stub_sampler_only_config_builder: DataDesignerConfigBuilder,
 ) -> None:
-    collector = ray_backend_module._RayMetricsCollector(max_trace_events=0)
+    collector = ray_observability_collection._RayMetricsCollector(max_trace_events=0)
     collector.record({"total_rows": 0, "blocks": 1, "elapsed_seconds": 0.25})
     results = RayDatasetCreationResults(
         dataset=lazy.pd.DataFrame({"id": []}),
@@ -112,6 +112,10 @@ def test_ray_results_load_analysis_returns_none_without_observability_payload(
     )
 
     assert results.load_analysis() is None
+
+
+def test_assemble_ray_dataset_analysis_returns_none_without_observability_payload() -> None:
+    assert ray_observability_collection.assemble_ray_dataset_analysis(RayDatasetMetrics(blocks=1), {}) is None
 
 
 def test_ray_dataset_analysis_to_report_filters_json_sections(tmp_path: Path) -> None:
