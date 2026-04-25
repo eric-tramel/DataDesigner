@@ -22,6 +22,11 @@ from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, A
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.integrations.ray.artifact_output import create_data_designer_ray_datasink
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
+from data_designer.integrations.ray.llm import (
+    RayDataLLMStageOptions,
+    RayDataLLMStagePlan,
+    plan_ray_data_llm_stage,
+)
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayDatasetAnalysis
 from data_designer.integrations.ray.observability_collection import (
@@ -124,6 +129,7 @@ class RayJobPlan:
     metrics_collector: Any | None
     throttle_manager: Any | None
     observability_options: _RayObservabilityOptions
+    llm_stage_plan: RayDataLLMStagePlan
     output: RayOutputMode
     num_records: int
     input_blocks: int | None
@@ -144,9 +150,11 @@ class RayDatasetCreationResults:
         artifact_storage: ArtifactStorage | None = None,
         output: Any | None = None,
         observability_options: _RayObservabilityOptions | None = None,
+        llm_stage_plan: RayDataLLMStagePlan | None = None,
     ) -> None:
         del config_builder, observability_options
         self.artifact_storage = artifact_storage
+        self.llm_stage_plan = llm_stage_plan
         self._artifacts = RayResultArtifacts(
             dataset=dataset,
             metrics=metrics,
@@ -295,12 +303,17 @@ class RayBackend:
         artifact_write_concurrency: int | None = None,
         artifact_write_ray_remote_args: dict[str, Any] | None = None,
         distributed_artifact_writes: bool = True,
+        llm_stage_options: RayDataLLMStageOptions | None = None,
         **legacy_options: Any,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
             raise RayBackendConfigurationError("RayBackend output must be 'dataset' or 'arrow_refs'.")
         if object_ref_format not in ("arrow", "pandas"):
             raise RayBackendConfigurationError("RayBackend object_ref_format must be 'arrow' or 'pandas'.")
+        if llm_stage_options is not None and not isinstance(llm_stage_options, RayDataLLMStageOptions):
+            raise RayBackendConfigurationError(
+                "RayBackend llm_stage_options must be a RayDataLLMStageOptions instance."
+            )
         _validate_ray_backend_batch_size(batch_size)
         if order_column is not None and order_column == "":
             raise RayBackendConfigurationError("RayBackend order_column must be a non-empty string when provided.")
@@ -343,6 +356,7 @@ class RayBackend:
         self.artifact_write_concurrency = artifact_write_concurrency
         self.artifact_write_ray_remote_args = artifact_write_ray_remote_args
         self.distributed_artifact_writes = distributed_artifact_writes
+        self.llm_stage_options = llm_stage_options or RayDataLLMStageOptions()
 
     def create(
         self,
@@ -432,6 +446,7 @@ class RayBackend:
             artifact_storage=artifact_storage,
             output=output,
             observability_options=plan.observability_options,
+            llm_stage_plan=plan.llm_stage_plan,
         )
 
     def _execute_plan(
@@ -648,6 +663,11 @@ class RayDriverPlanner:
             max_throttle_snapshots=self._backend.max_throttle_snapshots,
         )
         throttle_manager = self._create_throttle_manager(runtime_context, config_builder)
+        llm_stage_plan = plan_ray_data_llm_stage(
+            config_builder=config_builder,
+            options=self._backend.llm_stage_options,
+        )
+        _validate_llm_stage_plan(llm_stage_plan)
         worker_config_builder = _clone_config_builder_for_worker(
             config_builder,
             worker_model_health_checks=self._backend.worker_model_health_checks,
@@ -712,6 +732,7 @@ class RayDriverPlanner:
             metrics_collector=metrics_collector,
             throttle_manager=throttle_manager,
             observability_options=observability_options,
+            llm_stage_plan=llm_stage_plan,
             output=self._backend.output,
             num_records=num_records,
             input_blocks=_get_num_blocks(dataset),
@@ -1052,6 +1073,16 @@ def _generate_batch(
         metrics_collector=metrics_collector,
         observability_options=observability_options,
     )(batch)
+
+
+def _validate_llm_stage_plan(plan: RayDataLLMStagePlan) -> None:
+    if not plan.enabled or plan.has_eligible_stage or plan.options.allow_model_facade_fallback:
+        return
+    reason = plan.disabled_reason or "no eligible Ray Data LLM stage candidate was found"
+    raise RayBackendConfigurationError(
+        "RayBackend Ray Data LLM stage was explicitly requested but cannot be planned: "
+        f"{reason} Set allow_model_facade_fallback=True to use the existing ModelFacade execution path."
+    )
 
 
 def _import_ray() -> Any:
