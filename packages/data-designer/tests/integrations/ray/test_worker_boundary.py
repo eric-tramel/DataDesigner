@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pickle
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
+from data_designer.integrations.ray import worker_pipeline as ray_worker_pipeline
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = [pytest.mark.ray_fake, pytest.mark.ray_worker_boundary]
@@ -227,6 +229,109 @@ def test_ray_batch_worker_delegates_to_engine_block_api(
     assert all(call["runtime_context"] is worker._worker_options for call in calls)
     assert all(call["options"].use_async is True for call in calls)
     assert all(call["data_designer_config"].seed_config is None for call in calls)
+
+
+def test_worker_generation_pipeline_core_runs_without_metrics_actor_or_ray_runtime(
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+    )
+    payload = ray_backend_module._compile_ray_execution_payload(
+        config_builder=_input_expression_config_builder(stub_model_configs),
+        worker_options=_worker_options_from_designer(designer),
+        use_input_dataset=True,
+        hidden_order_column=ray_worker_pipeline._RAY_INTERNAL_ROW_ID_COLUMN,
+    )
+    calls: list[dict[str, Any]] = []
+
+    def execute_dataset_block(**kwargs: Any) -> BlockExecutionResult:
+        calls.append(kwargs)
+        return _block_result(dataframe=lazy.pd.DataFrame({"row": [0, 1]}), input_rows=2)
+
+    pipeline = ray_worker_pipeline._RayWorkerGenerationPipeline(
+        execution_payload=payload,
+        execute_block=execute_dataset_block,
+    )
+    worker_batch = ray_worker_pipeline._RayWorkerBatch(
+        dataframe=lazy.pd.DataFrame(
+            {
+                "x": [1, 2],
+                "label": ["a", "b"],
+                ray_worker_pipeline._RAY_INTERNAL_ROW_ID_COLUMN: [7, 8],
+            }
+        ),
+        num_records=2,
+        block_id="block-core",
+        start_time=time.perf_counter(),
+        worker_context={
+            "worker_hostname": "host",
+            "worker_pid": 123,
+            "ray_task_id": None,
+            "ray_node_id": None,
+        },
+    )
+
+    result = pipeline.generate_rows(worker_batch)
+
+    assert result.dataframe.to_dict(orient="records") == [
+        {"row": 0, ray_worker_pipeline._RAY_INTERNAL_ROW_ID_COLUMN: 7},
+        {"row": 1, ray_worker_pipeline._RAY_INTERNAL_ROW_ID_COLUMN: 8},
+    ]
+    assert len(calls) == 1
+    assert calls[0]["input_frame"].to_dict(orient="records") == [
+        {"x": 1, "label": "a"},
+        {"x": 2, "label": "b"},
+    ]
+    assert calls[0]["runtime_context"] is pipeline.worker_options
+    assert calls[0]["num_records"] == 2
+
+
+def test_worker_observer_records_empty_batch_without_row_generation(
+    fake_ray_installer: Any,
+) -> None:
+    fake_ray = fake_ray_installer(with_remote=True)
+    collector = ray_backend_module._create_metrics_collector(fake_ray)
+    observer = ray_worker_pipeline._RayWorkerObserver(
+        metrics_collector=collector,
+        observability_options=ray_worker_pipeline._RayObservabilityOptions(
+            profile_workers=True,
+            trace_enabled=True,
+        ),
+    )
+    worker_batch = ray_worker_pipeline._RayWorkerBatch(
+        dataframe=lazy.pd.DataFrame({"x": []}),
+        num_records=0,
+        block_id="block-empty",
+        start_time=time.perf_counter(),
+        worker_context={
+            "worker_hostname": "host",
+            "worker_pid": 123,
+            "ray_task_id": "task-id",
+            "ray_node_id": "node-id",
+        },
+    )
+
+    batch_observer = observer.begin_batch(worker_batch)
+    batch_observer.record_empty(worker_batch)
+
+    metrics = fake_ray.get(collector.snapshot.remote())[0]
+    observability = fake_ray.get(collector.observability_snapshot.remote())
+    assert metrics["block_id"] == "block-empty"
+    assert metrics["empty_input"] is True
+    assert metrics["blocks"] == 1
+    assert metrics["input_rows"] == 0
+    assert [event["event_type"] for event in observability["trace_events"]] == [
+        "block_started",
+        "block_completed",
+    ]
+    assert observability["worker_profiles"][0]["block_id"] == "block-empty"
+    assert observability["worker_profiles"][0]["total_rows"] == 0
 
 
 def test_ray_batch_worker_records_partial_row_drop_metrics(
