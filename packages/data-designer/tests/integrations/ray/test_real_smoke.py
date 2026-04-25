@@ -20,8 +20,10 @@ from data_designer.config.default_model_settings import (
     get_builtin_model_providers,
     resolve_seed_default_model_settings,
 )
+from data_designer.config.processors import DropColumnsProcessorConfig, SchemaTransformProcessorConfig
 from data_designer.config.seed_source import LocalFileSeedSource
 from data_designer.engine.secret_resolver import PlaintextResolver
+from data_designer.engine.storage.artifact_storage import BatchStage
 from data_designer.integrations.ray import RayBackend, RayDataContextOptions, RayExecutionResources, RayInputRepartition
 from data_designer.interface.data_designer import DataDesigner
 
@@ -199,6 +201,52 @@ def test_real_ray_data_designer_artifact_write_smoke(
     assert metadata["file_paths"]["parquet-files"]
     assert results.load_dataset().count() == 2
     assert sorted(artifact_storage.final_dataset_path.glob("*.parquet"))
+
+
+def test_real_ray_data_designer_artifact_write_output_chunks_smoke(
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    input_dataset = local_ray.data.from_pandas(lazy.pd.DataFrame({"x": [1, 2, 3, 4], "label": ["a", "b", "c", "d"]}))
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="x_label", expr="{{ x }}-{{ label }}"))
+    config_builder.add_column(ExpressionColumnConfig(name="kept_label", expr="{{ label }}"))
+    config_builder.add_processor(
+        SchemaTransformProcessorConfig(name="schema-transform", template={"combined": "{{ x_label }}"})
+    )
+    config_builder.add_processor(DropColumnsProcessorConfig(name="drop-x-label", column_names=["x_label"]))
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(batch_size=4, output_chunk_rows=2, write_artifacts=True),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset, num_records=4, dataset_name="ray-chunks")
+    artifact_storage = results.artifact_storage
+
+    assert artifact_storage is not None
+    metadata = artifact_storage.read_metadata()
+    assert metadata["actual_num_records"] == 4
+    assert metadata["file_paths"]["parquet-files"]
+    assert metadata["file_paths"]["dropped-columns-parquet-files"]
+    assert metadata["file_paths"]["processor-files"]["schema-transform"]
+    assert results.load_dataset().count() == 4
+    assert artifact_storage.load_dataset(batch_stage=BatchStage.DROPPED_COLUMNS).to_dict(orient="records") == [
+        {"x_label": "1-a"},
+        {"x_label": "2-b"},
+        {"x_label": "3-c"},
+        {"x_label": "4-d"},
+    ]
+    assert results.load_processor_dataset("schema-transform").to_dict(orient="records") == [
+        {"combined": "1-a"},
+        {"combined": "2-b"},
+        {"combined": "3-c"},
+        {"combined": "4-d"},
+    ]
 
 
 def test_real_ray_input_dataset_repartition_smoke(

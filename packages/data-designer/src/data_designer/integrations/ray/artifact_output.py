@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import data_designer.lazy_heavy_imports as lazy
-from data_designer.engine.dataset_builders.block_execution import BlockExecutionResult
+from data_designer.engine.dataset_builders.block_execution import BlockExecutionChunk, BlockExecutionResult
 from data_designer.engine.storage.artifact_storage import (
     BATCH_FILE_NAME_FORMAT,
     FINAL_DATASET_FOLDER_NAME,
@@ -175,21 +175,22 @@ def create_data_designer_ray_datasink(
 
 def append_ray_artifact_columns(dataframe: Any, block_result: BlockExecutionResult) -> Any:
     """Append internal artifact columns that the Ray datasink can split back out."""
-    output = dataframe.copy()
-    dropped_dataframe = _dropped_columns_dataframe(
+    return _append_ray_artifact_columns(
+        dataframe,
         raw_dataframe=block_result.raw_dataframe,
         final_dataframe=block_result.dataframe,
+        processor_artifacts=block_result.processor_artifacts,
     )
-    if len(dropped_dataframe.columns) > 0:
-        output = _append_prefixed_dataframe_columns(output, dropped_dataframe, (_DROPPED_ARTIFACT_KIND,))
 
-    for processor_name, processor_dataframe in block_result.processor_artifacts.items():
-        output = _append_prefixed_dataframe_columns(
-            output,
-            processor_dataframe.reset_index(drop=True),
-            (_PROCESSOR_ARTIFACT_KIND, processor_name),
-        )
-    return output
+
+def append_ray_artifact_chunk_columns(dataframe: Any, chunk: BlockExecutionChunk) -> Any:
+    """Append internal artifact columns for one streamed engine chunk."""
+    return _append_ray_artifact_columns(
+        dataframe,
+        raw_dataframe=chunk.raw_dataframe,
+        final_dataframe=chunk.dataframe,
+        processor_artifacts=chunk.processor_artifacts,
+    )
 
 
 def split_ray_artifact_columns(dataframe: Any) -> tuple[Any, Any, dict[str, Any]]:
@@ -212,6 +213,30 @@ def split_ray_artifact_columns(dataframe: Any) -> tuple[Any, Any, dict[str, Any]
         processor_name: lazy.pd.DataFrame(columns) for processor_name, columns in processor_columns.items()
     }
     return lazy.pd.DataFrame(dataframe[final_columns]), lazy.pd.DataFrame(dropped_columns), processor_dataframes
+
+
+def _append_ray_artifact_columns(
+    dataframe: Any,
+    *,
+    raw_dataframe: Any,
+    final_dataframe: Any,
+    processor_artifacts: dict[str, Any],
+) -> Any:
+    output = dataframe.copy()
+    dropped_dataframe = _dropped_columns_dataframe(
+        raw_dataframe=raw_dataframe,
+        final_dataframe=final_dataframe,
+    )
+    if len(dropped_dataframe.columns) > 0:
+        output = _append_prefixed_dataframe_columns(output, dropped_dataframe, (_DROPPED_ARTIFACT_KIND,))
+
+    for processor_name, processor_dataframe in processor_artifacts.items():
+        output = _append_prefixed_dataframe_columns(
+            output,
+            processor_dataframe.reset_index(drop=True),
+            (_PROCESSOR_ARTIFACT_KIND, processor_name),
+        )
+    return output
 
 
 def _dropped_columns_dataframe(*, raw_dataframe: Any, final_dataframe: Any) -> Any:

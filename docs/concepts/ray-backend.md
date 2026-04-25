@@ -38,7 +38,7 @@ artifacts/
 
 ## Streaming Worker Chunks
 
-Set `output_chunk_rows` to have Ray workers emit generated output in smaller Ray Data chunks. For partition-local jobs without artifact capture, RayBackend now uses the engine async row-group path, so a worker can release each generated row group instead of first materializing the full `map_batches` output frame. If processor artifacts are being captured, or if hidden ordering would need to reconcile row-count-changing output, RayBackend falls back to the older materialized chunking path to preserve artifacts and ordering semantics.
+Set `output_chunk_rows` to have Ray workers emit generated output in smaller Ray Data chunks. For partition-local jobs, RayBackend uses the engine async row-group path, so a worker can release each generated row group instead of first materializing the full `map_batches` output frame. When `write_artifacts=True`, dropped-column and processor artifact payloads are attached to each emitted chunk and split back out by the Ray datasink. If hidden ordering would need to reconcile row-count-changing output, RayBackend falls back to the older materialized chunking path to preserve ordering semantics.
 
 ```python
 backend = RayBackend(
