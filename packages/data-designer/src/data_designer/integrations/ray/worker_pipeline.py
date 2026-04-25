@@ -75,6 +75,7 @@ class _RayExecutionPayload:
     use_input_dataset: bool
     seed_window: ray_seed_planning.RaySeedWindow | None = None
     seed_config: SeedConfig | None = None
+    range_input_columns: list[str] | None = None
     hidden_order_column: str | None = None
     preserve_output_row_count: bool = False
     output_chunk_rows: int | None = None
@@ -186,8 +187,10 @@ class _RayWorkerGenerationPipeline:
             hidden_order_column=self._execution_payload.hidden_order_column,
         )
         block_config = self.create_block_config(worker_batch.dataframe)
-        input_frame = (
-            _strip_internal_columns(worker_batch.dataframe) if self._execution_payload.use_input_dataset else None
+        input_frame = _create_worker_input_frame(
+            worker_batch.dataframe,
+            use_input_dataset=self._execution_payload.use_input_dataset,
+            range_input_columns=self._execution_payload.range_input_columns,
         )
         block_result = self._execute_block(
             data_designer_config=block_config,
@@ -471,7 +474,7 @@ def _prepare_worker_options(
     if observability_options.trace_enabled:
         run_config.async_trace = True
     seed_readers = copy.deepcopy(worker_options.seed_readers)
-    if execution_payload.use_input_dataset:
+    if execution_payload.use_input_dataset or execution_payload.range_input_columns is not None:
         seed_readers = ray_seed_planning.ensure_dataframe_seed_reader(seed_readers)
     return replace(
         worker_options,
@@ -486,6 +489,7 @@ def _compile_ray_execution_payload(
     worker_options: _RayWorkerOptions,
     use_input_dataset: bool,
     seed_window: ray_seed_planning.RaySeedWindow | None = None,
+    range_input_columns: list[str] | None = None,
     hidden_order_column: str | None = None,
     preserve_output_row_count: bool = False,
     output_chunk_rows: int | None = None,
@@ -504,6 +508,7 @@ def _compile_ray_execution_payload(
         use_input_dataset=use_input_dataset,
         seed_window=seed_window,
         seed_config=payload_seed_config,
+        range_input_columns=range_input_columns,
         hidden_order_column=hidden_order_column,
         preserve_output_row_count=preserve_output_row_count,
         output_chunk_rows=output_chunk_rows,
@@ -534,6 +539,26 @@ def _validate_worker_payload_serializable(payload: _RayExecutionPayload) -> None
             "RayBackend worker payload is not serializable. Check model providers, seed readers, "
             "secret resolvers, and MCP providers for process-safe state before launching Ray workers."
         ) from exc
+
+
+def _create_worker_input_frame(
+    dataframe: Any,
+    *,
+    use_input_dataset: bool,
+    range_input_columns: list[str] | None,
+) -> Any | None:
+    if use_input_dataset:
+        return _strip_internal_columns(dataframe)
+    if range_input_columns is None:
+        return None
+
+    input_frame = _strip_internal_columns(dataframe)
+    missing_columns = [column for column in range_input_columns if column not in input_frame.columns]
+    if missing_columns:
+        raise RayDatasetGenerationError(
+            f"RayBackend expected ray.data.range() worker batches to include column(s) {missing_columns!r}."
+        )
+    return input_frame.loc[:, range_input_columns].copy()
 
 
 def _strip_internal_columns(dataframe: Any) -> Any:
