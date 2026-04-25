@@ -231,6 +231,115 @@ def test_ray_backend_batch_size_none_uses_run_config_buffer_size(
     assert input_dataset.map_batches_kwargs["batch_size"] == 7
 
 
+def test_ray_driver_planner_captures_from_scratch_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    backend = RayBackend(batch_size=2, output="arrow_refs", override_num_blocks=3)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=backend,
+    )
+
+    plan = ray_backend_module.RayDriverPlanner(backend=backend, ray=fake_ray).plan(
+        runtime_context=designer._create_backend_runtime_context(),
+        config_builder=stub_sampler_only_config_builder,
+        num_records=5,
+    )
+
+    assert isinstance(plan, ray_backend_module.RayJobPlan)
+    assert plan.dataset_source.kind == "range"
+    assert plan.dataset_source.external_input_dataset is False
+    assert plan.dataset_source.use_input_dataset is False
+    assert plan.block_plan is not None
+    assert plan.block_plan.planned_blocks == 3
+    assert fake_ray.data.range_kwargs == {"override_num_blocks": 3}
+    assert plan.worker_payload is plan.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
+    assert plan.map_batches_kwargs["batch_size"] == 2
+    assert plan.output == "arrow_refs"
+    assert plan.input_blocks == 3
+    assert plan.metrics_collector is None
+    assert plan.throttle_manager is None
+
+
+def test_ray_driver_planner_captures_preserve_order_input_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset(
+        [lazy.pd.DataFrame({"x": [2], "label": ["b"]}), lazy.pd.DataFrame({"x": [1], "label": ["a"]})]
+    )
+    backend = RayBackend(preserve_order=True)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=backend,
+    )
+
+    plan = ray_backend_module.RayDriverPlanner(backend=backend, ray=fake_ray).plan(
+        runtime_context=designer._create_backend_runtime_context(),
+        config_builder=_input_expression_config_builder(stub_model_configs),
+        num_records=2,
+        input_dataset=input_dataset,
+    )
+
+    assert plan.dataset_source.kind == "input_dataset"
+    assert plan.dataset_source.external_input_dataset is True
+    assert plan.dataset_source.use_input_dataset is True
+    assert plan.ordering_mode.hidden_order_column == ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN
+    assert plan.worker_payload.hidden_order_column == ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN
+    assert ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN in plan.dataset_source.dataset.to_pandas().columns
+    assert plan.block_plan is None
+
+
+def test_ray_driver_planner_captures_driver_materialized_seed_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_dataframe = lazy.pd.DataFrame({"seed_value": ["alpha"]})
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    config_builder.with_seed_dataset(DataFrameSeedSource(df=lazy.pd.DataFrame({"seed_value": ["unused"]})))
+    config_builder.add_column(ExpressionColumnConfig(name="value_copy", expr="{{ seed_value }}"))
+    backend = RayBackend(batch_size=1)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=backend,
+    )
+
+    monkeypatch.setattr(
+        ray_seed_planning,
+        "plan_seed_execution",
+        lambda **_: ray_seed_planning.RaySeedPlan(input_dataframe=input_dataframe),
+    )
+
+    plan = ray_backend_module.RayDriverPlanner(backend=backend, ray=fake_ray).plan(
+        runtime_context=designer._create_backend_runtime_context(),
+        config_builder=config_builder,
+        num_records=1,
+    )
+
+    assert plan.dataset_source.kind == "driver_materialized_seed"
+    assert plan.dataset_source.external_input_dataset is False
+    assert plan.dataset_source.use_input_dataset is True
+    assert fake_ray.data.from_pandas_input is input_dataframe
+    assert plan.worker_payload.use_input_dataset is True
+    assert plan.block_plan is None
+
+
 def test_ray_backend_rejects_grouped_block_planning_conflicts() -> None:
     with pytest.raises(RayBackendConfigurationError, match="block_planning"):
         RayBackend(block_planning=RayBlockPlanning(), override_num_blocks=1)
