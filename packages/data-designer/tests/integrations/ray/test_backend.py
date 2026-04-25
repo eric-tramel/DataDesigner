@@ -196,11 +196,22 @@ def test_ray_backend_validates_invalid_block_planning_options(kwargs: dict[str, 
         ({"object_ref_format": "json"}, "object_ref_format"),
         ({"order_column": ""}, "order_column"),
         ({"max_trace_events": -1}, "max_trace_events"),
+        ({"max_worker_profiles": -1}, "max_worker_profiles"),
+        ({"max_throttle_snapshots": -1}, "max_throttle_snapshots"),
     ],
 )
 def test_ray_backend_constructor_uses_configuration_error(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(RayBackendConfigurationError, match=match):
         RayBackend(**kwargs)
+
+
+def test_ray_backend_defaults_bound_observability_storage() -> None:
+    backend = RayBackend()
+
+    assert backend.profile_workers is True
+    assert backend.max_trace_events == 1000
+    assert backend.max_worker_profiles == 1000
+    assert backend.max_throttle_snapshots == 1000
 
 
 @pytest.mark.parametrize("batch_size", [True, "10", 0, -1])
@@ -230,6 +241,40 @@ def test_ray_backend_batch_size_none_uses_run_config_buffer_size(
 
     assert input_dataset.map_batches_kwargs is not None
     assert input_dataset.map_batches_kwargs["batch_size"] == 7
+
+
+def test_ray_backend_threads_observability_limits_to_collector_and_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch, with_remote=True)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            max_trace_events=7,
+            max_worker_profiles=8,
+            max_throttle_snapshots=9,
+        ),
+    )
+
+    designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    constructor_kwargs = input_dataset.map_batches_kwargs["fn_constructor_kwargs"]
+    observability_options = constructor_kwargs["observability_options"]
+    metrics_collector = constructor_kwargs["metrics_collector"]
+    assert observability_options.max_worker_profiles == 8
+    assert observability_options.max_throttle_snapshots == 9
+    assert metrics_collector._actor._max_trace_events == 7
+    assert metrics_collector._actor._max_worker_profiles == 8
+    assert metrics_collector._actor._max_throttle_snapshots == 9
 
 
 def test_ray_driver_planner_captures_from_scratch_plan(

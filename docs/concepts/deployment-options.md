@@ -170,6 +170,13 @@ Ray planning and execution kwargs such as `override_num_blocks`, `read_concurren
 `map_concurrency` are still accepted as compatibility shims, but do not combine them with `block_planning` or
 `execution_options`; effective mixed values raise a configuration error. Prefer the option objects for new code.
 
+Ray observability is bounded on the metrics actor. `profile_workers=True` is enabled by default and computes
+per-block worker summaries before retaining up to `max_worker_profiles=1000` profiles. Trace events are retained up
+to `max_trace_events=1000` when `trace_enabled=True`, and worker-local provider throttle snapshots are retained up to
+`max_throttle_snapshots=1000`. Very large jobs should disable `profile_workers` or lower these limits when driver-side
+diagnostics are less important than profiling overhead and metrics actor memory. `RayDatasetAnalysis` reports dropped
+profile, trace, and throttle snapshot counts when limits are exceeded.
+
 Use Ray only when the driver and workers are inside the same trusted operational boundary, such as a single-tenant
 cluster or a managed cluster with equivalent isolation. A Ray worker may receive provider endpoint configuration and
 may be able to resolve API keys through the configured `SecretResolver` or worker environment. Treat every Ray worker
