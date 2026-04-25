@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Stable public imports for the experimental Ray integration.
+
+Low-level telemetry normalizers, metric aggregators, and resolved planning
+internals remain available from their defining modules for tests and advanced
+debugging, but they are intentionally excluded from the package root surface.
+"""
+
 from __future__ import annotations
 
 from data_designer.integrations.ray.backend import RayBackend, RayDatasetCreationResults
@@ -13,22 +20,16 @@ from data_designer.integrations.ray.errors import (
 from data_designer.integrations.ray.metrics import (
     RayDatasetMetrics,
     RayWorkerMetrics,
-    aggregate_ray_metrics,
-    normalize_ray_worker_metrics,
 )
 from data_designer.integrations.ray.observability import (
     RayDatasetAnalysis,
     RayThrottleSnapshot,
     RayTraceEvent,
     RayWorkerProfile,
-    normalize_ray_throttle_snapshot,
-    normalize_ray_trace_event,
-    normalize_ray_worker_profile,
 )
 from data_designer.integrations.ray.options import (
     RayBlockPlanning,
     RayExecutionOptions,
-    RayResolvedBlockPlan,
 )
 
 __all__ = [
@@ -42,14 +43,8 @@ __all__ = [
     "RayExecutionOptions",
     "RayIntegrationError",
     "RayMetricsError",
-    "RayResolvedBlockPlan",
     "RayThrottleSnapshot",
     "RayTraceEvent",
     "RayWorkerMetrics",
     "RayWorkerProfile",
-    "aggregate_ray_metrics",
-    "normalize_ray_throttle_snapshot",
-    "normalize_ray_trace_event",
-    "normalize_ray_worker_metrics",
-    "normalize_ray_worker_profile",
 ]

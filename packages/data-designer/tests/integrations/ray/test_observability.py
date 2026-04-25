@@ -13,15 +13,16 @@ from fake_ray_harness import FakeActorHandle
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.integrations.ray import (
+    RayDatasetAnalysis,
     RayDatasetCreationResults,
     RayDatasetMetrics,
     RayMetricsError,
     RayThrottleSnapshot,
     RayTraceEvent,
     RayWorkerProfile,
-    normalize_ray_trace_event,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray.observability import normalize_ray_trace_event
 
 pytestmark = pytest.mark.ray_fake
 
@@ -111,6 +112,72 @@ def test_ray_results_load_analysis_returns_none_without_observability_payload(
     )
 
     assert results.load_analysis() is None
+
+
+def test_ray_dataset_analysis_to_report_filters_json_sections(tmp_path: Path) -> None:
+    analysis = RayDatasetAnalysis(
+        total_rows=2,
+        blocks=1,
+        worker_profiles=[RayWorkerProfile(block_id="block-a", total_rows=2, columns=["label"])],
+        trace_events=[RayTraceEvent(block_id="block-a", event_type="block_started", timestamp_seconds=1.0)],
+        trace_events_dropped=3,
+        throttle_snapshots=[
+            RayThrottleSnapshot(provider_name="provider", model_id="model", domain="chat", current_limit=1)
+        ],
+    )
+    report_path = tmp_path / "ray-analysis.json"
+
+    analysis.to_report(report_path, include_sections=["summary", "trace_events"])
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report == {
+        "summary": {
+            "blocks": 1,
+            "column_names": ["label"],
+            "failed_blocks": 0,
+            "successful_blocks": 1,
+            "total_rows": 2,
+            "trace_events_dropped": 3,
+        },
+        "trace_events": [
+            {
+                "block_id": "block-a",
+                "details": None,
+                "elapsed_seconds": 0.0,
+                "event_type": "block_started",
+                "ray_node_id": None,
+                "ray_task_id": None,
+                "row_count": 0,
+                "timestamp_seconds": 1.0,
+                "worker_hostname": None,
+                "worker_pid": None,
+            }
+        ],
+        "trace_events_dropped": 3,
+    }
+
+
+def test_ray_dataset_analysis_to_report_filters_html_sections(tmp_path: Path) -> None:
+    analysis = RayDatasetAnalysis(
+        total_rows=1,
+        blocks=1,
+        worker_profiles=[RayWorkerProfile(block_id="block-a", total_rows=1, columns=["label"])],
+    )
+    report_path = tmp_path / "ray-analysis.html"
+
+    analysis.to_report(report_path, include_sections=["worker_profiles"])
+
+    report = report_path.read_text(encoding="utf-8")
+    assert "&quot;worker_profiles&quot;" in report
+    assert "&quot;summary&quot;" not in report
+    assert "&quot;trace_events&quot;" not in report
+
+
+def test_ray_dataset_analysis_to_report_rejects_unknown_include_section(tmp_path: Path) -> None:
+    analysis = RayDatasetAnalysis()
+
+    with pytest.raises(RayMetricsError, match="Ray-native sections"):
+        analysis.to_report(tmp_path / "ray-analysis.json", include_sections=["column_profilers"])
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
