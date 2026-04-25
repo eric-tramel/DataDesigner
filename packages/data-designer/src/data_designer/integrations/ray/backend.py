@@ -602,6 +602,12 @@ class RayDriverPlanner:
         model_aliases = _model_health_check_aliases(config_builder)
         if self._backend.preflight_model_health_check:
             _run_driver_model_health_check(runtime_context, config_builder, model_aliases)
+        execution_options = self._backend.execution_options.resolve_actor_pool_defaults(
+            model_configs=config_builder.model_configs,
+            model_providers=list(runtime_context.model_providers),
+            default_provider_name=runtime_context.default_provider_name,
+            model_aliases=model_aliases,
+        )
 
         block_plan = self._backend.block_planning.resolve(num_records=num_records) if input_dataset is None else None
         dataset = self._backend._resolve_input_dataset(
@@ -689,7 +695,7 @@ class RayDriverPlanner:
             "batch_format": "pandas",
             "zero_copy_batch": self._backend.zero_copy_batch,
         }
-        map_batches_kwargs.update(self._backend.execution_options.to_map_batches_kwargs(self._ray))
+        map_batches_kwargs.update(execution_options.to_map_batches_kwargs(self._ray))
         map_batches_kwargs["udf_modifying_row_count"] = not row_count_preserving
 
         return RayJobPlan(
