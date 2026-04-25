@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -15,40 +17,66 @@ import data_designer.lazy_heavy_imports as lazy
 pytestmark = pytest.mark.ray_benchmark
 
 
-def _load_benchmark_module() -> Any:
-    repo_root = Path(__file__).resolve().parents[5]
-    script_path = repo_root / "scripts" / "benchmarks" / "benchmark_ray_openai.py"
-    spec = importlib.util.spec_from_file_location("benchmark_ray_openai", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load benchmark script from {script_path}.")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[5]
+
+
+def _benchmark_dir() -> Path:
+    return _repo_root() / "scripts" / "benchmarks"
+
+
+def _load_benchmark_module(module_name: str, script_path: Path) -> ModuleType:
+    sys.path.insert(0, str(script_path.parent))
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load benchmark module from {script_path}.")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(script_path.parent))
+
+
+def _load_common_module() -> ModuleType:
+    return _load_benchmark_module("ray_benchmark_common", _benchmark_dir() / "ray_benchmark_common.py")
+
+
+def test_ray_benchmark_scripts_import_with_shared_helpers() -> None:
+    benchmark_dir = _benchmark_dir()
+
+    modules = {
+        path.stem: _load_benchmark_module(path.stem, path) for path in sorted(benchmark_dir.glob("benchmark_ray_*.py"))
+    }
+
+    assert modules["benchmark_ray_openai"].RESULT_PREFIX == "RAY_OPENAI_BENCHMARK_RESULT="
+    assert modules["benchmark_ray_mock_provider"].RESULT_PREFIX == "RAY_MOCK_PROVIDER_BENCHMARK_RESULT="
+    assert modules["benchmark_ray_streaming_out_of_core"].RESULT_PREFIX == "RAY_STREAMING_OUT_OF_CORE_RESULT="
 
 
 def test_parse_backends_supports_full_apples_to_apples_suite() -> None:
-    benchmark = _load_benchmark_module()
+    benchmark_common = _load_common_module()
 
-    assert benchmark._parse_backends("all") == list(benchmark.ALL_BACKENDS)
-    assert benchmark._parse_backends("local-sync,local-async,ray-dataset,ray-arrow-refs") == [
+    assert benchmark_common.parse_backends("all") == list(benchmark_common.ALL_BACKENDS)
+    assert benchmark_common.parse_backends("local-sync,local-async,ray-dataset,ray-arrow-refs") == [
         "local-sync",
         "local-async",
         "ray-dataset",
         "ray-arrow-refs",
     ]
-    assert benchmark._parse_backends("local-sync,local-sync,ray-dataset") == ["local-sync", "ray-dataset"]
+    assert benchmark_common.parse_backends("local-sync,local-sync,ray-dataset") == ["local-sync", "ray-dataset"]
 
 
 def test_parse_backends_rejects_unknown_backend() -> None:
-    benchmark = _load_benchmark_module()
+    benchmark_common = _load_common_module()
 
     with pytest.raises(ValueError, match="Unsupported backend"):
-        benchmark._parse_backends("local,ray")
+        benchmark_common.parse_backends("local,ray")
 
 
 def test_result_payload_reports_validity_and_provider_counters(tmp_path: Path) -> None:
-    benchmark = _load_benchmark_module()
+    benchmark_common = _load_common_module()
     output = lazy.pd.DataFrame(
         {
             "instruction": ["write code", "debug code"],
@@ -69,7 +97,7 @@ def test_result_payload_reports_validity_and_provider_counters(tmp_path: Path) -
         },
     }
 
-    payload = benchmark._result_payload(
+    payload = benchmark_common.result_payload(
         backend="local-sync",
         iteration=1,
         seed=11,
@@ -82,6 +110,7 @@ def test_result_payload_reports_validity_and_provider_counters(tmp_path: Path) -
         max_parallel_requests=2,
         expected_columns=["instruction", "code_implementation"],
         expected_rows=2,
+        include_retry_throttle=True,
     )
 
     assert payload["validity"] == {
@@ -96,8 +125,28 @@ def test_result_payload_reports_validity_and_provider_counters(tmp_path: Path) -
     assert payload["throughput"]["throttle_count"] == 1
 
 
+def test_failure_payload_preserves_result_shape() -> None:
+    benchmark_common = _load_common_module()
+
+    payload = benchmark_common.failure_payload(
+        backend="ray-dataset",
+        iteration=2,
+        seed=12,
+        elapsed_seconds=3.5,
+        exc=RuntimeError("backend failed"),
+        batch_size=8,
+        max_parallel_requests=4,
+        expected_columns=["a", "b"],
+    )
+
+    assert payload["status"] == "failed"
+    assert payload["missing_columns"] == ["a", "b"]
+    assert payload["validity"]["all_output_valid"] is False
+    assert payload["throughput"]["total_requests"] == 0
+
+
 def test_summary_groups_iterations_and_speedups() -> None:
-    benchmark = _load_benchmark_module()
+    benchmark_common = _load_common_module()
     results = [
         _benchmark_result(backend="local-sync", iteration=1, elapsed_seconds=10.0, rows_per_second=10.0),
         _benchmark_result(backend="local-async", iteration=1, elapsed_seconds=5.0, rows_per_second=20.0),
@@ -107,7 +156,7 @@ def test_summary_groups_iterations_and_speedups() -> None:
         _benchmark_result(backend="ray-dataset", iteration=2, elapsed_seconds=2.0, rows_per_second=50.0),
     ]
 
-    summary = benchmark._build_summary(results)
+    summary = benchmark_common.build_summary(results, include_retry_throttle=True)
 
     assert summary["all_output_valid"] is True
     assert summary["failed_backends"] == []
@@ -118,7 +167,7 @@ def test_summary_groups_iterations_and_speedups() -> None:
 
 
 def test_summary_flags_row_count_mismatch_as_failed_backend() -> None:
-    benchmark = _load_benchmark_module()
+    benchmark_common = _load_common_module()
     result = _benchmark_result(
         backend="ray-dataset",
         iteration=1,
@@ -130,21 +179,40 @@ def test_summary_flags_row_count_mismatch_as_failed_backend() -> None:
     result["metrics"] = {"failed_blocks": 0}
     result["throughput"]["failed_requests"] = 0
 
-    summary = benchmark._build_summary([result])
+    summary = benchmark_common.build_summary([result], include_retry_throttle=True)
 
     assert summary["all_output_valid"] is False
     assert summary["failed_backends"] == ["ray-dataset"]
 
 
 def test_fail_on_invalid_summary_exits_nonzero_unless_allowed() -> None:
-    benchmark = _load_benchmark_module()
+    benchmark_common = _load_common_module()
     summary = {"all_output_valid": False, "failed_backends": ["ray-dataset"]}
 
     with pytest.raises(SystemExit) as exc_info:
-        benchmark._fail_on_invalid_summary(summary=summary, allow_failures=False)
+        benchmark_common.fail_on_invalid_summary(summary=summary, allow_failures=False)
 
     assert exc_info.value.code == 1
-    assert benchmark._fail_on_invalid_summary(summary=summary, allow_failures=True) is None
+    assert benchmark_common.fail_on_invalid_summary(summary=summary, allow_failures=True) is None
+
+
+def test_json_default_serializes_numpy_values() -> None:
+    benchmark_common = _load_common_module()
+
+    assert benchmark_common.json_default(lazy.np.array([1, 2])) == [1, 2]
+    assert benchmark_common.json_default(lazy.np.int64(3)) == 3
+
+
+def test_ray_benchmark_scripts_do_not_call_private_data_designer_builders_directly() -> None:
+    private_methods = {"_create_resource_provider", "_create_dataset_builder"}
+    offenders: list[str] = []
+    for script_path in sorted(_benchmark_dir().glob("benchmark_ray_*.py")):
+        tree = ast.parse(script_path.read_text(encoding="utf-8"), filename=str(script_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in private_methods:
+                offenders.append(f"{script_path.name}:{node.lineno}:{node.attr}")
+
+    assert offenders == []
 
 
 def _benchmark_result(

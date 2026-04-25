@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import resource
 import time
 from pathlib import Path
 from typing import Any
+
+import ray_benchmark_common as benchmark_common
 
 import data_designer.config as dd
 import data_designer.lazy_heavy_imports as lazy
@@ -83,20 +84,17 @@ def main() -> None:
     args.artifact_root.mkdir(parents=True, exist_ok=True)
     args.managed_assets_path.mkdir(parents=True, exist_ok=True)
     _reset_output_dir(args.parquet_output)
-    os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
-    ray = __import__("ray")
-    if args.sandbox_safe_ray_init:
-        _patch_ray_sandbox_process_discovery()
-    ray.init(address="local", num_cpus=args.ray_cpus, ignore_reinit_error=True, include_dashboard=False)
-    try:
+    with benchmark_common.ray_session(
+        ray_cpus=args.ray_cpus,
+        sandbox_safe_ray_init=args.sandbox_safe_ray_init,
+        ray_address="local",
+        set_uv_runtime_env=True,
+    ) as ray:
         payload = _run_streaming_case(ray, args)
-    finally:
-        ray.shutdown()
 
     if args.output_json is not None:
-        args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+        benchmark_common.write_json_report(args.output_json, payload, sort_keys=True, trailing_newline=True)
     _emit(payload)
 
 
@@ -392,22 +390,8 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{field_name.replace('_', '-')} must be >= 1.")
 
 
-def _patch_ray_sandbox_process_discovery() -> None:
-    import ray._private.node
-
-    def _sandbox_safe_system_processes(self: object) -> str:
-        all_processes = getattr(self, "all_processes", {})
-        pids: list[str] = []
-        for processes in all_processes.values():
-            if processes:
-                pids.append(str(processes[0].process.pid))
-        return ",".join(pids)
-
-    ray._private.node.Node._get_system_processes_for_resource_isolation = _sandbox_safe_system_processes
-
-
 def _emit(payload: dict[str, Any]) -> None:
-    print(f"{RESULT_PREFIX}{json.dumps(payload, sort_keys=True, default=str)}", flush=True)
+    benchmark_common.emit_result(RESULT_PREFIX, payload)
 
 
 if __name__ == "__main__":
