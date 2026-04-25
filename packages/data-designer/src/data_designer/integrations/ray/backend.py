@@ -667,6 +667,10 @@ class RayDriverPlanner:
             worker_options=worker_options,
             use_input_dataset=use_input_dataset,
             seed_window=seed_window,
+            range_input_columns=_range_input_columns_for_config(
+                config_builder,
+                dataset_source_kind=dataset_source_kind,
+            ),
             hidden_order_column=ordering_mode.hidden_order_column,
             preserve_output_row_count=row_count_preserving,
             output_chunk_rows=self._backend.output_chunk_rows,
@@ -727,6 +731,32 @@ def _initial_dataset_source_kind(input_dataset: Any | None) -> RayDatasetSourceK
     if hasattr(input_dataset, "map_batches"):
         return "input_dataset"
     return "object_refs"
+
+
+def _range_input_columns_for_config(
+    config_builder: DataDesignerConfigBuilder,
+    *,
+    dataset_source_kind: RayDatasetSourceKind,
+) -> list[str] | None:
+    if dataset_source_kind != "range":
+        return None
+    if not _config_references_missing_ray_range_id(config_builder):
+        return None
+    return [ray_seed_planning.RAY_RANGE_ID_COLUMN]
+
+
+def _config_references_missing_ray_range_id(config_builder: DataDesignerConfigBuilder) -> bool:
+    range_id_column = ray_seed_planning.RAY_RANGE_ID_COLUMN
+    column_configs = config_builder.get_column_configs()
+    referenceable_columns: set[str] = set()
+    required_columns: set[str] = set()
+    for column_config in column_configs:
+        referenceable_columns.add(column_config.name)
+        referenceable_columns.update(column_config.side_effect_columns)
+        required_columns.update(column_config.required_columns)
+        if column_config.skip is not None:
+            required_columns.update(column_config.skip.columns)
+    return range_id_column in required_columns and range_id_column not in referenceable_columns
 
 
 def _ray_data_context_scope(ray: Any, data_context: Any) -> Any:
@@ -988,6 +1018,7 @@ def _generate_batch(
     worker_options: _RayWorkerOptions | None = None,
     use_input_dataset: bool | None = None,
     seed_window: ray_seed_planning.RaySeedWindow | None = None,
+    range_input_columns: list[str] | None = None,
     hidden_order_column: str | None = None,
     preserve_output_row_count: bool = False,
     output_chunk_rows: int | None = None,
@@ -1004,6 +1035,7 @@ def _generate_batch(
         worker_options=worker_options,
         use_input_dataset=use_input_dataset,
         seed_window=seed_window,
+        range_input_columns=range_input_columns,
         hidden_order_column=hidden_order_column,
         preserve_output_row_count=preserve_output_row_count,
         output_chunk_rows=output_chunk_rows,

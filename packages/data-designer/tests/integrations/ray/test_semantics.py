@@ -58,6 +58,12 @@ def _summary_seed_config_builder(stub_model_configs: Any, seed_df: lazy.pd.DataF
     return config_builder
 
 
+def _id_label_config_builder(stub_model_configs: Any) -> DataDesignerConfigBuilder:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="id_label", expr="row-{{ id }}"))
+    return config_builder
+
+
 @pytest.mark.parametrize(
     ("drop_order_column", "expected_columns"),
     [
@@ -237,6 +243,39 @@ def test_hidden_row_id_preserves_from_scratch_order_without_schema_pollution(
     assert len(output_df) == 5
     assert list(output_df.columns) == ["uuid", "category", "uniform"]
     assert not any(column.startswith("__data_designer_ray") for column in output_df.columns)
+
+
+def test_from_scratch_range_id_is_available_to_referenced_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    fake_ray.data.range_blocks = [
+        lazy.pd.DataFrame({"id": [0, 1]}),
+        lazy.pd.DataFrame({"id": [2, 3]}),
+    ]
+    designer = _designer(
+        tmp_path=tmp_path,
+        stub_model_providers=stub_model_providers,
+        backend=RayBackend(batch_size=2),
+    )
+
+    output_df = (
+        designer.create(_id_label_config_builder(stub_model_configs), num_records=4)
+        .load_dataset()
+        .to_pandas()
+        .sort_values("id")
+        .reset_index(drop=True)
+    )
+
+    assert output_df.to_dict(orient="records") == [
+        {"id": 0, "id_label": "row-0"},
+        {"id": 1, "id_label": "row-1"},
+        {"id": 2, "id_label": "row-2"},
+        {"id": 3, "id_label": "row-3"},
+    ]
 
 
 def test_seed_config_without_input_dataset_reads_partition_offsets_once(
