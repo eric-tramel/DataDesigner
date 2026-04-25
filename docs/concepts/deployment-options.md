@@ -154,6 +154,8 @@ to Ray workers so each worker can construct its local generation engine.
 Use option objects for Ray-specific planning and execution controls, while keeping common constructor arguments direct:
 
 ```python
+import ray
+
 from data_designer.integrations.ray import RayBackend, RayBlockPlanning, RayExecutionOptions
 
 backend = RayBackend(
@@ -161,14 +163,42 @@ backend = RayBackend(
     output="dataset",
     auto_init=False,
     block_planning=RayBlockPlanning(target_block_size=10_000, min_blocks=4),
-    execution_options=RayExecutionOptions(num_cpus=1, concurrency=8),
+    execution_options=RayExecutionOptions(
+        num_cpus=1,
+        compute=ray.data.TaskPoolStrategy(size=8),
+    ),
 )
 ```
+
+Use `RayExecutionOptions.compute` for Ray Data compute strategies such as `ray.data.TaskPoolStrategy(size=8)`
+when you want fixed task-parallel execution. For stateful or high-startup-cost workers, prefer the Data Designer
+actor-pool controls instead of hand-building the strategy:
+
+```python
+from data_designer.integrations.ray import RayBackend, RayExecutionOptions
+
+backend = RayBackend(
+    batch_size=128,
+    execution_options=RayExecutionOptions(
+        num_cpus=1,
+        use_actor_pool=True,
+        actor_pool_min_size=2,
+        actor_pool_max_size=16,
+        actor_pool_initial_size=4,
+    ),
+)
+```
+
+With `use_actor_pool=True`, Data Designer builds the Ray `ActorPoolStrategy` at execution time and passes the actor
+pool sizing fields through as `min_size`, `max_size`, and `initial_size`. Do not combine `compute` with
+`use_actor_pool=True`; choose exactly one compute strategy for a backend.
 
 `batch_size`, `output`, and `auto_init` remain the direct constructor controls for common use. Older individual
 Ray planning and execution kwargs such as `override_num_blocks`, `read_concurrency`, `num_cpus`, and
 `map_concurrency` are still accepted as compatibility shims, but do not combine them with `block_planning` or
-`execution_options`; effective mixed values raise a configuration error. Prefer the option objects for new code.
+`execution_options`; effective mixed values raise a configuration error. Treat `map_concurrency` as a legacy surface
+for older callers. New code should use `RayExecutionOptions.compute` for task-pool sizing or
+`RayExecutionOptions(use_actor_pool=True, actor_pool_min_size=..., actor_pool_max_size=...)` for actor-pool sizing.
 
 Ray observability is bounded on the metrics actor. `profile_workers=True` is enabled by default and computes
 per-block worker summaries before retaining up to `max_worker_profiles=1000` profiles. Trace events are retained up

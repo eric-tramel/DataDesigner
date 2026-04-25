@@ -466,6 +466,34 @@ def test_ray_backend_propagates_execution_resource_options(
     assert input_dataset.map_batches_kwargs["concurrency"] == 2
 
 
+def test_ray_backend_propagates_preferred_compute_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    compute = object()
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            execution_options=RayExecutionOptions(num_cpus=0.5, compute=compute),
+        ),
+    )
+
+    designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["num_cpus"] == 0.5
+    assert input_dataset.map_batches_kwargs["compute"] is compute
+    assert "concurrency" not in input_dataset.map_batches_kwargs
+
+
 def test_ray_backend_actor_pool_uses_autoscaling_strategy_and_constructor_payload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
