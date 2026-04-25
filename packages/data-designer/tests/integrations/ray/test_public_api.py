@@ -41,6 +41,7 @@ def test_ray_package_root_does_not_export_internal_helpers() -> None:
         "normalize_ray_trace_event",
         "normalize_ray_worker_metrics",
         "normalize_ray_worker_profile",
+        "RayResultArtifacts",
     }
 
     assert internal_helpers.isdisjoint(ray.__all__)

@@ -20,21 +20,15 @@ from data_designer.engine.dataset_builders.block_execution import execute_datase
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
-from data_designer.integrations.ray.metrics import (
-    RayDatasetMetrics,
-    RayWorkerMetrics,
-    aggregate_ray_metrics,
-    normalize_ray_worker_metrics,
-)
+from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayDatasetAnalysis
 from data_designer.integrations.ray.observability_collection import (
     _create_metrics_collector,
-    _has_observability_payload,
     _RayObservabilityOptions,
-    assemble_ray_dataset_analysis,
 )
 from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, resolve_ray_backend_options
 from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
+from data_designer.integrations.ray.results import RayResultArtifacts
 from data_designer.integrations.ray.throttling import create_ray_throttle_manager
 from data_designer.integrations.ray.worker_pipeline import (
     _RAY_INTERNAL_ROW_ID_COLUMN,
@@ -112,7 +106,7 @@ class RayJobPlan:
 
 
 class RayDatasetCreationResults:
-    """Results wrapper for Ray-resident Data Designer outputs."""
+    """Public results facade for Ray-resident Data Designer outputs."""
 
     def __init__(
         self,
@@ -126,126 +120,92 @@ class RayDatasetCreationResults:
         output: Any | None = None,
         observability_options: _RayObservabilityOptions | None = None,
     ) -> None:
-        self.dataset = dataset
-        self._config_builder = config_builder
-        self._driver_metrics = metrics
-        self._metrics_cache: RayDatasetMetrics | None = None
-        self._worker_metrics_cache: list[RayWorkerMetrics] | None = None
-        self._analysis_cache: RayDatasetAnalysis | None = None
-        self._ray = ray
-        self._metrics_collector = metrics_collector
-        self._throttle_manager = throttle_manager
-        self._output = output
-        self._observability_options = observability_options or _RayObservabilityOptions()
+        del config_builder, observability_options
+        self._artifacts = RayResultArtifacts(
+            dataset=dataset,
+            metrics=metrics,
+            ray=ray,
+            metrics_collector=metrics_collector,
+            throttle_manager=throttle_manager,
+            output=output,
+        )
+
+    @property
+    def dataset(self) -> Any:
+        """Return the Ray Dataset reference without Ray actor reads or driver materialization."""
+        return self._artifacts.dataset
+
+    @dataset.setter
+    def dataset(self, value: Any) -> None:
+        self._artifacts.dataset = value
 
     def load_dataset(self) -> Any:
-        """Return the Ray Dataset without materializing it on the driver."""
-        return self.dataset
+        """Return the Ray Dataset without Ray actor reads or driver materialization."""
+        return self._artifacts.load_dataset()
 
     def load_analysis(self) -> RayDatasetAnalysis | None:
-        """Return Ray-native worker profiles and bounded traces when available."""
+        """Return Ray-native analysis.
+
+        This may read the Ray metrics actor and can materialize the Ray Dataset
+        once if worker metrics or observability payloads have not been emitted
+        yet.
+        """
         return self.load_observability()
 
     def load_metrics(self) -> RayDatasetMetrics:
-        """Return driver-visible Ray execution metrics."""
-        if self._metrics_cache is not None:
-            return self._metrics_cache
-        if self._ray is None or self._metrics_collector is None:
-            return self._driver_metrics
-        try:
-            worker_metrics_payloads = self._load_worker_metrics_payloads()
-        except Exception as exc:
-            raise RayDatasetGenerationError("RayBackend failed to load worker metrics.") from exc
-        if not worker_metrics_payloads:
-            return self._driver_metrics
-        worker_metrics = aggregate_ray_metrics(
-            worker_metrics_payloads,
-            elapsed_seconds=self._driver_metrics.elapsed_seconds,
-        )
-        self._metrics_cache = _merge_driver_and_worker_metrics(
-            self._driver_metrics,
-            worker_metrics,
-            throttle_metrics=self._load_throttle_metrics(),
-        )
-        return self._metrics_cache
+        """Return driver-visible Ray execution metrics.
+
+        This may read the Ray metrics actor. If the first metrics snapshot is
+        empty, it explicitly materializes the Ray Dataset once and reads the
+        actor again so lazy Ray execution has a chance to emit worker metrics.
+        """
+        return self._artifacts.load_metrics()
 
     def load_worker_metrics(self) -> list[RayWorkerMetrics]:
-        """Return per-worker metrics payloads before dataset-level aggregation."""
-        if self._ray is None or self._metrics_collector is None:
-            return []
-        try:
-            return list(self._load_worker_metrics_payloads())
-        except Exception as exc:
-            raise RayDatasetGenerationError("RayBackend failed to load worker metrics.") from exc
+        """Return per-worker metrics payloads before dataset-level aggregation.
+
+        This may read the Ray metrics actor. If the first metrics snapshot is
+        empty, it explicitly materializes the Ray Dataset once and reads the
+        actor again so lazy Ray execution has a chance to emit worker metrics.
+        """
+        return self._artifacts.load_worker_metrics()
 
     def load_observability(self) -> RayDatasetAnalysis | None:
-        """Return bounded Ray-native profiles, traces, and worker-local throttle snapshots."""
-        if self._analysis_cache is not None:
-            return self._analysis_cache
-        if self._ray is None or self._metrics_collector is None:
-            return None
-        try:
-            payload = self._load_observability_payload()
-        except Exception as exc:
-            raise RayDatasetGenerationError("RayBackend failed to load Ray observability artifacts.") from exc
-        if not _has_observability_payload(payload):
-            return None
+        """Return bounded Ray-native profiles, traces, and worker-local throttle snapshots.
 
-        self._analysis_cache = assemble_ray_dataset_analysis(self.load_metrics(), payload)
-        return self._analysis_cache
+        This may read the Ray metrics actor. If observability is missing before
+        worker execution, it asks the metrics loader to run its explicit
+        materialization fallback before reading observability again.
+        """
+        return self._artifacts.load_observability()
 
     @property
     def metrics(self) -> RayDatasetMetrics:
-        """Return the latest available Ray execution metrics."""
+        """Return the latest available Ray execution metrics.
+
+        This has the same Ray actor read and materialization side effects as
+        ``load_metrics()``.
+        """
         return self.load_metrics()
 
-    def _materialize_dataset_for_metrics(self) -> None:
-        materialize = getattr(self.dataset, "materialize", None)
-        if not callable(materialize):
-            return
-        self.dataset = materialize()
-
-    def _load_worker_metrics_payloads(self) -> list[RayWorkerMetrics]:
-        if self._worker_metrics_cache is not None:
-            return self._worker_metrics_cache
-        payloads = self._ray.get(self._metrics_collector.snapshot.remote())
-        if not payloads:
-            self._materialize_dataset_for_metrics()
-            payloads = self._ray.get(self._metrics_collector.snapshot.remote())
-        self._worker_metrics_cache = [normalize_ray_worker_metrics(payload) for payload in payloads]
-        return self._worker_metrics_cache
-
-    def _load_observability_payload(self) -> dict[str, Any]:
-        observability_snapshot = getattr(self._metrics_collector, "observability_snapshot", None)
-        if observability_snapshot is None:
-            return {}
-        payload = self._ray.get(observability_snapshot.remote())
-        if not _has_observability_payload(payload):
-            self._load_worker_metrics_payloads()
-            payload = self._ray.get(observability_snapshot.remote())
-        return dict(payload)
-
-    def _load_throttle_metrics(self) -> dict[str, Any] | None:
-        if self._throttle_manager is None:
-            return None
-        snapshot = getattr(self._throttle_manager, "snapshot", None)
-        if not callable(snapshot):
-            return None
-        return snapshot()
-
     def to_arrow_refs(self) -> list[Any]:
-        """Return Ray ObjectRefs containing PyArrow tables, one per Ray block."""
-        if self._output is not None:
-            return self._output
-        try:
-            return self.dataset.to_arrow_refs()
-        except Exception as exc:
-            raise RayDatasetGenerationError("RayBackend failed to materialize Arrow ObjectRefs.") from exc
+        """Return Ray ObjectRefs containing PyArrow tables, one per Ray block.
+
+        If the backend already selected ``output="arrow_refs"``, this returns
+        the cached refs. Otherwise it calls ``Ray Dataset.to_arrow_refs()``,
+        which materializes Ray output blocks.
+        """
+        return self._artifacts.to_arrow_refs()
 
     @property
     def output(self) -> Any:
-        """Backend-selected output object."""
-        return self._output if self._output is not None else self.dataset
+        """Backend-selected output object without additional Ray actor reads.
+
+        For dataset output this returns the Ray Dataset reference. For
+        ``output="arrow_refs"`` this returns the refs materialized during
+        backend execution.
+        """
+        return self._artifacts.output
 
 
 class RayBackend:
@@ -739,29 +699,6 @@ def _dataset_from_arrow_refs_via_items(ray: Any, refs: list[Any]) -> Any:
         raise RayDatasetGenerationError("RayBackend Arrow ObjectRef fallback expected PyArrow tables with to_pylist().")
     kwargs = {"override_num_blocks": len(refs)} if refs else {}
     return from_items(records, **kwargs)
-
-
-def _merge_driver_and_worker_metrics(
-    driver_metrics: RayDatasetMetrics,
-    worker_metrics: RayDatasetMetrics,
-    *,
-    throttle_metrics: dict[str, Any] | None = None,
-) -> RayDatasetMetrics:
-    return RayDatasetMetrics(
-        total_rows=worker_metrics.total_rows,
-        input_rows=worker_metrics.input_rows,
-        output_rows=worker_metrics.output_rows,
-        dropped_rows=worker_metrics.dropped_rows,
-        all_rows_dropped_blocks=worker_metrics.all_rows_dropped_blocks,
-        partial_rows_dropped_blocks=worker_metrics.partial_rows_dropped_blocks,
-        empty_input_blocks=worker_metrics.empty_input_blocks,
-        blocks=worker_metrics.blocks,
-        failed_blocks=worker_metrics.failed_blocks,
-        elapsed_seconds=driver_metrics.elapsed_seconds,
-        worker_elapsed_seconds=worker_metrics.worker_elapsed_seconds,
-        model_usage=worker_metrics.model_usage or driver_metrics.model_usage,
-        throttle=throttle_metrics or worker_metrics.throttle or driver_metrics.throttle,
-    )
 
 
 class _RayBatchWorker:

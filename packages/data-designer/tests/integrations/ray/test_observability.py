@@ -23,6 +23,7 @@ from data_designer.integrations.ray import (
 )
 from data_designer.integrations.ray import observability_collection as ray_observability_collection
 from data_designer.integrations.ray.observability import normalize_ray_trace_event, normalize_ray_worker_profile
+from data_designer.integrations.ray.results import RayResultArtifacts
 
 pytestmark = pytest.mark.ray_fake
 
@@ -116,6 +117,39 @@ def test_ray_results_load_analysis_returns_none_without_observability_payload(
 
 def test_assemble_ray_dataset_analysis_returns_none_without_observability_payload() -> None:
     assert ray_observability_collection.assemble_ray_dataset_analysis(RayDatasetMetrics(blocks=1), {}) is None
+
+
+def test_ray_result_artifacts_load_observability_without_public_results() -> None:
+    collector = ray_observability_collection._RayMetricsCollector(max_trace_events=2)
+    collector.record({"total_rows": 1, "blocks": 1, "elapsed_seconds": 0.5, "block_id": "block-a"})
+    collector.record_observability(
+        {
+            "worker_profile": RayWorkerProfile(block_id="block-a", total_rows=1, columns=["id"]).to_dict(),
+            "trace_events": [
+                RayTraceEvent(
+                    block_id="block-a",
+                    event_type="block_completed",
+                    timestamp_seconds=2.0,
+                    elapsed_seconds=0.5,
+                    row_count=1,
+                ).to_dict()
+            ],
+        }
+    )
+    artifacts = RayResultArtifacts(
+        dataset=lazy.pd.DataFrame({"id": [1]}),
+        metrics=RayDatasetMetrics(total_rows=0, blocks=1, elapsed_seconds=1.0),
+        ray=types.SimpleNamespace(get=lambda ref: ref.value),
+        metrics_collector=FakeActorHandle(collector),
+    )
+
+    analysis = artifacts.load_observability()
+
+    assert analysis is not None
+    assert analysis.total_rows == 1
+    assert analysis.blocks == 1
+    assert analysis.worker_profiles[0].block_id == "block-a"
+    assert analysis.trace_events[0].event_type == "block_completed"
 
 
 def test_ray_dataset_analysis_to_report_filters_json_sections(tmp_path: Path) -> None:
