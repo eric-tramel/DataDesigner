@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 import data_designer.lazy_heavy_imports as lazy
+from data_designer.integrations.ray import RayDatasetAnalysis, RayDatasetStats, RayTraceEvent
 
 pytestmark = pytest.mark.ray_benchmark
 
@@ -123,6 +124,49 @@ def test_result_payload_reports_validity_and_provider_counters(tmp_path: Path) -
     assert payload["throughput"]["tokens_per_second"] == 20
     assert payload["throughput"]["retry_count"] == 4
     assert payload["throughput"]["throttle_count"] == 1
+
+
+def test_ray_diagnostics_payload_summarizes_dataset_stats_without_raw_text() -> None:
+    benchmark_common = _load_common_module()
+
+    analysis = RayDatasetAnalysis(
+        total_rows=2,
+        blocks=1,
+        trace_events=[RayTraceEvent(block_id="block-a", event_type="block_completed", timestamp_seconds=1.0)],
+        trace_events_dropped=2,
+        ray_dataset_stats=RayDatasetStats(
+            stats_text="Operator 1 MapBatches: detailed stats text",
+            stats_text_char_count=43,
+            operator_diagnostics=["Operator 1 MapBatches: detailed stats text"],
+            backpressure_diagnostics=["Backpressure: queued task wait time 0.1s"],
+            object_store_diagnostics=["Object store memory: 1 MiB used"],
+        ),
+        diagnostic_warnings=["some Ray stats were unavailable"],
+    )
+
+    payload = benchmark_common.ray_diagnostics_payload(analysis)
+
+    assert payload == {
+        "diagnostic_warnings": ["some Ray stats were unavailable"],
+        "ray_dataset_stats": {
+            "backpressure_diagnostics": ["Backpressure: queued task wait time 0.1s"],
+            "backpressure_diagnostics_dropped": 0,
+            "object_store_diagnostics": ["Object store memory: 1 MiB used"],
+            "object_store_diagnostics_dropped": 0,
+            "operator_diagnostics": ["Operator 1 MapBatches: detailed stats text"],
+            "operator_diagnostics_dropped": 0,
+            "stats_text_available": True,
+            "stats_text_char_count": 43,
+            "stats_text_truncated": False,
+            "warnings": [],
+        },
+        "throttle_snapshots": 0,
+        "throttle_snapshots_dropped": 0,
+        "trace_events": 1,
+        "trace_events_dropped": 2,
+        "worker_profiles": 0,
+        "worker_profiles_dropped": 0,
+    }
 
 
 def test_failure_payload_preserves_result_shape() -> None:

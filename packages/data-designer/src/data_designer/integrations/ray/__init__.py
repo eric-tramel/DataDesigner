@@ -23,6 +23,7 @@ from data_designer.integrations.ray.metrics import (
 )
 from data_designer.integrations.ray.observability import (
     RayDatasetAnalysis,
+    RayDatasetStats,
     RayThrottleSnapshot,
     RayTraceEvent,
     RayWorkerProfile,
@@ -46,6 +47,7 @@ __all__ = [
     "RayDatasetCreationResults",
     "RayDatasetGenerationError",
     "RayDatasetMetrics",
+    "RayDatasetStats",
     "RayExecutionOptions",
     "RayExecutionResources",
     "RayInputRepartition",

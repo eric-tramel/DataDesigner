@@ -12,12 +12,14 @@ from typing import Any, TypeAlias
 
 from data_designer.integrations.ray._telemetry_normalization import (
     ModelUsageSummary,
+    coerce_bool_field,
     coerce_float_field,
     coerce_int_field,
     coerce_model_usage,
     coerce_optional_int_field,
     coerce_optional_string_field,
     coerce_string_field,
+    validate_bool_field,
     validate_failed_blocks_not_greater_than_blocks,
     validate_non_empty_string_field,
     validate_non_negative_float_field,
@@ -28,12 +30,17 @@ from data_designer.integrations.ray.errors import RayMetricsError
 RayTraceEventPayload: TypeAlias = "RayTraceEvent | Mapping[str, Any]"
 RayWorkerProfilePayload: TypeAlias = "RayWorkerProfile | Mapping[str, Any]"
 RayThrottleSnapshotPayload: TypeAlias = "RayThrottleSnapshot | Mapping[str, Any]"
+RayDatasetStatsPayload: TypeAlias = "RayDatasetStats | Mapping[str, Any]"
 _OBSERVABILITY_FIELD_LABEL = "Ray observability field"
 _OBSERVABILITY_TELEMETRY_LABEL = "Ray observability"
 _MODEL_USAGE_FIELD_LABEL = "Ray observability model_usage"
 _RAY_REPORT_SECTION_ALIASES = {
+    "dataset_stats": "ray_dataset_stats",
+    "diagnostics": "ray_dataset_stats",
     "overview": "summary",
+    "ray_dataset_stats": "ray_dataset_stats",
     "summary": "summary",
+    "stats": "ray_dataset_stats",
     "worker_profiles": "worker_profiles",
     "profiles": "worker_profiles",
     "trace_events": "trace_events",
@@ -168,6 +175,75 @@ class RayThrottleSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RayDatasetStats:
+    """Bounded Ray Dataset stats text and extracted operator diagnostics."""
+
+    stats_text: str | None = None
+    stats_text_truncated: bool = False
+    stats_text_char_count: int = 0
+    operator_diagnostics: list[str] = field(default_factory=list)
+    operator_diagnostics_dropped: int = 0
+    backpressure_diagnostics: list[str] = field(default_factory=list)
+    backpressure_diagnostics_dropped: int = 0
+    object_store_diagnostics: list[str] = field(default_factory=list)
+    object_store_diagnostics_dropped: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        coerce_optional_string_field(
+            self.stats_text,
+            "stats_text",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_bool_field(
+            "stats_text_truncated",
+            self.stats_text_truncated,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "stats_text_char_count",
+            self.stats_text_char_count,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "operator_diagnostics_dropped",
+            self.operator_diagnostics_dropped,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "backpressure_diagnostics_dropped",
+            self.backpressure_diagnostics_dropped,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "object_store_diagnostics_dropped",
+            self.object_store_diagnostics_dropped,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        for field_name, values in (
+            ("operator_diagnostics", self.operator_diagnostics),
+            ("backpressure_diagnostics", self.backpressure_diagnostics),
+            ("object_store_diagnostics", self.object_store_diagnostics),
+            ("warnings", self.warnings),
+        ):
+            for value in values:
+                validate_non_empty_string_field(
+                    f"{field_name} item",
+                    value,
+                    field_label=_OBSERVABILITY_FIELD_LABEL,
+                )
+
+    @property
+    def has_stats_text(self) -> bool:
+        """Return whether Ray returned non-empty Dataset.stats() text."""
+        return bool(self.stats_text)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class RayDatasetAnalysis:
     """Ray-native analysis artifact composed from bounded worker summaries."""
 
@@ -180,6 +256,8 @@ class RayDatasetAnalysis:
     trace_events_dropped: int = 0
     throttle_snapshots: list[RayThrottleSnapshot] = field(default_factory=list)
     throttle_snapshots_dropped: int = 0
+    ray_dataset_stats: RayDatasetStats | None = None
+    diagnostic_warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         validate_non_negative_int_field("total_rows", self.total_rows, field_label=_OBSERVABILITY_FIELD_LABEL)
@@ -205,6 +283,14 @@ class RayDatasetAnalysis:
             self.throttle_snapshots_dropped,
             field_label=_OBSERVABILITY_FIELD_LABEL,
         )
+        if self.ray_dataset_stats is not None and not isinstance(self.ray_dataset_stats, RayDatasetStats):
+            raise RayMetricsError("RayDatasetAnalysis ray_dataset_stats must be RayDatasetStats when provided.")
+        for warning in self.diagnostic_warnings:
+            validate_non_empty_string_field(
+                "diagnostic_warnings item",
+                warning,
+                field_label=_OBSERVABILITY_FIELD_LABEL,
+            )
 
     @property
     def successful_blocks(self) -> int:
@@ -226,7 +312,7 @@ class RayDatasetAnalysis:
         Ray-native reports are bounded worker summaries, not the standard local
         dataset profiler report. include_sections filters top-level Ray report
         sections and accepts ``summary``/``overview``, ``worker_profiles``,
-        ``trace_events``, and ``throttle_snapshots``.
+        ``trace_events``, ``throttle_snapshots``, and ``ray_dataset_stats``.
         """
         sections = _normalize_include_sections(include_sections)
         if save_path is None:
@@ -263,7 +349,59 @@ class RayDatasetAnalysis:
         if "throttle_snapshots" in sections:
             payload["throttle_snapshots"] = [snapshot.to_dict() for snapshot in self.throttle_snapshots]
             payload["throttle_snapshots_dropped"] = self.throttle_snapshots_dropped
+        if "ray_dataset_stats" in sections:
+            payload["ray_dataset_stats"] = None if self.ray_dataset_stats is None else self.ray_dataset_stats.to_dict()
+            payload["diagnostic_warnings"] = list(self.diagnostic_warnings)
         return payload
+
+
+def normalize_ray_dataset_stats(payload: RayDatasetStatsPayload) -> RayDatasetStats:
+    """Normalize a Ray Dataset stats dataclass or mapping payload."""
+    if isinstance(payload, RayDatasetStats):
+        return payload
+    if not isinstance(payload, Mapping):
+        raise RayMetricsError(f"Ray Dataset stats payload must be a mapping, got {type(payload)!r}.")
+    return RayDatasetStats(
+        stats_text=coerce_optional_string_field(
+            payload.get("stats_text"),
+            "stats_text",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        stats_text_truncated=coerce_bool_field(
+            payload,
+            "stats_text_truncated",
+            default=False,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        stats_text_char_count=coerce_int_field(
+            payload,
+            "stats_text_char_count",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        operator_diagnostics=_coerce_str_list(payload.get("operator_diagnostics")),
+        operator_diagnostics_dropped=coerce_int_field(
+            payload,
+            "operator_diagnostics_dropped",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        backpressure_diagnostics=_coerce_str_list(payload.get("backpressure_diagnostics")),
+        backpressure_diagnostics_dropped=coerce_int_field(
+            payload,
+            "backpressure_diagnostics_dropped",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        object_store_diagnostics=_coerce_str_list(payload.get("object_store_diagnostics")),
+        object_store_diagnostics_dropped=coerce_int_field(
+            payload,
+            "object_store_diagnostics_dropped",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        warnings=_coerce_str_list(payload.get("warnings")),
+    )
 
 
 def normalize_ray_trace_event(payload: RayTraceEventPayload) -> RayTraceEvent:

@@ -17,6 +17,7 @@ from data_designer.integrations.ray.observability import RayDatasetAnalysis
 from data_designer.integrations.ray.observability_collection import (
     _has_observability_payload,
     assemble_ray_dataset_analysis,
+    collect_ray_dataset_stats,
 )
 
 
@@ -46,6 +47,7 @@ class RayResultArtifacts:
             ray=ray,
             metrics_collector=metrics_collector,
             metrics_loader=self._metrics_loader,
+            dataset_getter=lambda: self._dataset,
         )
 
     @property
@@ -171,6 +173,11 @@ class RayMetricsLoader:
             return None
         return snapshot()
 
+    @property
+    def driver_metrics(self) -> RayDatasetMetrics:
+        """Return driver-only metrics captured before optional worker aggregation."""
+        return self._driver_metrics
+
 
 class RayAnalysisLoader:
     """Load and normalize Ray observability artifacts without the public result wrapper."""
@@ -181,27 +188,57 @@ class RayAnalysisLoader:
         ray: Any | None = None,
         metrics_collector: Any | None = None,
         metrics_loader: RayMetricsLoader,
+        dataset_getter: Callable[[], Any] | None = None,
     ) -> None:
         self._ray = ray
         self._metrics_collector = metrics_collector
         self._metrics_loader = metrics_loader
+        self._dataset_getter = dataset_getter
         self._analysis_cache: RayDatasetAnalysis | None = None
 
     def load_observability(self) -> RayDatasetAnalysis | None:
         """Return bounded Ray-native profiles, traces, and worker-local throttle snapshots."""
         if self._analysis_cache is not None:
             return self._analysis_cache
-        if self._ray is None or self._metrics_collector is None:
-            return None
-        try:
-            payload = self._load_observability_payload()
-        except Exception as exc:
-            raise RayDatasetGenerationError("RayBackend failed to load Ray observability artifacts.") from exc
-        if not _has_observability_payload(payload):
+        diagnostic_warnings: list[str] = []
+        payload = self._load_observability_payload_or_warning(diagnostic_warnings)
+        metrics = self._load_metrics_for_analysis(diagnostic_warnings)
+        ray_dataset_stats = self._load_ray_dataset_stats(diagnostic_warnings)
+        if not _has_observability_payload(payload) and ray_dataset_stats is None and not diagnostic_warnings:
             return None
 
-        self._analysis_cache = assemble_ray_dataset_analysis(self._metrics_loader.load_metrics(), payload)
+        self._analysis_cache = assemble_ray_dataset_analysis(
+            metrics,
+            payload,
+            ray_dataset_stats=ray_dataset_stats,
+            diagnostic_warnings=diagnostic_warnings,
+        )
         return self._analysis_cache
+
+    def _load_observability_payload_or_warning(self, diagnostic_warnings: list[str]) -> dict[str, Any]:
+        if self._ray is None or self._metrics_collector is None:
+            return {}
+        try:
+            return self._load_observability_payload()
+        except Exception as exc:
+            diagnostic_warnings.append(_diagnostic_collection_warning("load Ray observability artifacts", exc))
+            return {}
+
+    def _load_metrics_for_analysis(self, diagnostic_warnings: list[str]) -> RayDatasetMetrics:
+        try:
+            return self._metrics_loader.load_metrics()
+        except Exception as exc:
+            diagnostic_warnings.append(_diagnostic_collection_warning("load Ray metrics for analysis", exc))
+            return self._metrics_loader.driver_metrics
+
+    def _load_ray_dataset_stats(self, diagnostic_warnings: list[str]) -> Any | None:
+        if self._dataset_getter is None:
+            return None
+        try:
+            return collect_ray_dataset_stats(self._dataset_getter())
+        except Exception as exc:
+            diagnostic_warnings.append(_diagnostic_collection_warning("collect Ray Dataset stats", exc))
+            return None
 
     def _load_observability_payload(self) -> dict[str, Any]:
         observability_snapshot = getattr(self._metrics_collector, "observability_snapshot", None)
@@ -212,6 +249,10 @@ class RayAnalysisLoader:
             self._metrics_loader.load_worker_metrics()
             payload = self._ray.get(observability_snapshot.remote())
         return dict(payload)
+
+
+def _diagnostic_collection_warning(action: str, exc: Exception) -> str:
+    return f"RayBackend failed to {action}: {type(exc).__name__}: {exc}"
 
 
 def _merge_driver_and_worker_metrics(

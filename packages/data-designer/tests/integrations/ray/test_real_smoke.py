@@ -155,6 +155,8 @@ def test_real_ray_streaming_out_of_core_parquet_smoke(
     assert analysis.total_rows == num_records
     assert analysis.worker_profiles
     assert analysis.trace_events
+    assert analysis.ray_dataset_stats is not None
+    assert analysis.ray_dataset_stats.stats_text is not None or analysis.ray_dataset_stats.warnings
     assert sample["ticket_key"].notna().all()
     assert sample["routing_key"].str.contains("::").all()
     assert list(parquet_dir.glob("*.parquet"))

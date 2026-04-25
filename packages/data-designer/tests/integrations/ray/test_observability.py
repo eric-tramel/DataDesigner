@@ -16,6 +16,7 @@ from data_designer.integrations.ray import (
     RayDatasetAnalysis,
     RayDatasetCreationResults,
     RayDatasetMetrics,
+    RayDatasetStats,
     RayMetricsError,
     RayThrottleSnapshot,
     RayTraceEvent,
@@ -101,6 +102,116 @@ def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(
     assert report["worker_profiles"][0]["block_id"] == "block-a"
     assert report["worker_profiles_dropped"] == 0
     assert report["throttle_snapshots_dropped"] == 0
+
+
+def test_ray_results_load_analysis_collects_dataset_stats_without_metrics_actor(
+    stub_sampler_only_config_builder: DataDesignerConfigBuilder,
+) -> None:
+    class StatsDataset:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stats(self) -> str:
+            self.calls += 1
+            return "\n".join(
+                [
+                    "Operator 1 MapBatches(_RayBatchWorker): 2 tasks executed, 2 blocks produced",
+                    "Backpressure: queued task wait time 0.25s",
+                    "Object store memory: 10 MiB used, 0 bytes spilled",
+                ]
+            )
+
+    dataset = StatsDataset()
+    results = RayDatasetCreationResults(
+        dataset=dataset,
+        config_builder=stub_sampler_only_config_builder,
+        metrics=RayDatasetMetrics(total_rows=4, blocks=2),
+    )
+
+    analysis = results.load_analysis()
+
+    assert analysis is not None
+    assert analysis.total_rows == 4
+    assert analysis.blocks == 2
+    assert analysis.ray_dataset_stats is not None
+    assert analysis.ray_dataset_stats.stats_text_char_count > 0
+    assert (
+        "Operator 1 MapBatches(_RayBatchWorker): 2 tasks executed, 2 blocks produced"
+        in analysis.ray_dataset_stats.operator_diagnostics
+    )
+    assert analysis.ray_dataset_stats.backpressure_diagnostics == ["Backpressure: queued task wait time 0.25s"]
+    assert analysis.ray_dataset_stats.object_store_diagnostics == ["Object store memory: 10 MiB used, 0 bytes spilled"]
+    assert results.load_analysis() is analysis
+    assert dataset.calls == 1
+
+
+def test_ray_results_load_analysis_preserves_dataset_stats_failure_as_warning(
+    stub_sampler_only_config_builder: DataDesignerConfigBuilder,
+) -> None:
+    class FailingStatsDataset:
+        def stats(self) -> str:
+            raise RuntimeError("stats unavailable")
+
+    results = RayDatasetCreationResults(
+        dataset=FailingStatsDataset(),
+        config_builder=stub_sampler_only_config_builder,
+        metrics=RayDatasetMetrics(total_rows=1, blocks=1),
+    )
+
+    analysis = results.load_analysis()
+
+    assert analysis is not None
+    assert analysis.ray_dataset_stats is not None
+    assert analysis.ray_dataset_stats.stats_text is None
+    assert analysis.ray_dataset_stats.warnings == ["Ray Dataset.stats() failed: RuntimeError: stats unavailable"]
+
+
+def test_collect_ray_dataset_stats_bounds_raw_text_and_diagnostics() -> None:
+    class LongStatsDataset:
+        def stats(self) -> str:
+            long_operator_line = f"Operator {'x' * 600}"
+            return "\n".join([long_operator_line for _ in range(105)] + ["tail" * 1000])
+
+    dataset_stats = ray_observability_collection.collect_ray_dataset_stats(LongStatsDataset())
+
+    assert dataset_stats is not None
+    assert dataset_stats.stats_text_truncated is True
+    assert dataset_stats.stats_text is not None
+    assert len(dataset_stats.stats_text) == 65_536
+    assert len(dataset_stats.operator_diagnostics) == 100
+    assert dataset_stats.operator_diagnostics_dropped == 5
+    assert dataset_stats.operator_diagnostics[0].endswith("... [truncated]")
+
+
+def test_assemble_ray_dataset_analysis_skips_malformed_diagnostics() -> None:
+    analysis = ray_observability_collection.assemble_ray_dataset_analysis(
+        RayDatasetMetrics(total_rows=1, blocks=1),
+        {
+            "worker_profiles": [{"block_id": "block-a", "total_rows": 1}, {"total_rows": 1}],
+            "trace_events": "not-a-list",
+            "throttle_snapshots": [
+                {
+                    "provider_name": "provider",
+                    "model_id": "model",
+                    "domain": "chat",
+                    "current_limit": 1,
+                },
+                {"provider_name": 7},
+            ],
+            "trace_events_dropped": "bad-count",
+        },
+    )
+
+    assert analysis is not None
+    assert [profile.block_id for profile in analysis.worker_profiles] == ["block-a"]
+    assert analysis.worker_profiles_dropped == 1
+    assert analysis.trace_events == []
+    assert analysis.trace_events_dropped == 1
+    assert [snapshot.domain for snapshot in analysis.throttle_snapshots] == ["chat"]
+    assert analysis.throttle_snapshots_dropped == 1
+    assert any("Skipped Ray observability worker profile" in warning for warning in analysis.diagnostic_warnings)
+    assert any("trace event payload must be a list" in warning for warning in analysis.diagnostic_warnings)
+    assert any("trace_events_dropped" in warning for warning in analysis.diagnostic_warnings)
 
 
 def test_ray_metrics_collector_bounds_profiles_and_throttle_snapshots() -> None:
@@ -292,6 +403,39 @@ def test_ray_dataset_analysis_to_report_filters_html_sections(tmp_path: Path) ->
     assert "&quot;worker_profiles&quot;" in report
     assert "&quot;summary&quot;" not in report
     assert "&quot;trace_events&quot;" not in report
+
+
+def test_ray_dataset_analysis_to_report_filters_dataset_stats_section(tmp_path: Path) -> None:
+    analysis = RayDatasetAnalysis(
+        total_rows=1,
+        blocks=1,
+        ray_dataset_stats=RayDatasetStats(
+            stats_text="Operator 1 MapBatches: 1 blocks",
+            stats_text_char_count=31,
+            operator_diagnostics=["Operator 1 MapBatches: 1 blocks"],
+        ),
+        diagnostic_warnings=["stats partially unavailable"],
+    )
+    report_path = tmp_path / "ray-analysis.json"
+
+    analysis.to_report(report_path, include_sections=["ray_dataset_stats"])
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report == {
+        "diagnostic_warnings": ["stats partially unavailable"],
+        "ray_dataset_stats": {
+            "backpressure_diagnostics": [],
+            "backpressure_diagnostics_dropped": 0,
+            "object_store_diagnostics": [],
+            "object_store_diagnostics_dropped": 0,
+            "operator_diagnostics": ["Operator 1 MapBatches: 1 blocks"],
+            "operator_diagnostics_dropped": 0,
+            "stats_text": "Operator 1 MapBatches: 1 blocks",
+            "stats_text_char_count": 31,
+            "stats_text_truncated": False,
+            "warnings": [],
+        },
+    }
 
 
 def test_ray_dataset_analysis_to_report_rejects_unknown_include_section(tmp_path: Path) -> None:
