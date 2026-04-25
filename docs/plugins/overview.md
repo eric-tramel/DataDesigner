@@ -38,12 +38,14 @@ Each plugin has three components, and we recommend organizing them into separate
 - **`config.py`** -- Configuration class defining user-facing parameters
     - Column generator plugins: inherit from `SingleColumnConfig` with a `column_type` discriminator
     - Seed reader plugins: inherit from `SeedSource` with a `seed_type` discriminator
-    - Processor plugins: inherit from `ProcessorConfig` with a `processor_type` discriminator
+    - Processor plugins: inherit from `ProcessorConfig` with a `processor_type` discriminator and class-level distributed safety metadata
 - **`impl.py`** -- Implementation class containing the core logic
     - Column generator plugins: inherit from `ColumnGeneratorFullColumn` or `ColumnGeneratorCellByCell`
     - Seed reader plugins: inherit from `SeedReader` or `FileSystemSeedReader` for directory-backed sources
     - Processor plugins: inherit from `Processor` and override callback methods (`process_before_batch`, `process_after_batch`, `process_after_generation`)
 - **`plugin.py`** -- A `Plugin` instance that connects the config and implementation classes
+
+Processor plugins that may run on distributed backends should declare backend-neutral `ProcessorDistributedSafety` metadata. Use `partition_safe`, `requires_global_order`, and `side_effects` to describe the processor's semantics; the Ray backend maps those generic capabilities to its supported execution modes. See [Processors](../concepts/processors.md#distributed-execution-metadata) for the field reference and compatibility notes for older `ray_safe` metadata.
 
 ### 2. Package Your Plugin
 

@@ -159,6 +159,40 @@ builder.add_processor(
 )
 ```
 
+### Distributed Execution Metadata
+
+Processor config classes should declare class-level `distributed_safety` metadata so distributed backends can decide whether the processor can run over independent partitions:
+
+```python
+from typing import ClassVar, Literal
+
+from data_designer.config import ProcessorDistributedSafety, ProcessorSideEffect
+from data_designer.config.base import ProcessorConfig
+
+
+class MyProcessorConfig(ProcessorConfig):
+    processor_type: Literal["my_processor"] = "my_processor"
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        partition_safe=True,
+        requires_global_order=False,
+        side_effects=ProcessorSideEffect.NONE,
+        reason="Transforms each partition independently.",
+    )
+```
+
+Use these fields to describe processor semantics without naming a specific backend:
+
+| Field | Meaning |
+|-------|---------|
+| `partition_safe` | The processor can run independently on separate data partitions without cross-partition coordination. |
+| `requires_global_order` | The processor needs a globally ordered or complete dataset view. |
+| `side_effects` | Side-effect category: `NONE`, `BATCH_ARTIFACT`, `DATASET_ARTIFACT`, or `EXTERNAL`. |
+| `reason` | Optional explanation for constrained or unsafe distributed execution. |
+
+The Ray backend currently accepts processors that are `partition_safe`, do not require global ordering, and have side effects of `NONE` or `BATCH_ARTIFACT`. Processors that write dataset-level artifacts or external side effects are rejected by default; pass `allow_unsafe_processors=True` only when you have verified the behavior for your workload.
+
+Existing plugins that pass `ray_safe=` to `ProcessorDistributedSafety` still load through a compatibility alias, but new code should use `partition_safe=`.
+
 **Entry point configuration** in `pyproject.toml`:
 
 ```toml
