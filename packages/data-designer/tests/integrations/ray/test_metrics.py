@@ -104,6 +104,44 @@ def test_normalize_ray_worker_metrics_uses_serializable_mapping_defaults() -> No
     assert metrics == RayWorkerMetrics(total_rows=3, output_rows=3, blocks=1)
 
 
+def test_normalize_ray_worker_metrics_preserves_engine_model_usage_optional_fields() -> None:
+    payload = {
+        "total_rows": 1,
+        "model_usage": {
+            "model-a": {
+                "token_usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "request_usage": {"successful_requests": 1, "failed_requests": 0, "total_requests": 1},
+                "tool_usage": {
+                    "total_tool_calls": 2,
+                    "total_tool_call_turns": 1,
+                    "total_generations": 1,
+                    "generations_with_tools": 1,
+                },
+                "image_usage": {"total_images": 4},
+                "tokens_per_second": 3,
+                "requests_per_minute": 60,
+            }
+        },
+    }
+
+    metrics = normalize_ray_worker_metrics(payload)
+
+    assert metrics.model_usage == payload["model_usage"]
+    assert metrics.model_usage is not payload["model_usage"]
+    assert metrics.model_usage["model-a"]["tool_usage"] is not payload["model_usage"]["model-a"]["tool_usage"]
+
+
+@pytest.mark.parametrize("model_usage", [[], {"model-a": []}, {1: {}}])
+def test_normalize_ray_worker_metrics_rejects_invalid_model_usage(model_usage: object) -> None:
+    with pytest.raises(RayMetricsError, match="model_usage|model usage"):
+        normalize_ray_worker_metrics({"total_rows": 1, "model_usage": model_usage})
+
+
+def test_normalize_ray_worker_metrics_rejects_invalid_optional_string() -> None:
+    with pytest.raises(RayMetricsError, match="block_id.*string"):
+        normalize_ray_worker_metrics({"total_rows": 1, "block_id": 123})
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_normalize_ray_worker_metrics_rejects_non_finite_elapsed_seconds(value: float) -> None:
     with pytest.raises(RayMetricsError, match="elapsed_seconds.*finite"):

@@ -22,7 +22,7 @@ from data_designer.integrations.ray import (
     RayWorkerProfile,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
-from data_designer.integrations.ray.observability import normalize_ray_trace_event
+from data_designer.integrations.ray.observability import normalize_ray_trace_event, normalize_ray_worker_profile
 
 pytestmark = pytest.mark.ray_fake
 
@@ -190,6 +190,51 @@ def test_normalize_ray_trace_event_rejects_non_finite_timestamp_seconds(value: f
                 "timestamp_seconds": value,
             }
         )
+
+
+def test_normalize_ray_trace_event_rejects_invalid_optional_string() -> None:
+    with pytest.raises(RayMetricsError, match="worker_hostname.*string"):
+        normalize_ray_trace_event(
+            {
+                "block_id": "block-a",
+                "event_type": "block_started",
+                "timestamp_seconds": 1.0,
+                "worker_hostname": 123,
+            }
+        )
+
+
+def test_normalize_ray_worker_profile_preserves_engine_model_usage_optional_fields() -> None:
+    payload = {
+        "block_id": "block-a",
+        "model_usage": {
+            "model-a": {
+                "token_usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "request_usage": {"successful_requests": 1, "failed_requests": 0, "total_requests": 1},
+                "tool_usage": {
+                    "total_tool_calls": 2,
+                    "total_tool_call_turns": 1,
+                    "total_generations": 1,
+                    "generations_with_tools": 1,
+                },
+                "image_usage": {"total_images": 4},
+                "tokens_per_second": 3,
+                "requests_per_minute": 60,
+            }
+        },
+    }
+
+    profile = normalize_ray_worker_profile(payload)
+
+    assert profile.model_usage == payload["model_usage"]
+    assert profile.model_usage is not payload["model_usage"]
+    assert profile.model_usage["model-a"]["image_usage"] is not payload["model_usage"]["model-a"]["image_usage"]
+
+
+@pytest.mark.parametrize("model_usage", [[], {"model-a": []}, {1: {}}])
+def test_normalize_ray_worker_profile_rejects_invalid_model_usage(model_usage: object) -> None:
+    with pytest.raises(RayMetricsError, match="model_usage|model usage"):
+        normalize_ray_worker_profile({"block_id": "block-a", "model_usage": model_usage})
 
 
 def test_ray_dataset_analysis_rejects_failed_blocks_greater_than_blocks() -> None:
