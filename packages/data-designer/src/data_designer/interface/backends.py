@@ -50,6 +50,9 @@ class BackendRuntimeContext(Protocol):
     def managed_assets_path(self) -> Path: ...
 
     @property
+    def artifact_path(self) -> Path: ...
+
+    @property
     def person_reader(self) -> PersonReader | None: ...
 
     @property
@@ -94,6 +97,7 @@ class DataDesignerRuntimeContext:
     secret_resolver: SecretResolver
     seed_readers: tuple[SeedReader, ...]
     managed_assets_path: Path
+    artifact_path: Path
     person_reader: PersonReader | None
     mcp_providers: tuple[MCPProviderT, ...]
     run_config: RunConfig

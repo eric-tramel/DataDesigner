@@ -162,6 +162,38 @@ def test_real_ray_streaming_out_of_core_parquet_smoke(
     assert list(parquet_dir.glob("*.parquet"))
 
 
+def test_real_ray_data_designer_artifact_write_smoke(
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    input_dataset = local_ray.data.from_pandas(
+        [
+            lazy.pd.DataFrame({"x": [1], "label": ["a"]}),
+            lazy.pd.DataFrame({"x": [2], "label": ["b"]}),
+        ]
+    )
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="x_label", expr="{{ x }}-{{ label }}"))
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(batch_size=1, write_artifacts=True),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset, num_records=2, dataset_name="ray-artifacts")
+    artifact_storage = results.artifact_storage
+
+    assert artifact_storage is not None
+    assert artifact_storage.metadata_file_path.is_file()
+    assert artifact_storage.read_metadata()["actual_num_records"] == 2
+    assert results.load_dataset().count() == 2
+    assert sorted(artifact_storage.final_dataset_path.glob("*.parquet"))
+
+
 def test_real_ray_input_dataset_repartition_smoke(
     local_ray: Any,
     real_ray_smoke_paths: Any,
