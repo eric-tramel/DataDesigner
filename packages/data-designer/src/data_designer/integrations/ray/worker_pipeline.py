@@ -125,12 +125,18 @@ class _RayWorkerProfileAccumulator:
     non_null_counts: dict[str, int] = field(default_factory=dict)
     null_counts: dict[str, int] = field(default_factory=dict)
     memory_usage_bytes: int = 0
+    input_memory_usage_bytes: int | None = None
+    process_maxrss_bytes: int | None = None
     warnings: list[str] = field(default_factory=list)
 
-    def observe(self, dataframe: Any) -> None:
-        profile = _profile_worker_output(dataframe, block_id=self.block_id, model_usage=None)
+    def observe(self, dataframe: Any, *, input_frame: Any | None = None) -> None:
+        profile = _profile_worker_output(dataframe, block_id=self.block_id, model_usage=None, input_frame=input_frame)
         self.total_rows += profile.total_rows
         self.memory_usage_bytes += profile.memory_usage_bytes or 0
+        if profile.input_memory_usage_bytes is not None and self.input_memory_usage_bytes is None:
+            self.input_memory_usage_bytes = profile.input_memory_usage_bytes
+        if profile.process_maxrss_bytes is not None:
+            self.process_maxrss_bytes = max(self.process_maxrss_bytes or 0, profile.process_maxrss_bytes)
         self.warnings.extend(profile.warnings)
         if not self.columns:
             self.columns = list(profile.columns)
@@ -157,6 +163,8 @@ class _RayWorkerProfileAccumulator:
             non_null_counts=self.non_null_counts,
             null_counts=self.null_counts,
             memory_usage_bytes=self.memory_usage_bytes,
+            input_memory_usage_bytes=self.input_memory_usage_bytes,
+            process_maxrss_bytes=self.process_maxrss_bytes,
             model_usage=model_usage,
             warnings=self.warnings,
         )
@@ -268,9 +276,10 @@ class _RayWorkerGenerationPipeline:
                     _validate_output_row_count(input_rows=chunk.input_rows, output_rows=len(output))
                 if not output_columns:
                     output_columns = [str(column) for column in output.columns]
+                input_profile_frame = worker_batch.dataframe if emitted_rows == 0 else None
                 emitted_rows += len(output)
                 if self._observability_options.profile_workers:
-                    profile.observe(output)
+                    profile.observe(output, input_frame=input_profile_frame)
                 yield output
 
             block_summary = stream.summary
@@ -493,7 +502,12 @@ class _RayWorkerBatchObserver:
         _record_worker_observability(
             self._metrics_collector,
             worker_profile=(
-                _profile_worker_output(worker_batch.dataframe, block_id=worker_batch.block_id, model_usage=None)
+                _profile_worker_output(
+                    worker_batch.dataframe,
+                    block_id=worker_batch.block_id,
+                    model_usage=None,
+                    input_frame=worker_batch.dataframe,
+                )
                 if self._observability_options.profile_workers
                 else None
             ),
@@ -560,6 +574,7 @@ class _RayWorkerBatchObserver:
                     generation_result.dataframe,
                     block_id=worker_batch.block_id,
                     model_usage=generation_result.model_usage,
+                    input_frame=worker_batch.dataframe,
                 )
                 if self._observability_options.profile_workers
                 else None

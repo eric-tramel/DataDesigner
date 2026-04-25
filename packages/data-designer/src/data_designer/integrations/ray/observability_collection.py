@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import platform
 import socket
 import time
 from collections.abc import Callable, Mapping
@@ -428,15 +429,21 @@ def _record_worker_metrics(metrics_collector: Any | None, metrics: RayWorkerMetr
 
 
 def _profile_worker_output(
-    output: Any, *, block_id: str, model_usage: dict[str, dict[str, Any]] | None
+    output: Any,
+    *,
+    block_id: str,
+    model_usage: dict[str, dict[str, Any]] | None,
+    input_frame: Any | None = None,
 ) -> RayWorkerProfile:
     warnings: list[str] = []
+    process_maxrss_bytes = _process_maxrss_bytes(warnings)
+    input_memory_usage_bytes = _dataframe_memory_usage_bytes(input_frame, warnings, label="input")
     try:
         columns = [str(column) for column in output.columns]
         column_dtypes = {str(column): str(dtype) for column, dtype in output.dtypes.items()}
         non_null_counts = {str(column): int(value) for column, value in output.notna().sum().to_dict().items()}
         null_counts = {str(column): int(value) for column, value in output.isna().sum().to_dict().items()}
-        memory_usage_bytes = int(output.memory_usage(deep=True).sum())
+        memory_usage_bytes = _dataframe_memory_usage_bytes(output, warnings, label="output")
     except Exception as exc:
         columns = []
         column_dtypes = {}
@@ -452,9 +459,36 @@ def _profile_worker_output(
         non_null_counts=non_null_counts,
         null_counts=null_counts,
         memory_usage_bytes=memory_usage_bytes,
+        input_memory_usage_bytes=input_memory_usage_bytes,
+        process_maxrss_bytes=process_maxrss_bytes,
         model_usage=model_usage,
         warnings=warnings,
     )
+
+
+def _dataframe_memory_usage_bytes(dataframe: Any | None, warnings: list[str], *, label: str) -> int | None:
+    if dataframe is None:
+        return None
+    try:
+        memory_usage = getattr(dataframe, "memory_usage", None)
+        if not callable(memory_usage):
+            return None
+        return int(memory_usage(deep=True).sum())
+    except Exception as exc:
+        warnings.append(f"Failed to profile Ray worker {label} memory: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _process_maxrss_bytes(warnings: list[str]) -> int | None:
+    try:
+        resource_module = importlib.import_module("resource")
+        value = int(resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss)
+    except Exception as exc:
+        warnings.append(f"Failed to profile Ray worker process RSS: {type(exc).__name__}: {exc}")
+        return None
+    if platform.system() == "Darwin":
+        return value
+    return value * 1024
 
 
 def _snapshot_worker_throttle(throttle_manager: Any | None) -> list[RayThrottleSnapshot]:

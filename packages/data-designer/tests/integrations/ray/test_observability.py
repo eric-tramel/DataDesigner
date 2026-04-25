@@ -45,6 +45,8 @@ def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(
                 non_null_counts={"id": 2, "label": 1},
                 null_counts={"id": 0, "label": 1},
                 memory_usage_bytes=128,
+                input_memory_usage_bytes=96,
+                process_maxrss_bytes=1024,
             ).to_dict(),
             "trace_events": [
                 RayTraceEvent(
@@ -89,6 +91,8 @@ def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(
     assert analysis.blocks == 1
     assert analysis.worker_profiles[0].block_id == "block-a"
     assert analysis.worker_profiles[0].null_counts == {"id": 0, "label": 1}
+    assert analysis.worker_profiles[0].input_memory_usage_bytes == 96
+    assert analysis.worker_profiles[0].process_maxrss_bytes == 1024
     assert analysis.worker_profiles_dropped == 0
     assert analysis.trace_events[0].event_type == "block_started"
     assert analysis.trace_events_dropped == 1
@@ -472,6 +476,9 @@ def test_normalize_ray_trace_event_rejects_invalid_optional_string() -> None:
 def test_normalize_ray_worker_profile_preserves_engine_model_usage_optional_fields() -> None:
     payload = {
         "block_id": "block-a",
+        "input_memory_usage_bytes": 96,
+        "memory_usage_bytes": 128,
+        "process_maxrss_bytes": 1024,
         "model_usage": {
             "model-a": {
                 "token_usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
@@ -492,6 +499,9 @@ def test_normalize_ray_worker_profile_preserves_engine_model_usage_optional_fiel
     profile = normalize_ray_worker_profile(payload)
 
     assert profile.model_usage == payload["model_usage"]
+    assert profile.input_memory_usage_bytes == 96
+    assert profile.memory_usage_bytes == 128
+    assert profile.process_maxrss_bytes == 1024
     assert profile.model_usage is not payload["model_usage"]
     assert profile.model_usage["model-a"]["image_usage"] is not payload["model_usage"]["model-a"]["image_usage"]
 

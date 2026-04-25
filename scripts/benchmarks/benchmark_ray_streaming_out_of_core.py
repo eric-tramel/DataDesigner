@@ -158,6 +158,7 @@ def _run_streaming_case(ray: Any, args: argparse.Namespace) -> dict[str, Any]:
     )
     metrics = results.load_metrics().to_dict()
     analysis = results.load_analysis()
+    worker_memory = _worker_memory_summary(analysis)
     elapsed_seconds = time.perf_counter() - started_at
     parquet_files = sorted(args.parquet_output.glob("*.parquet"))
 
@@ -185,6 +186,7 @@ def _run_streaming_case(ray: Any, args: argparse.Namespace) -> dict[str, Any]:
             "driver_maxrss_bytes_after_create": rss_after_create,
             "driver_maxrss_bytes_after_write": rss_after_write,
             "driver_maxrss_delta_bytes": max(rss_after_write - rss_before, 0),
+            "worker_profiles": worker_memory,
         },
         "dataset": {
             "source_blocks_observed": source_blocks_observed,
@@ -338,6 +340,52 @@ def _stream_sample(dataset: Any, *, stream_batch_size: int, max_batches: int) ->
         "batch_count": batch_count,
         "rows": rows,
         "first_rows": first_rows,
+    }
+
+
+def _worker_memory_summary(analysis: Any | None) -> dict[str, Any]:
+    if analysis is None:
+        return {
+            "profile_count": 0,
+            "input_memory_usage_bytes": _numeric_summary([]),
+            "output_memory_usage_bytes": _numeric_summary([]),
+            "process_maxrss_bytes": _numeric_summary([]),
+            "max_output_to_input_memory_ratio": None,
+        }
+    profiles = list(getattr(analysis, "worker_profiles", []) or [])
+    input_values = _profile_values(profiles, "input_memory_usage_bytes")
+    output_values = _profile_values(profiles, "memory_usage_bytes")
+    process_values = _profile_values(profiles, "process_maxrss_bytes")
+    ratios = [
+        output_value / input_value for input_value, output_value in zip(input_values, output_values) if input_value > 0
+    ]
+    return {
+        "profile_count": len(profiles),
+        "input_memory_usage_bytes": _numeric_summary(input_values),
+        "output_memory_usage_bytes": _numeric_summary(output_values),
+        "process_maxrss_bytes": _numeric_summary(process_values),
+        "max_output_to_input_memory_ratio": max(ratios) if ratios else None,
+    }
+
+
+def _profile_values(profiles: list[Any], field_name: str) -> list[float]:
+    values: list[float] = []
+    for profile in profiles:
+        value = getattr(profile, field_name, None)
+        if value is not None:
+            values.append(float(value))
+    return values
+
+
+def _numeric_summary(values: list[float]) -> dict[str, float | int | None]:
+    if not values:
+        return {"min": None, "max": None, "mean": None, "total": 0, "n": 0}
+    return {
+        "min": min(values),
+        "max": max(values),
+        "mean": sum(values) / len(values),
+        "total": sum(values),
+        "n": len(values),
     }
 
 
