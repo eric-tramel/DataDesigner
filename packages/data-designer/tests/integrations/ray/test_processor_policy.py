@@ -19,10 +19,15 @@ from data_designer.config.processors import (
     ProcessorSideEffect,
     SchemaTransformProcessorConfig,
 )
+from data_designer.engine.processing.processors.base import Processor
+from data_designer.engine.registry.data_designer_registry import DataDesignerRegistry
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError
 from data_designer.integrations.ray import backend as ray_backend_module
-from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
+from data_designer.integrations.ray.processor_policy import (
+    validate_no_ray_after_generation_processors,
+    validate_ray_safe_processors,
+)
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = pytest.mark.ray_fake
@@ -58,6 +63,28 @@ class LegacyRaySafeProcessorConfig(ProcessorConfig):
         side_effects=ProcessorSideEffect.NONE,
         reason="Uses legacy compatibility metadata.",
     )
+
+
+class AfterGenerationProcessorConfig(ProcessorConfig):
+    processor_type: Literal["after_generation"] = "after_generation"
+    distributed_safety: ClassVar[ProcessorDistributedSafety] = ProcessorDistributedSafety(
+        partition_safe=True,
+        requires_global_order=False,
+        side_effects=ProcessorSideEffect.NONE,
+        reason="Metadata is intentionally safe-looking to test implementation-stage validation.",
+    )
+
+
+class AfterGenerationProcessor(Processor[AfterGenerationProcessorConfig]):
+    def process_after_generation(self, data: Any) -> Any:
+        return data
+
+
+DataDesignerRegistry().processors.register(
+    "after_generation",
+    AfterGenerationProcessor,
+    AfterGenerationProcessorConfig,
+)
 
 
 def _managed_assets_path(tmp_path: Path) -> Path:
@@ -209,6 +236,35 @@ def test_ray_processor_policy_accepts_legacy_ray_safe_metadata(stub_model_config
     config_builder.add_processor(LegacyRaySafeProcessorConfig(name="legacy-processor"))
 
     validate_ray_safe_processors(config_builder)
+
+
+def test_ray_processor_policy_rejects_after_generation_processor_implementation(stub_model_configs: Any) -> None:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_processor(AfterGenerationProcessorConfig(name="global-processor"))
+
+    with pytest.raises(RayBackendConfigurationError, match="process_after_generation") as exc_info:
+        validate_no_ray_after_generation_processors(config_builder)
+
+    assert "global-processor (after_generation)" in str(exc_info.value)
+
+
+def test_ray_backend_rejects_after_generation_processors_even_when_unsafe_processors_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_processor(AfterGenerationProcessorConfig(name="global-processor"))
+    designer = _designer(tmp_path, stub_model_providers, backend=RayBackend(allow_unsafe_processors=True))
+
+    with pytest.raises(RayBackendConfigurationError, match="process_after_generation") as exc_info:
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    assert "global-processor (after_generation)" in str(exc_info.value)
+    assert input_dataset.map_batches_kwargs is None
 
 
 def test_ray_backend_allow_unsafe_processors_bypasses_schema_transform_preflight(

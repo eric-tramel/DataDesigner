@@ -6,6 +6,8 @@ from __future__ import annotations
 from data_designer.config.base import ProcessorConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.processors import ProcessorDistributedSafety, ProcessorSideEffect
+from data_designer.engine.processing.processors.base import Processor
+from data_designer.engine.registry.data_designer_registry import DataDesignerRegistry
 from data_designer.integrations.ray.errors import RayBackendConfigurationError
 
 _RAY_SUPPORTED_SIDE_EFFECTS = frozenset(
@@ -36,6 +38,36 @@ def validate_ray_safe_processors(config_builder: DataDesignerConfigBuilder) -> N
     )
 
 
+def validate_no_ray_after_generation_processors(config_builder: DataDesignerConfigBuilder) -> None:
+    """Reject processors whose implementation requires a completed dataset view.
+
+    RayBackend currently runs DataDesigner generation inside Ray Data
+    ``map_batches`` workers. A ``process_after_generation`` implementation would
+    therefore receive only one Ray block instead of the complete final dataset.
+    """
+    unsupported: list[str] = []
+    processor_registry = DataDesignerRegistry().processors
+    for processor in config_builder.get_processor_configs():
+        try:
+            processor_impl = processor_registry.get_for_config_type(type(processor))
+        except Exception:
+            continue
+        if getattr(processor_impl, "process_after_generation") is getattr(Processor, "process_after_generation"):
+            continue
+        unsupported.append(_format_processor_label(processor))
+
+    if not unsupported:
+        return
+
+    raise RayBackendConfigurationError(
+        "RayBackend does not support processors that implement process_after_generation because "
+        "Ray workers process independent data blocks, not the completed dataset. "
+        f"Unsupported processor(s): {'; '.join(unsupported)}. "
+        "Use the local backend or remove the after-generation processor until Ray-native global "
+        "processor execution is implemented."
+    )
+
+
 def _get_distributed_safety(processor: ProcessorConfig) -> ProcessorDistributedSafety | None:
     safety = getattr(processor, "distributed_safety", None)
     if isinstance(safety, ProcessorDistributedSafety):
@@ -52,8 +84,7 @@ def _is_supported_by_ray(safety: ProcessorDistributedSafety) -> bool:
 
 
 def _format_processor_violation(processor: ProcessorConfig, safety: ProcessorDistributedSafety | None) -> str:
-    processor_type = getattr(processor.processor_type, "value", processor.processor_type)
-    label = f"{processor.name} ({processor_type})"
+    label = _format_processor_label(processor)
     if safety is None:
         return f"{label}: missing distributed_safety metadata"
 
@@ -69,3 +100,8 @@ def _format_processor_violation(processor: ProcessorConfig, safety: ProcessorDis
     if safety.reason is not None:
         reasons.append(f"reason={safety.reason}")
     return f"{label}: {', '.join(reasons)}"
+
+
+def _format_processor_label(processor: ProcessorConfig) -> str:
+    processor_type = getattr(processor.processor_type, "value", processor.processor_type)
+    return f"{processor.name} ({processor_type})"
