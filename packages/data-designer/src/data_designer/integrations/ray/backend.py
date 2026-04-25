@@ -45,7 +45,7 @@ from data_designer.integrations.ray.observability import (
     normalize_ray_trace_event,
     normalize_ray_worker_profile,
 )
-from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, RayMapConcurrency
+from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, resolve_ray_backend_options
 from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
 from data_designer.integrations.ray.throttling import create_ray_throttle_manager
 from data_designer.interface.backends import BackendRuntimeContext
@@ -310,6 +310,11 @@ class RayBackend:
     Ray-resident outputs. Ray is imported lazily so base Data Designer installs
     do not require the optional dependency. input_dataset may be a Ray Dataset
     or a sequence of ObjectRefs containing Arrow tables or pandas DataFrames.
+
+    Prefer ``block_planning=RayBlockPlanning(...)`` and
+    ``execution_options=RayExecutionOptions(...)`` for Ray-specific controls.
+    Individual Ray planning and execution kwargs are still accepted as
+    backwards-compatible shims.
     """
 
     def __init__(
@@ -320,26 +325,8 @@ class RayBackend:
         object_ref_format: RayObjectRefInputFormat = "arrow",
         auto_init: bool = False,
         zero_copy_batch: bool = True,
-        ray_remote_args: dict[str, Any] | None = None,
         block_planning: RayBlockPlanning | None = None,
-        override_num_blocks: int | None = None,
-        target_block_size: int | None = None,
-        min_blocks: int | None = None,
-        max_blocks: int | None = None,
-        read_concurrency: int | None = None,
         execution_options: RayExecutionOptions | None = None,
-        num_cpus: float | None = None,
-        num_gpus: float | None = None,
-        memory: float | None = None,
-        resources: dict[str, float] | None = None,
-        scheduling_strategy: Any | None = None,
-        compute: Any | None = None,
-        map_concurrency: RayMapConcurrency | None = None,
-        ray_remote_args_fn: Any | None = None,
-        use_actor_pool: bool = False,
-        actor_pool_min_size: int | None = None,
-        actor_pool_max_size: int | None = None,
-        actor_pool_initial_size: int | None = None,
         preflight_model_health_check: bool = True,
         worker_model_health_checks: bool = False,
         order_column: str | None = None,
@@ -351,6 +338,7 @@ class RayBackend:
         profile_workers: bool = True,
         trace_enabled: bool = False,
         max_trace_events: int = 1000,
+        **legacy_options: Any,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
             raise RayBackendConfigurationError("RayBackend output must be 'dataset' or 'arrow_refs'.")
@@ -361,36 +349,19 @@ class RayBackend:
             raise RayBackendConfigurationError("RayBackend order_column must be a non-empty string when provided.")
         if max_trace_events < 0:
             raise RayBackendConfigurationError("RayBackend max_trace_events must be non-negative.")
-        self.block_planning = _resolve_block_planning(
-            block_planning,
-            override_num_blocks=override_num_blocks,
-            target_block_size=target_block_size,
-            min_blocks=min_blocks,
-            max_blocks=max_blocks,
-            read_concurrency=read_concurrency,
+        resolved_options = resolve_ray_backend_options(
+            block_planning=block_planning,
+            execution_options=execution_options,
+            legacy_options=legacy_options,
         )
-        self.execution_options = _resolve_execution_options(
-            execution_options,
-            ray_remote_args=ray_remote_args,
-            num_cpus=num_cpus,
-            num_gpus=num_gpus,
-            memory=memory,
-            resources=resources,
-            scheduling_strategy=scheduling_strategy,
-            compute=compute,
-            map_concurrency=map_concurrency,
-            ray_remote_args_fn=ray_remote_args_fn,
-            use_actor_pool=use_actor_pool,
-            actor_pool_min_size=actor_pool_min_size,
-            actor_pool_max_size=actor_pool_max_size,
-            actor_pool_initial_size=actor_pool_initial_size,
-        )
+        self.block_planning = resolved_options.block_planning
+        self.execution_options = resolved_options.execution_options
         self.batch_size = batch_size
         self.output = output
         self.object_ref_format = object_ref_format
         self.auto_init = auto_init
         self.zero_copy_batch = zero_copy_batch
-        self.ray_remote_args = ray_remote_args
+        self.ray_remote_args = self.execution_options.ray_remote_args
         self.preflight_model_health_check = preflight_model_health_check
         self.worker_model_health_checks = worker_model_health_checks
         self.order_column = order_column
@@ -680,92 +651,11 @@ def _create_driver_metrics(
     )
 
 
-def _resolve_block_planning(
-    block_planning: RayBlockPlanning | None,
-    *,
-    override_num_blocks: int | None,
-    target_block_size: int | None,
-    min_blocks: int | None,
-    max_blocks: int | None,
-    read_concurrency: int | None,
-) -> RayBlockPlanning:
-    if block_planning is not None and any(
-        value is not None
-        for value in (override_num_blocks, target_block_size, min_blocks, max_blocks, read_concurrency)
-    ):
-        raise RayBackendConfigurationError(
-            "RayBackend block_planning cannot be combined with individual block planning arguments."
-        )
-    if block_planning is not None:
-        return block_planning
-    return RayBlockPlanning(
-        override_num_blocks=override_num_blocks,
-        target_block_size=target_block_size,
-        min_blocks=min_blocks,
-        max_blocks=max_blocks,
-        read_concurrency=read_concurrency,
-    )
-
-
 def _validate_ray_backend_batch_size(batch_size: int | None) -> None:
     if batch_size is None:
         return
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise RayBackendConfigurationError("RayBackend batch_size must be a positive integer or None.")
-
-
-def _resolve_execution_options(
-    execution_options: RayExecutionOptions | None,
-    *,
-    ray_remote_args: dict[str, Any] | None,
-    num_cpus: float | None,
-    num_gpus: float | None,
-    memory: float | None,
-    resources: dict[str, float] | None,
-    scheduling_strategy: Any | None,
-    compute: Any | None,
-    map_concurrency: RayMapConcurrency | None,
-    ray_remote_args_fn: Any | None,
-    use_actor_pool: bool,
-    actor_pool_min_size: int | None,
-    actor_pool_max_size: int | None,
-    actor_pool_initial_size: int | None,
-) -> RayExecutionOptions:
-    explicit_values = (
-        ray_remote_args,
-        num_cpus,
-        num_gpus,
-        memory,
-        resources,
-        scheduling_strategy,
-        compute,
-        map_concurrency,
-        ray_remote_args_fn,
-        actor_pool_min_size,
-        actor_pool_max_size,
-        actor_pool_initial_size,
-    )
-    if execution_options is not None and (use_actor_pool or any(value is not None for value in explicit_values)):
-        raise RayBackendConfigurationError(
-            "RayBackend execution_options cannot be combined with individual Ray execution arguments."
-        )
-    if execution_options is not None:
-        return execution_options
-    return RayExecutionOptions(
-        num_cpus=num_cpus,
-        num_gpus=num_gpus,
-        memory=memory,
-        resources=resources,
-        scheduling_strategy=scheduling_strategy,
-        compute=compute,
-        concurrency=map_concurrency,
-        ray_remote_args_fn=ray_remote_args_fn,
-        ray_remote_args=ray_remote_args,
-        use_actor_pool=use_actor_pool,
-        actor_pool_min_size=actor_pool_min_size,
-        actor_pool_max_size=actor_pool_max_size,
-        actor_pool_initial_size=actor_pool_initial_size,
-    )
 
 
 def _model_health_check_aliases(config_builder: DataDesignerConfigBuilder) -> list[str]:

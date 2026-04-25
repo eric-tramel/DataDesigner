@@ -24,6 +24,32 @@ _DATA_DESIGNER_OWNED_MAP_BATCHES_KEYS = frozenset(
         "zero_copy_batch",
     }
 )
+_RAY_BACKEND_BLOCK_PLANNING_LEGACY_KWARGS = frozenset(
+    {
+        "override_num_blocks",
+        "target_block_size",
+        "min_blocks",
+        "max_blocks",
+        "read_concurrency",
+    }
+)
+_RAY_BACKEND_EXECUTION_OPTIONS_LEGACY_KWARGS = frozenset(
+    {
+        "ray_remote_args",
+        "num_cpus",
+        "num_gpus",
+        "memory",
+        "resources",
+        "scheduling_strategy",
+        "compute",
+        "map_concurrency",
+        "ray_remote_args_fn",
+        "use_actor_pool",
+        "actor_pool_min_size",
+        "actor_pool_max_size",
+        "actor_pool_initial_size",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +228,123 @@ class RayExecutionOptions:
                 )
             kwargs["compute"] = _create_actor_pool_strategy(ray, self)
         return kwargs
+
+
+@dataclass(frozen=True, slots=True)
+class RayBackendOptionResolution:
+    """Resolved RayBackend option objects after applying compatibility shims."""
+
+    block_planning: RayBlockPlanning
+    execution_options: RayExecutionOptions
+
+
+def resolve_ray_backend_options(
+    *,
+    block_planning: RayBlockPlanning | None = None,
+    execution_options: RayExecutionOptions | None = None,
+    legacy_options: Mapping[str, Any] | None = None,
+) -> RayBackendOptionResolution:
+    """Resolve RayBackend planning and execution option objects.
+
+    Args:
+        block_planning: Primary block-planning option object.
+        execution_options: Primary Ray execution option object.
+        legacy_options: Backwards-compatible constructor kwargs for individual
+            block-planning or execution settings.
+
+    Returns:
+        The resolved option objects used by RayBackend.
+
+    Raises:
+        RayBackendConfigurationError: If option objects are combined with
+            effective individual kwargs, or if unsupported legacy kwargs are
+            present.
+    """
+    remaining_options = dict(legacy_options or {})
+    block_planning_kwargs = _pop_legacy_options(
+        remaining_options,
+        _RAY_BACKEND_BLOCK_PLANNING_LEGACY_KWARGS,
+    )
+    execution_options_kwargs = _pop_legacy_options(
+        remaining_options,
+        _RAY_BACKEND_EXECUTION_OPTIONS_LEGACY_KWARGS,
+    )
+    if remaining_options:
+        unsupported_options = ", ".join(sorted(remaining_options))
+        raise RayBackendConfigurationError(
+            "RayBackend received unsupported Ray option arguments: "
+            f"{unsupported_options}. Use block_planning=RayBlockPlanning(...) or "
+            "execution_options=RayExecutionOptions(...) for Ray planning and execution controls."
+        )
+    return RayBackendOptionResolution(
+        block_planning=_resolve_ray_block_planning(block_planning, block_planning_kwargs),
+        execution_options=_resolve_ray_execution_options(execution_options, execution_options_kwargs),
+    )
+
+
+def _pop_legacy_options(source: dict[str, Any], option_names: frozenset[str]) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    for option_name in option_names:
+        if option_name in source:
+            options[option_name] = source.pop(option_name)
+    return options
+
+
+def _resolve_ray_block_planning(
+    block_planning: RayBlockPlanning | None,
+    legacy_options: Mapping[str, Any],
+) -> RayBlockPlanning:
+    if block_planning is not None and any(value is not None for value in legacy_options.values()):
+        raise RayBackendConfigurationError(
+            "RayBackend block_planning cannot be combined with individual block planning arguments."
+        )
+    if block_planning is not None:
+        return block_planning
+    return RayBlockPlanning(
+        override_num_blocks=legacy_options.get("override_num_blocks"),
+        target_block_size=legacy_options.get("target_block_size"),
+        min_blocks=legacy_options.get("min_blocks"),
+        max_blocks=legacy_options.get("max_blocks"),
+        read_concurrency=legacy_options.get("read_concurrency"),
+    )
+
+
+def _resolve_ray_execution_options(
+    execution_options: RayExecutionOptions | None,
+    legacy_options: Mapping[str, Any],
+) -> RayExecutionOptions:
+    if execution_options is not None and _has_effective_execution_legacy_options(legacy_options):
+        raise RayBackendConfigurationError(
+            "RayBackend execution_options cannot be combined with individual Ray execution arguments."
+        )
+    if execution_options is not None:
+        return execution_options
+    return RayExecutionOptions(
+        num_cpus=legacy_options.get("num_cpus"),
+        num_gpus=legacy_options.get("num_gpus"),
+        memory=legacy_options.get("memory"),
+        resources=legacy_options.get("resources"),
+        scheduling_strategy=legacy_options.get("scheduling_strategy"),
+        compute=legacy_options.get("compute"),
+        concurrency=legacy_options.get("map_concurrency"),
+        ray_remote_args_fn=legacy_options.get("ray_remote_args_fn"),
+        ray_remote_args=legacy_options.get("ray_remote_args"),
+        use_actor_pool=legacy_options.get("use_actor_pool", False),
+        actor_pool_min_size=legacy_options.get("actor_pool_min_size"),
+        actor_pool_max_size=legacy_options.get("actor_pool_max_size"),
+        actor_pool_initial_size=legacy_options.get("actor_pool_initial_size"),
+    )
+
+
+def _has_effective_execution_legacy_options(legacy_options: Mapping[str, Any]) -> bool:
+    for name, value in legacy_options.items():
+        if name == "use_actor_pool":
+            if value:
+                return True
+            continue
+        if value is not None:
+            return True
+    return False
 
 
 def _validate_optional_positive_int(field_name: str, value: int | None) -> None:

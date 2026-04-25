@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from data_designer.integrations.ray import RayBackendConfigurationError, RayBlockPlanning, RayExecutionOptions
+from data_designer.integrations.ray.options import resolve_ray_backend_options
 
 pytestmark = pytest.mark.ray_fake
 
@@ -23,6 +24,14 @@ pytestmark = pytest.mark.ray_fake
 def test_ray_block_planning_validation_uses_configuration_error(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(RayBackendConfigurationError, match=match):
         RayBlockPlanning(**kwargs)
+
+
+def test_ray_backend_option_resolution_rejects_block_planning_conflicts() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="block_planning"):
+        resolve_ray_backend_options(
+            block_planning=RayBlockPlanning(),
+            legacy_options={"override_num_blocks": 1},
+        )
 
 
 @pytest.mark.parametrize(
@@ -78,3 +87,34 @@ def test_ray_execution_options_rejects_actor_pool_with_concurrency() -> None:
 def test_ray_execution_options_validation_uses_configuration_error(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(RayBackendConfigurationError, match=match):
         RayExecutionOptions(**kwargs)
+
+
+def test_ray_backend_option_resolution_rejects_execution_option_conflicts() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="execution_options"):
+        resolve_ray_backend_options(
+            execution_options=RayExecutionOptions(),
+            legacy_options={"num_cpus": 1},
+        )
+
+
+def test_ray_backend_option_resolution_allows_noop_legacy_values_with_option_objects() -> None:
+    block_planning = RayBlockPlanning(override_num_blocks=2)
+    execution_options = RayExecutionOptions(num_cpus=0.5)
+
+    resolved = resolve_ray_backend_options(
+        block_planning=block_planning,
+        execution_options=execution_options,
+        legacy_options={
+            "override_num_blocks": None,
+            "num_cpus": None,
+            "use_actor_pool": False,
+        },
+    )
+
+    assert resolved.block_planning is block_planning
+    assert resolved.execution_options is execution_options
+
+
+def test_ray_backend_option_resolution_rejects_unknown_legacy_options() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="unsupported Ray option arguments: unknown"):
+        resolve_ray_backend_options(legacy_options={"unknown": 1})
