@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from data_designer.integrations.ray._validation import validate_finite_number
 from data_designer.integrations.ray.errors import RayMetricsError
 
 ModelUsageSummary = dict[str, dict[str, Any]]
@@ -258,6 +259,12 @@ def _coerce_float(payload: Mapping[str, Any], field_name: str, *, default: float
     value = payload.get(field_name, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RayMetricsError(f"Ray observability field {field_name!r} must be numeric.")
+    validate_finite_number(
+        repr(field_name),
+        value,
+        error_type=RayMetricsError,
+        error_label="Ray observability field",
+    )
     return float(value)
 
 
@@ -335,5 +342,11 @@ def _validate_non_negative_int(field_name: str, value: int) -> None:
 def _validate_non_negative_float(field_name: str, value: float) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RayMetricsError(f"Ray observability field {field_name!r} must be numeric.")
+    validate_finite_number(
+        repr(field_name),
+        value,
+        error_type=RayMetricsError,
+        error_label="Ray observability field",
+    )
     if value < 0:
         raise RayMetricsError(f"Ray observability field {field_name!r} must be non-negative.")
