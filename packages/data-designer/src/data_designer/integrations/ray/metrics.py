@@ -7,11 +7,24 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
 
-from data_designer.integrations.ray._validation import validate_finite_number
+from data_designer.integrations.ray._telemetry_normalization import (
+    ModelUsageSummary,
+    coerce_bool_field,
+    coerce_float_field,
+    coerce_int_field,
+    coerce_model_usage,
+    coerce_optional_string_field,
+    validate_bool_field,
+    validate_failed_blocks_not_greater_than_blocks,
+    validate_non_negative_float_field,
+    validate_non_negative_int_field,
+)
 from data_designer.integrations.ray.errors import RayMetricsError
 
-ModelUsageSummary = dict[str, dict[str, Any]]
 RayWorkerMetricsPayload: TypeAlias = "RayWorkerMetrics | Mapping[str, Any]"
+_METRICS_FIELD_LABEL = "Ray metrics field"
+_METRICS_TELEMETRY_LABEL = "Ray metrics"
+_MODEL_USAGE_FIELD_LABEL = "Ray metrics field 'model_usage'"
 _DATASET_METRICS_ONLY_FIELDS = frozenset(
     {
         "all_rows_dropped_blocks",
@@ -43,19 +56,22 @@ class RayWorkerMetrics:
     def __post_init__(self) -> None:
         if self.output_rows == 0 and self.total_rows > 0:
             object.__setattr__(self, "output_rows", self.total_rows)
-        _validate_non_negative_int("total_rows", self.total_rows)
-        _validate_non_negative_int("input_rows", self.input_rows)
-        _validate_non_negative_int("output_rows", self.output_rows)
-        _validate_non_negative_int("dropped_rows", self.dropped_rows)
-        _validate_bool("all_rows_dropped", self.all_rows_dropped)
-        _validate_bool("partial_rows_dropped", self.partial_rows_dropped)
-        _validate_bool("empty_input", self.empty_input)
-        _validate_non_negative_int("blocks", self.blocks)
-        _validate_non_negative_int("failed_blocks", self.failed_blocks)
-        _validate_failed_blocks_not_greater_than_blocks(blocks=self.blocks, failed_blocks=self.failed_blocks)
-        _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
-        if self.block_id is not None and not isinstance(self.block_id, str):
-            raise RayMetricsError("Ray metrics field 'block_id' must be a string when provided.")
+        validate_non_negative_int_field("total_rows", self.total_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("input_rows", self.input_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("output_rows", self.output_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("dropped_rows", self.dropped_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_bool_field("all_rows_dropped", self.all_rows_dropped, field_label=_METRICS_FIELD_LABEL)
+        validate_bool_field("partial_rows_dropped", self.partial_rows_dropped, field_label=_METRICS_FIELD_LABEL)
+        validate_bool_field("empty_input", self.empty_input, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("blocks", self.blocks, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("failed_blocks", self.failed_blocks, field_label=_METRICS_FIELD_LABEL)
+        validate_failed_blocks_not_greater_than_blocks(
+            blocks=self.blocks,
+            failed_blocks=self.failed_blocks,
+            field_label=_METRICS_FIELD_LABEL,
+        )
+        validate_non_negative_float_field("elapsed_seconds", self.elapsed_seconds, field_label=_METRICS_FIELD_LABEL)
+        coerce_optional_string_field(self.block_id, "block_id", field_label=_METRICS_FIELD_LABEL)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -90,18 +106,34 @@ class RayDatasetMetrics:
     def __post_init__(self) -> None:
         if self.output_rows == 0 and self.total_rows > 0:
             object.__setattr__(self, "output_rows", self.total_rows)
-        _validate_non_negative_int("total_rows", self.total_rows)
-        _validate_non_negative_int("input_rows", self.input_rows)
-        _validate_non_negative_int("output_rows", self.output_rows)
-        _validate_non_negative_int("dropped_rows", self.dropped_rows)
-        _validate_non_negative_int("all_rows_dropped_blocks", self.all_rows_dropped_blocks)
-        _validate_non_negative_int("partial_rows_dropped_blocks", self.partial_rows_dropped_blocks)
-        _validate_non_negative_int("empty_input_blocks", self.empty_input_blocks)
-        _validate_non_negative_int("blocks", self.blocks)
-        _validate_non_negative_int("failed_blocks", self.failed_blocks)
-        _validate_failed_blocks_not_greater_than_blocks(blocks=self.blocks, failed_blocks=self.failed_blocks)
-        _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
-        _validate_non_negative_float("worker_elapsed_seconds", self.worker_elapsed_seconds)
+        validate_non_negative_int_field("total_rows", self.total_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("input_rows", self.input_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("output_rows", self.output_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("dropped_rows", self.dropped_rows, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field(
+            "all_rows_dropped_blocks",
+            self.all_rows_dropped_blocks,
+            field_label=_METRICS_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "partial_rows_dropped_blocks",
+            self.partial_rows_dropped_blocks,
+            field_label=_METRICS_FIELD_LABEL,
+        )
+        validate_non_negative_int_field("empty_input_blocks", self.empty_input_blocks, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("blocks", self.blocks, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_int_field("failed_blocks", self.failed_blocks, field_label=_METRICS_FIELD_LABEL)
+        validate_failed_blocks_not_greater_than_blocks(
+            blocks=self.blocks,
+            failed_blocks=self.failed_blocks,
+            field_label=_METRICS_FIELD_LABEL,
+        )
+        validate_non_negative_float_field("elapsed_seconds", self.elapsed_seconds, field_label=_METRICS_FIELD_LABEL)
+        validate_non_negative_float_field(
+            "worker_elapsed_seconds",
+            self.worker_elapsed_seconds,
+            field_label=_METRICS_FIELD_LABEL,
+        )
 
     @property
     def successful_blocks(self) -> int:
@@ -196,102 +228,36 @@ def normalize_ray_worker_metrics(payload: RayWorkerMetricsPayload) -> RayWorkerM
             f"Ray metrics payload must be a mapping or RayWorkerMetrics dataclass, got {type(payload)!r}."
         )
     _reject_dataset_metrics_mapping(payload)
+    total_rows = coerce_int_field(payload, "total_rows", default=0, field_label=_METRICS_FIELD_LABEL)
 
     return RayWorkerMetrics(
-        total_rows=_coerce_int(payload, "total_rows", default=0),
-        input_rows=_coerce_int(payload, "input_rows", default=0),
-        output_rows=_coerce_int(payload, "output_rows", default=_coerce_int(payload, "total_rows", default=0)),
-        dropped_rows=_coerce_int(payload, "dropped_rows", default=0),
-        all_rows_dropped=_coerce_bool(payload, "all_rows_dropped", default=False),
-        partial_rows_dropped=_coerce_bool(payload, "partial_rows_dropped", default=False),
-        empty_input=_coerce_bool(payload, "empty_input", default=False),
-        blocks=_coerce_int(payload, "blocks", default=1),
-        failed_blocks=_coerce_int(payload, "failed_blocks", default=0),
-        elapsed_seconds=_coerce_float(payload, "elapsed_seconds", default=0.0),
-        model_usage=_coerce_model_usage(payload.get("model_usage")),
-        block_id=_coerce_optional_str(payload.get("block_id")),
+        total_rows=total_rows,
+        input_rows=coerce_int_field(payload, "input_rows", default=0, field_label=_METRICS_FIELD_LABEL),
+        output_rows=coerce_int_field(payload, "output_rows", default=total_rows, field_label=_METRICS_FIELD_LABEL),
+        dropped_rows=coerce_int_field(payload, "dropped_rows", default=0, field_label=_METRICS_FIELD_LABEL),
+        all_rows_dropped=coerce_bool_field(
+            payload,
+            "all_rows_dropped",
+            default=False,
+            field_label=_METRICS_FIELD_LABEL,
+        ),
+        partial_rows_dropped=coerce_bool_field(
+            payload,
+            "partial_rows_dropped",
+            default=False,
+            field_label=_METRICS_FIELD_LABEL,
+        ),
+        empty_input=coerce_bool_field(payload, "empty_input", default=False, field_label=_METRICS_FIELD_LABEL),
+        blocks=coerce_int_field(payload, "blocks", default=1, field_label=_METRICS_FIELD_LABEL),
+        failed_blocks=coerce_int_field(payload, "failed_blocks", default=0, field_label=_METRICS_FIELD_LABEL),
+        elapsed_seconds=coerce_float_field(payload, "elapsed_seconds", default=0.0, field_label=_METRICS_FIELD_LABEL),
+        model_usage=coerce_model_usage(
+            payload.get("model_usage"),
+            telemetry_label=_METRICS_TELEMETRY_LABEL,
+            field_label=_MODEL_USAGE_FIELD_LABEL,
+        ),
+        block_id=coerce_optional_string_field(payload.get("block_id"), "block_id", field_label=_METRICS_FIELD_LABEL),
     )
-
-
-def _coerce_int(payload: Mapping[str, Any], field_name: str, *, default: int) -> int:
-    value = payload.get(field_name, default)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be an integer.")
-    return value
-
-
-def _coerce_float(payload: Mapping[str, Any], field_name: str, *, default: float) -> float:
-    value = payload.get(field_name, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be numeric.")
-    validate_finite_number(
-        repr(field_name),
-        value,
-        error_type=RayMetricsError,
-        error_label="Ray metrics field",
-    )
-    return float(value)
-
-
-def _coerce_bool(payload: Mapping[str, Any], field_name: str, *, default: bool) -> bool:
-    value = payload.get(field_name, default)
-    if not isinstance(value, bool):
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be a boolean.")
-    return value
-
-
-def _coerce_model_usage(value: Any) -> ModelUsageSummary | None:
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise RayMetricsError("Ray metrics field 'model_usage' must be a mapping when provided.")
-
-    model_usage: ModelUsageSummary = {}
-    for model_name, stats in value.items():
-        if not isinstance(model_name, str):
-            raise RayMetricsError("Ray metrics model usage keys must be strings.")
-        if not isinstance(stats, Mapping):
-            raise RayMetricsError(f"Ray metrics model usage for {model_name!r} must be a mapping.")
-        model_usage[model_name] = dict(stats)
-    return model_usage
-
-
-def _coerce_optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise RayMetricsError("Ray metrics field 'block_id' must be a string when provided.")
-    return value
-
-
-def _validate_non_negative_int(field_name: str, value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be an integer.")
-    if value < 0:
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be non-negative.")
-
-
-def _validate_non_negative_float(field_name: str, value: float) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be numeric.")
-    validate_finite_number(
-        repr(field_name),
-        value,
-        error_type=RayMetricsError,
-        error_label="Ray metrics field",
-    )
-    if value < 0:
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be non-negative.")
-
-
-def _validate_bool(field_name: str, value: bool) -> None:
-    if not isinstance(value, bool):
-        raise RayMetricsError(f"Ray metrics field {field_name!r} must be a boolean.")
-
-
-def _validate_failed_blocks_not_greater_than_blocks(*, blocks: int, failed_blocks: int) -> None:
-    if failed_blocks > blocks:
-        raise RayMetricsError("Ray metrics field 'failed_blocks' cannot be greater than 'blocks'.")
 
 
 def _reject_dataset_metrics_mapping(payload: Mapping[str, Any]) -> None:

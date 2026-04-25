@@ -10,13 +10,27 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from data_designer.integrations.ray._validation import validate_finite_number
+from data_designer.integrations.ray._telemetry_normalization import (
+    ModelUsageSummary,
+    coerce_float_field,
+    coerce_int_field,
+    coerce_model_usage,
+    coerce_optional_int_field,
+    coerce_optional_string_field,
+    coerce_string_field,
+    validate_failed_blocks_not_greater_than_blocks,
+    validate_non_empty_string_field,
+    validate_non_negative_float_field,
+    validate_non_negative_int_field,
+)
 from data_designer.integrations.ray.errors import RayMetricsError
 
-ModelUsageSummary = dict[str, dict[str, Any]]
 RayTraceEventPayload: TypeAlias = "RayTraceEvent | Mapping[str, Any]"
 RayWorkerProfilePayload: TypeAlias = "RayWorkerProfile | Mapping[str, Any]"
 RayThrottleSnapshotPayload: TypeAlias = "RayThrottleSnapshot | Mapping[str, Any]"
+_OBSERVABILITY_FIELD_LABEL = "Ray observability field"
+_OBSERVABILITY_TELEMETRY_LABEL = "Ray observability"
+_MODEL_USAGE_FIELD_LABEL = "Ray observability model_usage"
 _RAY_REPORT_SECTION_ALIASES = {
     "overview": "summary",
     "summary": "summary",
@@ -46,13 +60,21 @@ class RayTraceEvent:
     details: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        _validate_non_empty_str("block_id", self.block_id)
-        _validate_non_empty_str("event_type", self.event_type)
-        _validate_non_negative_float("timestamp_seconds", self.timestamp_seconds)
-        _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
-        _validate_non_negative_int("row_count", self.row_count)
+        validate_non_empty_string_field("block_id", self.block_id, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_empty_string_field("event_type", self.event_type, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_float_field(
+            "timestamp_seconds",
+            self.timestamp_seconds,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_float_field(
+            "elapsed_seconds",
+            self.elapsed_seconds,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field("row_count", self.row_count, field_label=_OBSERVABILITY_FIELD_LABEL)
         if self.worker_pid is not None:
-            _validate_non_negative_int("worker_pid", self.worker_pid)
+            validate_non_negative_int_field("worker_pid", self.worker_pid, field_label=_OBSERVABILITY_FIELD_LABEL)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -74,16 +96,28 @@ class RayWorkerProfile:
     warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        _validate_non_empty_str("block_id", self.block_id)
-        _validate_non_negative_int("total_rows", self.total_rows)
+        validate_non_empty_string_field("block_id", self.block_id, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_int_field("total_rows", self.total_rows, field_label=_OBSERVABILITY_FIELD_LABEL)
         if self.memory_usage_bytes is not None:
-            _validate_non_negative_int("memory_usage_bytes", self.memory_usage_bytes)
+            validate_non_negative_int_field(
+                "memory_usage_bytes",
+                self.memory_usage_bytes,
+                field_label=_OBSERVABILITY_FIELD_LABEL,
+            )
         for column in self.columns:
-            _validate_non_empty_str("columns item", column)
+            validate_non_empty_string_field("columns item", column, field_label=_OBSERVABILITY_FIELD_LABEL)
         for field_name, counts in (("non_null_counts", self.non_null_counts), ("null_counts", self.null_counts)):
             for column_name, value in counts.items():
-                _validate_non_empty_str(f"{field_name} key", column_name)
-                _validate_non_negative_int(f"{field_name}[{column_name!r}]", value)
+                validate_non_empty_string_field(
+                    f"{field_name} key",
+                    column_name,
+                    field_label=_OBSERVABILITY_FIELD_LABEL,
+                )
+                validate_non_negative_int_field(
+                    f"{field_name}[{column_name!r}]",
+                    value,
+                    field_label=_OBSERVABILITY_FIELD_LABEL,
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -105,16 +139,28 @@ class RayThrottleSnapshot:
     consecutive_rate_limits: int = 0
 
     def __post_init__(self) -> None:
-        _validate_non_empty_str("provider_name", self.provider_name)
-        _validate_non_empty_str("model_id", self.model_id)
-        _validate_non_empty_str("domain", self.domain)
-        _validate_non_negative_int("current_limit", self.current_limit)
+        validate_non_empty_string_field("provider_name", self.provider_name, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_empty_string_field("model_id", self.model_id, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_empty_string_field("domain", self.domain, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_int_field("current_limit", self.current_limit, field_label=_OBSERVABILITY_FIELD_LABEL)
         if self.effective_max is not None:
-            _validate_non_negative_int("effective_max", self.effective_max)
-        _validate_non_negative_int("in_flight", self.in_flight)
-        _validate_non_negative_int("waiters", self.waiters)
-        _validate_non_negative_int("rate_limit_ceiling", self.rate_limit_ceiling)
-        _validate_non_negative_int("consecutive_rate_limits", self.consecutive_rate_limits)
+            validate_non_negative_int_field(
+                "effective_max",
+                self.effective_max,
+                field_label=_OBSERVABILITY_FIELD_LABEL,
+            )
+        validate_non_negative_int_field("in_flight", self.in_flight, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_int_field("waiters", self.waiters, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_int_field(
+            "rate_limit_ceiling",
+            self.rate_limit_ceiling,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "consecutive_rate_limits",
+            self.consecutive_rate_limits,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -134,11 +180,19 @@ class RayDatasetAnalysis:
     throttle_snapshots: list[RayThrottleSnapshot] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        _validate_non_negative_int("total_rows", self.total_rows)
-        _validate_non_negative_int("blocks", self.blocks)
-        _validate_non_negative_int("failed_blocks", self.failed_blocks)
-        _validate_failed_blocks_not_greater_than_blocks(blocks=self.blocks, failed_blocks=self.failed_blocks)
-        _validate_non_negative_int("trace_events_dropped", self.trace_events_dropped)
+        validate_non_negative_int_field("total_rows", self.total_rows, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_int_field("blocks", self.blocks, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_non_negative_int_field("failed_blocks", self.failed_blocks, field_label=_OBSERVABILITY_FIELD_LABEL)
+        validate_failed_blocks_not_greater_than_blocks(
+            blocks=self.blocks,
+            failed_blocks=self.failed_blocks,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
+        validate_non_negative_int_field(
+            "trace_events_dropped",
+            self.trace_events_dropped,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        )
 
     @property
     def successful_blocks(self) -> int:
@@ -203,15 +257,41 @@ def normalize_ray_trace_event(payload: RayTraceEventPayload) -> RayTraceEvent:
     if not isinstance(payload, Mapping):
         raise RayMetricsError(f"Ray trace event payload must be a mapping, got {type(payload)!r}.")
     return RayTraceEvent(
-        block_id=_coerce_str(payload, "block_id"),
-        event_type=_coerce_str(payload, "event_type"),
-        timestamp_seconds=_coerce_float(payload, "timestamp_seconds", default=0.0),
-        elapsed_seconds=_coerce_float(payload, "elapsed_seconds", default=0.0),
-        row_count=_coerce_int(payload, "row_count", default=0),
-        worker_hostname=_coerce_optional_str(payload.get("worker_hostname")),
-        worker_pid=_coerce_optional_int(payload.get("worker_pid"), "worker_pid"),
-        ray_task_id=_coerce_optional_str(payload.get("ray_task_id")),
-        ray_node_id=_coerce_optional_str(payload.get("ray_node_id")),
+        block_id=coerce_string_field(payload, "block_id", field_label=_OBSERVABILITY_FIELD_LABEL),
+        event_type=coerce_string_field(payload, "event_type", field_label=_OBSERVABILITY_FIELD_LABEL),
+        timestamp_seconds=coerce_float_field(
+            payload,
+            "timestamp_seconds",
+            default=0.0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        elapsed_seconds=coerce_float_field(
+            payload,
+            "elapsed_seconds",
+            default=0.0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        row_count=coerce_int_field(payload, "row_count", default=0, field_label=_OBSERVABILITY_FIELD_LABEL),
+        worker_hostname=coerce_optional_string_field(
+            payload.get("worker_hostname"),
+            "worker_hostname",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        worker_pid=coerce_optional_int_field(
+            payload.get("worker_pid"),
+            "worker_pid",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        ray_task_id=coerce_optional_string_field(
+            payload.get("ray_task_id"),
+            "ray_task_id",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        ray_node_id=coerce_optional_string_field(
+            payload.get("ray_node_id"),
+            "ray_node_id",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
         details=_coerce_optional_mapping(payload.get("details")),
     )
 
@@ -223,14 +303,22 @@ def normalize_ray_worker_profile(payload: RayWorkerProfilePayload) -> RayWorkerP
     if not isinstance(payload, Mapping):
         raise RayMetricsError(f"Ray worker profile payload must be a mapping, got {type(payload)!r}.")
     return RayWorkerProfile(
-        block_id=_coerce_str(payload, "block_id"),
-        total_rows=_coerce_int(payload, "total_rows", default=0),
+        block_id=coerce_string_field(payload, "block_id", field_label=_OBSERVABILITY_FIELD_LABEL),
+        total_rows=coerce_int_field(payload, "total_rows", default=0, field_label=_OBSERVABILITY_FIELD_LABEL),
         columns=_coerce_str_list(payload.get("columns")),
         column_dtypes=_coerce_str_mapping(payload.get("column_dtypes")),
         non_null_counts=_coerce_int_mapping(payload.get("non_null_counts")),
         null_counts=_coerce_int_mapping(payload.get("null_counts")),
-        memory_usage_bytes=_coerce_optional_int(payload.get("memory_usage_bytes"), "memory_usage_bytes"),
-        model_usage=_coerce_model_usage(payload.get("model_usage")),
+        memory_usage_bytes=coerce_optional_int_field(
+            payload.get("memory_usage_bytes"),
+            "memory_usage_bytes",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        model_usage=coerce_model_usage(
+            payload.get("model_usage"),
+            telemetry_label=_OBSERVABILITY_TELEMETRY_LABEL,
+            field_label=_MODEL_USAGE_FIELD_LABEL,
+        ),
         warnings=_coerce_str_list(payload.get("warnings")),
     )
 
@@ -242,15 +330,34 @@ def normalize_ray_throttle_snapshot(payload: RayThrottleSnapshotPayload) -> RayT
     if not isinstance(payload, Mapping):
         raise RayMetricsError(f"Ray throttle snapshot payload must be a mapping, got {type(payload)!r}.")
     return RayThrottleSnapshot(
-        provider_name=_coerce_str(payload, "provider_name"),
-        model_id=_coerce_str(payload, "model_id"),
-        domain=_coerce_str(payload, "domain"),
-        current_limit=_coerce_int(payload, "current_limit", default=0),
-        effective_max=_coerce_optional_int(payload.get("effective_max"), "effective_max"),
-        in_flight=_coerce_int(payload, "in_flight", default=0),
-        waiters=_coerce_int(payload, "waiters", default=0),
-        rate_limit_ceiling=_coerce_int(payload, "rate_limit_ceiling", default=0),
-        consecutive_rate_limits=_coerce_int(payload, "consecutive_rate_limits", default=0),
+        provider_name=coerce_string_field(payload, "provider_name", field_label=_OBSERVABILITY_FIELD_LABEL),
+        model_id=coerce_string_field(payload, "model_id", field_label=_OBSERVABILITY_FIELD_LABEL),
+        domain=coerce_string_field(payload, "domain", field_label=_OBSERVABILITY_FIELD_LABEL),
+        current_limit=coerce_int_field(
+            payload,
+            "current_limit",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        effective_max=coerce_optional_int_field(
+            payload.get("effective_max"),
+            "effective_max",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        in_flight=coerce_int_field(payload, "in_flight", default=0, field_label=_OBSERVABILITY_FIELD_LABEL),
+        waiters=coerce_int_field(payload, "waiters", default=0, field_label=_OBSERVABILITY_FIELD_LABEL),
+        rate_limit_ceiling=coerce_int_field(
+            payload,
+            "rate_limit_ceiling",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        consecutive_rate_limits=coerce_int_field(
+            payload,
+            "consecutive_rate_limits",
+            default=0,
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
     )
 
 
@@ -288,49 +395,6 @@ def _section_name(section: Any) -> str:
     if not isinstance(value, str):
         raise RayMetricsError("RayDatasetAnalysis.to_report include_sections values must be strings or enums.")
     return value.lower()
-
-
-def _coerce_str(payload: Mapping[str, Any], field_name: str) -> str:
-    value = payload.get(field_name)
-    if not isinstance(value, str):
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be a string.")
-    return value
-
-
-def _coerce_optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise RayMetricsError("Ray observability optional string fields must be strings when provided.")
-    return value
-
-
-def _coerce_int(payload: Mapping[str, Any], field_name: str, *, default: int) -> int:
-    value = payload.get(field_name, default)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be an integer.")
-    return value
-
-
-def _coerce_optional_int(value: Any, field_name: str) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be an integer when provided.")
-    return value
-
-
-def _coerce_float(payload: Mapping[str, Any], field_name: str, *, default: float) -> float:
-    value = payload.get(field_name, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be numeric.")
-    validate_finite_number(
-        repr(field_name),
-        value,
-        error_type=RayMetricsError,
-        error_label="Ray observability field",
-    )
-    return float(value)
 
 
 def _coerce_str_list(value: Any) -> list[str]:
@@ -375,48 +439,3 @@ def _coerce_optional_mapping(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         raise RayMetricsError("Ray observability details must be a mapping when provided.")
     return dict(value)
-
-
-def _coerce_model_usage(value: Any) -> ModelUsageSummary | None:
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise RayMetricsError("Ray observability model_usage must be a mapping when provided.")
-    model_usage: ModelUsageSummary = {}
-    for model_name, stats in value.items():
-        if not isinstance(model_name, str):
-            raise RayMetricsError("Ray observability model usage keys must be strings.")
-        if not isinstance(stats, Mapping):
-            raise RayMetricsError(f"Ray observability model usage for {model_name!r} must be a mapping.")
-        model_usage[model_name] = dict(stats)
-    return model_usage
-
-
-def _validate_non_empty_str(field_name: str, value: str) -> None:
-    if not isinstance(value, str) or value == "":
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be a non-empty string.")
-
-
-def _validate_non_negative_int(field_name: str, value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be an integer.")
-    if value < 0:
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be non-negative.")
-
-
-def _validate_non_negative_float(field_name: str, value: float) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be numeric.")
-    validate_finite_number(
-        repr(field_name),
-        value,
-        error_type=RayMetricsError,
-        error_label="Ray observability field",
-    )
-    if value < 0:
-        raise RayMetricsError(f"Ray observability field {field_name!r} must be non-negative.")
-
-
-def _validate_failed_blocks_not_greater_than_blocks(*, blocks: int, failed_blocks: int) -> None:
-    if failed_blocks > blocks:
-        raise RayMetricsError("Ray observability field 'failed_blocks' cannot be greater than 'blocks'.")
