@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -231,6 +232,240 @@ class RayExecutionOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class RayExecutionResources:
+    """Typed Ray Data execution resource controls for DataContext options."""
+
+    cpu: float | None = None
+    gpu: float | None = None
+    object_store_memory: float | None = None
+    memory: float | None = None
+
+    def __post_init__(self) -> None:
+        _validate_optional_non_negative_number("cpu", self.cpu)
+        _validate_optional_non_negative_number("gpu", self.gpu)
+        _validate_optional_non_negative_number("object_store_memory", self.object_store_memory)
+        _validate_optional_non_negative_number("memory", self.memory)
+
+    @property
+    def has_explicit_controls(self) -> bool:
+        """Return whether at least one resource quantity was configured."""
+        return any(
+            value is not None
+            for value in (
+                self.cpu,
+                self.gpu,
+                self.object_store_memory,
+                self.memory,
+            )
+        )
+
+    def to_execution_resources(self, ray: Any, *, for_limits: bool) -> Any:
+        """Create Ray Data ``ExecutionResources`` from this typed config."""
+        execution_resources = getattr(ray.data, "ExecutionResources", None)
+        if not callable(execution_resources):
+            raise RayBackendConfigurationError(
+                "RayDataContextOptions resource controls require ray.data.ExecutionResources."
+            )
+        kwargs = self.to_kwargs()
+        try:
+            if for_limits:
+                for_limits_factory = getattr(execution_resources, "for_limits", None)
+                if callable(for_limits_factory):
+                    return for_limits_factory(**kwargs)
+            return execution_resources(**kwargs)
+        except Exception as exc:
+            raise RayBackendConfigurationError(
+                "RayBackend failed to create Ray Data execution resources from RayDataContextOptions."
+            ) from exc
+
+    def to_kwargs(self) -> dict[str, float]:
+        """Return non-None resource keyword arguments."""
+        kwargs: dict[str, float] = {}
+        _set_if_not_none(kwargs, "cpu", self.cpu)
+        _set_if_not_none(kwargs, "gpu", self.gpu)
+        _set_if_not_none(kwargs, "object_store_memory", self.object_store_memory)
+        _set_if_not_none(kwargs, "memory", self.memory)
+        return kwargs
+
+
+@dataclass(frozen=True, slots=True)
+class RayDataCheckpointConfig:
+    """Typed subset of Ray Data job-level checkpoint configuration."""
+
+    id_column: str | None = None
+    checkpoint_path: str | None = None
+    delete_checkpoint_on_success: bool = True
+    filter_num_threads: int = 3
+    write_num_threads: int = 3
+
+    def __post_init__(self) -> None:
+        _validate_optional_non_empty_string("id_column", self.id_column)
+        _validate_optional_non_empty_string("checkpoint_path", self.checkpoint_path)
+        _validate_bool("delete_checkpoint_on_success", self.delete_checkpoint_on_success)
+        _validate_positive_int("filter_num_threads", self.filter_num_threads)
+        _validate_positive_int("write_num_threads", self.write_num_threads)
+
+    def to_context_value(self) -> dict[str, Any]:
+        """Return a value accepted by ``DataContext.checkpoint_config``."""
+        value: dict[str, Any] = {
+            "delete_checkpoint_on_success": self.delete_checkpoint_on_success,
+            "filter_num_threads": self.filter_num_threads,
+            "write_num_threads": self.write_num_threads,
+        }
+        _set_if_not_none(value, "id_column", self.id_column)
+        _set_if_not_none(value, "checkpoint_path", self.checkpoint_path)
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class RayDataContextOptions:
+    """Validated Ray DataContext and ExecutionOptions controls.
+
+    These options apply to Ray Datasets created by RayBackend while planning a
+    job. Ray seals DataContext values into each Dataset when it is created, so
+    existing ``ray.data.Dataset`` inputs must be created with their desired
+    DataContext before they are passed to DataDesigner.
+    """
+
+    resource_limits: RayExecutionResources | None = None
+    exclude_resources: RayExecutionResources | None = None
+    preserve_execution_order: bool | None = None
+    actor_locality_enabled: bool | None = None
+    verbose_progress: bool | None = None
+    verbose_stats_logs: bool | None = None
+    enable_progress_bars: bool | None = None
+    enable_operator_progress_bars: bool | None = None
+    log_internal_stack_trace_to_stdout: bool | None = None
+    raise_original_map_exception: bool | None = None
+    max_errored_blocks: int | None = None
+    checkpoint_config: RayDataCheckpointConfig | None = None
+
+    def __post_init__(self) -> None:
+        _validate_optional_resource_controls("resource_limits", self.resource_limits)
+        _validate_optional_resource_controls("exclude_resources", self.exclude_resources)
+        _validate_non_overlapping_resources(self.resource_limits, self.exclude_resources)
+        _validate_optional_bool("preserve_execution_order", self.preserve_execution_order)
+        _validate_optional_bool("actor_locality_enabled", self.actor_locality_enabled)
+        _validate_optional_bool("verbose_progress", self.verbose_progress)
+        _validate_optional_bool("verbose_stats_logs", self.verbose_stats_logs)
+        _validate_optional_bool("enable_progress_bars", self.enable_progress_bars)
+        _validate_optional_bool("enable_operator_progress_bars", self.enable_operator_progress_bars)
+        _validate_optional_bool("log_internal_stack_trace_to_stdout", self.log_internal_stack_trace_to_stdout)
+        _validate_optional_bool("raise_original_map_exception", self.raise_original_map_exception)
+        if self.max_errored_blocks is not None and (
+            isinstance(self.max_errored_blocks, bool) or not isinstance(self.max_errored_blocks, int)
+        ):
+            raise RayBackendConfigurationError("RayDataContextOptions max_errored_blocks must be an integer.")
+        if self.checkpoint_config is not None and not isinstance(self.checkpoint_config, RayDataCheckpointConfig):
+            raise RayBackendConfigurationError(
+                "RayDataContextOptions checkpoint_config must be a RayDataCheckpointConfig instance."
+            )
+
+    @property
+    def has_explicit_controls(self) -> bool:
+        """Return whether any DataContext value should be applied."""
+        return any(
+            value is not None
+            for value in (
+                self.resource_limits,
+                self.exclude_resources,
+                self.preserve_execution_order,
+                self.actor_locality_enabled,
+                self.verbose_progress,
+                self.verbose_stats_logs,
+                self.enable_progress_bars,
+                self.enable_operator_progress_bars,
+                self.log_internal_stack_trace_to_stdout,
+                self.raise_original_map_exception,
+                self.max_errored_blocks,
+                self.checkpoint_config,
+            )
+        )
+
+    def apply_to_context(self, ray: Any, context: Any) -> None:
+        """Apply configured controls to a copied Ray DataContext."""
+        execution_options = getattr(context, "execution_options", None)
+        if self._has_execution_option_controls and execution_options is None:
+            raise RayBackendConfigurationError("RayDataContextOptions require DataContext.execution_options.")
+        if self.resource_limits is not None and self.resource_limits.has_explicit_controls:
+            execution_options.resource_limits = self.resource_limits.to_execution_resources(ray, for_limits=True)
+        if self.exclude_resources is not None and self.exclude_resources.has_explicit_controls:
+            execution_options.exclude_resources = self.exclude_resources.to_execution_resources(ray, for_limits=False)
+        _set_object_attribute(
+            execution_options,
+            "preserve_order",
+            self.preserve_execution_order,
+            owner_label="Ray Data ExecutionOptions",
+        )
+        _set_object_attribute(
+            execution_options,
+            "actor_locality_enabled",
+            self.actor_locality_enabled,
+            owner_label="Ray Data ExecutionOptions",
+        )
+        _set_object_attribute(
+            execution_options,
+            "verbose_progress",
+            self.verbose_progress,
+            owner_label="Ray Data ExecutionOptions",
+        )
+        validate = getattr(execution_options, "validate", None)
+        if callable(validate):
+            try:
+                validate()
+            except Exception as exc:
+                raise RayBackendConfigurationError(
+                    "RayDataContextOptions produced invalid Ray Data ExecutionOptions."
+                ) from exc
+
+        _set_object_attribute(context, "verbose_stats_logs", self.verbose_stats_logs, owner_label="Ray DataContext")
+        _set_object_attribute(context, "enable_progress_bars", self.enable_progress_bars, owner_label="Ray DataContext")
+        _set_object_attribute(
+            context,
+            "enable_operator_progress_bars",
+            self.enable_operator_progress_bars,
+            owner_label="Ray DataContext",
+        )
+        _set_object_attribute(
+            context,
+            "log_internal_stack_trace_to_stdout",
+            self.log_internal_stack_trace_to_stdout,
+            owner_label="Ray DataContext",
+        )
+        _set_object_attribute(
+            context,
+            "raise_original_map_exception",
+            self.raise_original_map_exception,
+            owner_label="Ray DataContext",
+        )
+        _set_object_attribute(context, "max_errored_blocks", self.max_errored_blocks, owner_label="Ray DataContext")
+        if self.checkpoint_config is not None:
+            if not hasattr(context, "checkpoint_config"):
+                raise RayBackendConfigurationError(
+                    "RayDataContextOptions checkpoint_config requires DataContext.checkpoint_config."
+                )
+            try:
+                context.checkpoint_config = self.checkpoint_config.to_context_value()
+            except Exception as exc:
+                raise RayBackendConfigurationError(
+                    "RayBackend failed to configure Ray Data checkpointing from RayDataContextOptions."
+                ) from exc
+
+    @property
+    def _has_execution_option_controls(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.resource_limits,
+                self.exclude_resources,
+                self.preserve_execution_order,
+                self.actor_locality_enabled,
+                self.verbose_progress,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RayInputRepartition:
     """Controls for Ray Data repartitioning of an existing input dataset."""
 
@@ -274,6 +509,7 @@ class RayBackendOptionResolution:
     block_planning: RayBlockPlanning
     execution_options: RayExecutionOptions
     input_repartition: RayInputRepartition
+    data_context_options: RayDataContextOptions
 
 
 def resolve_ray_backend_options(
@@ -281,6 +517,7 @@ def resolve_ray_backend_options(
     block_planning: RayBlockPlanning | None = None,
     execution_options: RayExecutionOptions | None = None,
     input_repartition: RayInputRepartition | None = None,
+    data_context_options: RayDataContextOptions | None = None,
     legacy_options: Mapping[str, Any] | None = None,
 ) -> RayBackendOptionResolution:
     """Resolve RayBackend planning and execution option objects.
@@ -320,7 +557,28 @@ def resolve_ray_backend_options(
         block_planning=_resolve_ray_block_planning(block_planning, block_planning_kwargs),
         execution_options=_resolve_ray_execution_options(execution_options, execution_options_kwargs),
         input_repartition=_resolve_ray_input_repartition(input_repartition),
+        data_context_options=_resolve_ray_data_context_options(data_context_options),
     )
+
+
+def create_ray_data_context(ray: Any, options: RayDataContextOptions) -> Any | None:
+    """Return a copied Ray DataContext with backend options applied."""
+    if not options.has_explicit_controls:
+        return None
+    data_context_cls = getattr(ray.data, "DataContext", None)
+    get_current = getattr(data_context_cls, "get_current", None)
+    if not callable(get_current):
+        raise RayBackendConfigurationError("RayDataContextOptions require ray.data.DataContext.get_current().")
+    try:
+        current_context = get_current()
+        copy_context = getattr(current_context, "copy", None)
+        data_context = copy_context() if callable(copy_context) else copy.deepcopy(current_context)
+        options.apply_to_context(ray, data_context)
+    except RayBackendConfigurationError:
+        raise
+    except Exception as exc:
+        raise RayBackendConfigurationError("RayBackend failed to configure Ray DataContext options.") from exc
+    return data_context
 
 
 def _pop_legacy_options(source: dict[str, Any], option_names: frozenset[str]) -> dict[str, Any]:
@@ -385,6 +643,14 @@ def _resolve_ray_input_repartition(input_repartition: RayInputRepartition | None
     return input_repartition
 
 
+def _resolve_ray_data_context_options(data_context_options: RayDataContextOptions | None) -> RayDataContextOptions:
+    if data_context_options is None:
+        return RayDataContextOptions()
+    if not isinstance(data_context_options, RayDataContextOptions):
+        raise RayBackendConfigurationError("RayBackend data_context_options must be a RayDataContextOptions instance.")
+    return data_context_options
+
+
 def _has_effective_execution_legacy_options(legacy_options: Mapping[str, Any]) -> bool:
     for name, value in legacy_options.items():
         if name == "use_actor_pool":
@@ -399,6 +665,10 @@ def _has_effective_execution_legacy_options(legacy_options: Mapping[str, Any]) -
 def _validate_optional_positive_int(field_name: str, value: int | None) -> None:
     if value is None:
         return
+    _validate_positive_int(field_name, value)
+
+
+def _validate_positive_int(field_name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise RayBackendConfigurationError(f"Ray option {field_name} must be a positive integer.")
 
@@ -421,6 +691,50 @@ def _validate_optional_positive_number(field_name: str, value: float | None) -> 
     validate_finite_number(field_name, value, error_type=RayBackendConfigurationError, error_label="Ray option")
     if value <= 0:
         raise RayBackendConfigurationError(f"Ray option {field_name} must be a positive number.")
+
+
+def _validate_optional_bool(field_name: str, value: bool | None) -> None:
+    if value is not None:
+        _validate_bool(field_name, value)
+
+
+def _validate_bool(field_name: str, value: bool) -> None:
+    if not isinstance(value, bool):
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a boolean.")
+
+
+def _validate_optional_non_empty_string(field_name: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value:
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a non-empty string.")
+
+
+def _validate_optional_resource_controls(
+    field_name: str,
+    value: RayExecutionResources | None,
+) -> None:
+    if value is not None and not isinstance(value, RayExecutionResources):
+        raise RayBackendConfigurationError(f"RayDataContextOptions {field_name} must be a RayExecutionResources.")
+
+
+def _validate_non_overlapping_resources(
+    resource_limits: RayExecutionResources | None,
+    exclude_resources: RayExecutionResources | None,
+) -> None:
+    if resource_limits is None or exclude_resources is None:
+        return
+    overlapping_fields = [
+        field_name
+        for field_name in ("cpu", "gpu", "object_store_memory", "memory")
+        if getattr(resource_limits, field_name) is not None and getattr(exclude_resources, field_name) is not None
+    ]
+    if overlapping_fields:
+        field_list = ", ".join(overlapping_fields)
+        raise RayBackendConfigurationError(
+            "RayDataContextOptions resource_limits and exclude_resources cannot both set "
+            f"the same resource(s): {field_list}."
+        )
 
 
 def _validate_resources(resources: Mapping[str, float] | None) -> None:
@@ -500,3 +814,14 @@ def _create_actor_pool_strategy(ray: Any, options: RayExecutionOptions) -> Any:
 def _set_if_not_none(target: dict[str, Any], key: str, value: Any | None) -> None:
     if value is not None:
         target[key] = value
+
+
+def _set_object_attribute(target: Any, name: str, value: Any | None, *, owner_label: str) -> None:
+    if value is None:
+        return
+    if not hasattr(target, name):
+        raise RayBackendConfigurationError(f"{owner_label} does not support option {name!r}.")
+    try:
+        setattr(target, name, value)
+    except Exception as exc:
+        raise RayBackendConfigurationError(f"RayBackend failed to set {owner_label} option {name!r}.") from exc

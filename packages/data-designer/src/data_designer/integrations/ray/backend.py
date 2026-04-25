@@ -28,8 +28,10 @@ from data_designer.integrations.ray.observability_collection import (
 )
 from data_designer.integrations.ray.options import (
     RayBlockPlanning,
+    RayDataContextOptions,
     RayExecutionOptions,
     RayInputRepartition,
+    create_ray_data_context,
     resolve_ray_backend_options,
 )
 from data_designer.integrations.ray.processor_policy import (
@@ -231,8 +233,10 @@ class RayBackend:
     do not require the optional dependency. input_dataset may be a Ray Dataset
     or a sequence of ObjectRefs containing Arrow tables or pandas DataFrames.
 
-    Prefer ``block_planning=RayBlockPlanning(...)`` and
-    ``execution_options=RayExecutionOptions(...)`` for Ray-specific controls.
+    Prefer ``block_planning=RayBlockPlanning(...)``,
+    ``execution_options=RayExecutionOptions(...)``, and
+    ``data_context_options=RayDataContextOptions(...)`` for Ray-specific
+    controls.
     Individual Ray planning and execution kwargs are still accepted as
     backwards-compatible shims.
 
@@ -254,6 +258,7 @@ class RayBackend:
         block_planning: RayBlockPlanning | None = None,
         execution_options: RayExecutionOptions | None = None,
         input_repartition: RayInputRepartition | None = None,
+        data_context_options: RayDataContextOptions | None = None,
         preflight_model_health_check: bool = True,
         worker_model_health_checks: bool = False,
         order_column: str | None = None,
@@ -283,11 +288,13 @@ class RayBackend:
             block_planning=block_planning,
             execution_options=execution_options,
             input_repartition=input_repartition,
+            data_context_options=data_context_options,
             legacy_options=legacy_options,
         )
         self.block_planning = resolved_options.block_planning
         self.execution_options = resolved_options.execution_options
         self.input_repartition = resolved_options.input_repartition
+        self.data_context_options = resolved_options.data_context_options
         self.batch_size = batch_size
         self.output = output
         self.object_ref_format = object_ref_format
@@ -328,6 +335,36 @@ class RayBackend:
                 )
             ray.init()
 
+        data_context = create_ray_data_context(ray, self.data_context_options)
+        if data_context is None:
+            return self._create_with_ray_context(
+                ray=ray,
+                runtime_context=runtime_context,
+                config_builder=config_builder,
+                num_records=num_records,
+                start_time=start_time,
+                input_dataset=input_dataset,
+            )
+        with _ray_data_context_scope(ray, data_context):
+            return self._create_with_ray_context(
+                ray=ray,
+                runtime_context=runtime_context,
+                config_builder=config_builder,
+                num_records=num_records,
+                start_time=start_time,
+                input_dataset=input_dataset,
+            )
+
+    def _create_with_ray_context(
+        self,
+        *,
+        ray: Any,
+        runtime_context: BackendRuntimeContext,
+        config_builder: DataDesignerConfigBuilder,
+        num_records: int,
+        start_time: float,
+        input_dataset: Any | None,
+    ) -> RayDatasetCreationResults:
         plan = RayDriverPlanner(backend=self, ray=ray).plan(
             runtime_context=runtime_context,
             config_builder=config_builder,
@@ -426,6 +463,17 @@ class RayDriverPlanner:
         if use_input_dataset and seed_config is not None:
             raise RayBackendConfigurationError(
                 "RayBackend input_dataset is used as the seed dataset; remove the existing seed config."
+            )
+        if (
+            use_input_dataset
+            and hasattr(input_dataset, "map_batches")
+            and self._backend.data_context_options.has_explicit_controls
+        ):
+            raise RayBackendConfigurationError(
+                "RayBackend data_context_options apply only to Ray Datasets created by RayBackend. "
+                "Ray seals DataContext into an existing ray.data.Dataset when it is created; configure "
+                "Ray DataContext before creating input_dataset, or pass ObjectRefs so RayBackend can create "
+                "the Ray Dataset."
             )
         if use_input_dataset and self._backend.block_planning.has_explicit_controls:
             raise RayBackendConfigurationError(
@@ -587,6 +635,19 @@ def _initial_dataset_source_kind(input_dataset: Any | None) -> RayDatasetSourceK
     if hasattr(input_dataset, "map_batches"):
         return "input_dataset"
     return "object_refs"
+
+
+def _ray_data_context_scope(ray: Any, data_context: Any) -> Any:
+    data_context_cls = getattr(ray.data, "DataContext", None)
+    current = getattr(data_context_cls, "current", None)
+    if not callable(current):
+        raise RayBackendConfigurationError("RayDataContextOptions require ray.data.DataContext.current().")
+    try:
+        return current(data_context)
+    except RayBackendConfigurationError:
+        raise
+    except Exception as exc:
+        raise RayBackendConfigurationError("RayBackend failed to activate Ray DataContext options.") from exc
 
 
 def _repartition_input_dataset(dataset: Any, input_repartition: RayInputRepartition) -> Any:

@@ -10,7 +10,10 @@ import pytest
 from data_designer.integrations.ray import (
     RayBackendConfigurationError,
     RayBlockPlanning,
+    RayDataCheckpointConfig,
+    RayDataContextOptions,
     RayExecutionOptions,
+    RayExecutionResources,
     RayInputRepartition,
 )
 from data_designer.integrations.ray.options import resolve_ray_backend_options
@@ -94,6 +97,66 @@ def test_ray_execution_options_validation_uses_configuration_error(kwargs: dict[
         RayExecutionOptions(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"resource_limits": object()}, "resource_limits"),
+        (
+            {
+                "resource_limits": RayExecutionResources(cpu=1),
+                "exclude_resources": RayExecutionResources(cpu=0.5),
+            },
+            "cannot both set",
+        ),
+        ({"preserve_execution_order": "yes"}, "preserve_execution_order"),
+        ({"max_errored_blocks": 1.5}, "max_errored_blocks"),
+        ({"checkpoint_config": object()}, "checkpoint_config"),
+    ],
+)
+def test_ray_data_context_options_validation_uses_configuration_error(
+    kwargs: dict[str, Any],
+    match: str,
+) -> None:
+    with pytest.raises(RayBackendConfigurationError, match=match):
+        RayDataContextOptions(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("factory", "match"),
+    [
+        (lambda: RayExecutionResources(cpu=True), "cpu"),
+        (lambda: RayExecutionResources(memory=-1), "memory"),
+        (lambda: RayDataCheckpointConfig(id_column=""), "id_column"),
+        (lambda: RayDataCheckpointConfig(checkpoint_path=""), "checkpoint_path"),
+        (lambda: RayDataCheckpointConfig(delete_checkpoint_on_success="no"), "delete_checkpoint_on_success"),
+        (lambda: RayDataCheckpointConfig(filter_num_threads=None), "filter_num_threads"),
+        (lambda: RayDataCheckpointConfig(filter_num_threads=0), "filter_num_threads"),
+        (lambda: RayDataCheckpointConfig(write_num_threads=-1), "write_num_threads"),
+    ],
+)
+def test_ray_data_context_nested_options_validate_values(factory: Any, match: str) -> None:
+    with pytest.raises(RayBackendConfigurationError, match=match):
+        factory()
+
+
+def test_ray_data_checkpoint_config_serializes_supported_context_fields() -> None:
+    checkpoint_config = RayDataCheckpointConfig(
+        id_column="row_id",
+        checkpoint_path="s3://bucket/path",
+        delete_checkpoint_on_success=False,
+        filter_num_threads=2,
+        write_num_threads=4,
+    )
+
+    assert checkpoint_config.to_context_value() == {
+        "id_column": "row_id",
+        "checkpoint_path": "s3://bucket/path",
+        "delete_checkpoint_on_success": False,
+        "filter_num_threads": 2,
+        "write_num_threads": 4,
+    }
+
+
 def test_ray_backend_option_resolution_rejects_execution_option_conflicts() -> None:
     with pytest.raises(RayBackendConfigurationError, match="execution_options"):
         resolve_ray_backend_options(
@@ -106,11 +169,13 @@ def test_ray_backend_option_resolution_allows_noop_legacy_values_with_option_obj
     block_planning = RayBlockPlanning(override_num_blocks=2)
     execution_options = RayExecutionOptions(num_cpus=0.5)
     input_repartition = RayInputRepartition(num_blocks=4)
+    data_context_options = RayDataContextOptions(max_errored_blocks=1)
 
     resolved = resolve_ray_backend_options(
         block_planning=block_planning,
         execution_options=execution_options,
         input_repartition=input_repartition,
+        data_context_options=data_context_options,
         legacy_options={
             "override_num_blocks": None,
             "num_cpus": None,
@@ -121,6 +186,7 @@ def test_ray_backend_option_resolution_allows_noop_legacy_values_with_option_obj
     assert resolved.block_planning is block_planning
     assert resolved.execution_options is execution_options
     assert resolved.input_repartition is input_repartition
+    assert resolved.data_context_options is data_context_options
 
 
 def test_ray_backend_option_resolution_rejects_unknown_legacy_options() -> None:
@@ -157,3 +223,8 @@ def test_ray_input_repartition_resolves_repartition_kwargs() -> None:
 def test_ray_backend_option_resolution_rejects_invalid_input_repartition_object() -> None:
     with pytest.raises(RayBackendConfigurationError, match="input_repartition"):
         resolve_ray_backend_options(input_repartition=object())
+
+
+def test_ray_backend_option_resolution_rejects_invalid_data_context_options_object() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="data_context_options"):
+        resolve_ray_backend_options(data_context_options=object())

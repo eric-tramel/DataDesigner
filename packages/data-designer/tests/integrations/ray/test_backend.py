@@ -18,6 +18,7 @@ from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import IndexRange, SamplingStrategy
 from data_designer.config.seed_source import DirectorySeedSource, FileContentsSeedSource, LocalFileSeedSource
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
+from data_designer.engine.dataset_builders.block_execution import BlockExecutionResult
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.engine.testing.seed_readers import LineFanoutDirectorySeedReader
@@ -25,10 +26,13 @@ from data_designer.integrations.ray import (
     RayBackend,
     RayBackendConfigurationError,
     RayBlockPlanning,
+    RayDataCheckpointConfig,
+    RayDataContextOptions,
     RayDatasetCreationResults,
     RayDatasetGenerationError,
     RayDatasetMetrics,
     RayExecutionOptions,
+    RayExecutionResources,
     RayInputRepartition,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
@@ -65,6 +69,24 @@ def _llm_config_builder(stub_model_configs: Any) -> DataDesignerConfigBuilder:
         )
     )
     return config_builder
+
+
+def _block_result(*, dataframe: Any, input_rows: int) -> BlockExecutionResult:
+    output_rows = len(dataframe)
+    dropped_rows = max(input_rows - output_rows, 0)
+    return BlockExecutionResult(
+        dataframe=dataframe,
+        raw_dataframe=dataframe.copy(),
+        task_traces=[],
+        model_usage_stats={},
+        model_usage_deltas={},
+        processor_artifacts={},
+        input_rows=input_rows,
+        output_rows=output_rows,
+        dropped_rows=dropped_rows,
+        all_rows_dropped=input_rows > 0 and output_rows == 0,
+        partial_rows_dropped=0 < output_rows < input_rows,
+    )
 
 
 def test_ray_backend_uses_input_dataset_as_in_memory_seed(
@@ -369,6 +391,184 @@ def test_ray_backend_threads_observability_limits_to_collector_and_workers(
     assert metrics_collector._actor._max_throttle_snapshots == 9
 
 
+def test_ray_backend_threads_data_context_options_to_backend_created_datasets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_refs = [lazy.pd.DataFrame({"x": [1], "label": ["a"]})]
+    checkpoint_path = tmp_path / "ray-checkpoints"
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            data_context_options=RayDataContextOptions(
+                resource_limits=RayExecutionResources(cpu=2, memory=1024),
+                exclude_resources=RayExecutionResources(gpu=1),
+                preserve_execution_order=True,
+                actor_locality_enabled=False,
+                verbose_progress=True,
+                verbose_stats_logs=True,
+                enable_progress_bars=False,
+                enable_operator_progress_bars=False,
+                log_internal_stack_trace_to_stdout=True,
+                raise_original_map_exception=True,
+                max_errored_blocks=3,
+                checkpoint_config=RayDataCheckpointConfig(
+                    id_column="x",
+                    checkpoint_path=str(checkpoint_path),
+                    delete_checkpoint_on_success=False,
+                    filter_num_threads=2,
+                    write_num_threads=4,
+                ),
+            ),
+        ),
+    )
+
+    designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_refs)
+
+    data_context = fake_ray.data.latest_dataset_context
+    assert data_context is not None
+    assert data_context.execution_options.resource_limits.to_resource_dict() == {"cpu": 2, "memory": 1024}
+    assert data_context.execution_options.resource_limits._for_limits is True
+    assert data_context.execution_options.exclude_resources.to_resource_dict() == {"gpu": 1}
+    assert data_context.execution_options.preserve_order is True
+    assert data_context.execution_options.actor_locality_enabled is False
+    assert data_context.execution_options.verbose_progress is True
+    assert data_context.verbose_stats_logs is True
+    assert data_context.enable_progress_bars is False
+    assert data_context.enable_operator_progress_bars is False
+    assert data_context.log_internal_stack_trace_to_stdout is True
+    assert data_context.raise_original_map_exception is True
+    assert data_context.max_errored_blocks == 3
+    assert data_context.checkpoint_config is not None
+    assert data_context.checkpoint_config.id_column == "x"
+    assert data_context.checkpoint_config.checkpoint_path == str(checkpoint_path)
+    assert data_context.checkpoint_config.delete_checkpoint_on_success is False
+    assert data_context.checkpoint_config.filter_num_threads == 2
+    assert data_context.checkpoint_config.write_num_threads == 4
+    assert fake_ray.data.DataContext.get_current().max_errored_blocks == 0
+
+
+def test_ray_backend_rejects_data_context_options_for_existing_ray_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(data_context_options=RayDataContextOptions(max_errored_blocks=1)),
+    )
+
+    with pytest.raises(RayBackendConfigurationError, match="DataContext into an existing ray.data.Dataset"):
+        designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_backend_tolerates_failed_blocks_with_data_context_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch, with_remote=True)
+    input_refs = [
+        lazy.pd.DataFrame({"x": [1], "label": ["bad"]}),
+        lazy.pd.DataFrame({"x": [2], "label": ["good"]}),
+    ]
+
+    def execute_dataset_block(**kwargs: Any) -> BlockExecutionResult:
+        input_frame = kwargs["input_frame"]
+        if input_frame["label"].iloc[0] == "bad":
+            raise RuntimeError("bad block")
+        output = input_frame.copy()
+        output["x_label"] = output["x"].astype(str) + "-" + output["label"]
+        return _block_result(dataframe=output, input_rows=len(input_frame))
+
+    monkeypatch.setattr(ray_backend_module, "execute_dataset_block", execute_dataset_block)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            data_context_options=RayDataContextOptions(max_errored_blocks=1),
+        ),
+    )
+
+    results = designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_refs)
+    output_df = results.load_dataset().to_pandas()
+    metrics = results.load_metrics()
+
+    assert output_df.to_dict(orient="records") == [{"x": 2, "label": "good", "x_label": "2-good"}]
+    assert metrics.blocks == 2
+    assert metrics.failed_blocks == 1
+    assert metrics.successful_blocks == 1
+
+
+def test_ray_backend_strict_failed_blocks_raise_without_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch, with_remote=True)
+    input_refs = [lazy.pd.DataFrame({"x": [1], "label": ["bad"]})]
+
+    def execute_dataset_block(**_: Any) -> BlockExecutionResult:
+        raise RuntimeError("bad block")
+
+    monkeypatch.setattr(ray_backend_module, "execute_dataset_block", execute_dataset_block)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=1),
+    )
+
+    with pytest.raises(RayDatasetGenerationError, match="bad block"):
+        designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_refs)
+
+
+def test_ray_backend_wraps_data_context_configuration_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+
+    def fail_get_current() -> Any:
+        raise TypeError("DataContext unavailable")
+
+    monkeypatch.setattr(fake_ray.data.DataContext, "get_current", staticmethod(fail_get_current))
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(data_context_options=RayDataContextOptions(max_errored_blocks=1)),
+    )
+
+    with pytest.raises(RayBackendConfigurationError, match="DataContext options") as exc_info:
+        designer.create(stub_sampler_only_config_builder, num_records=1)
+
+    assert "DataContext unavailable" in str(exc_info.value.__cause__)
+
+
 def test_ray_driver_planner_captures_from_scratch_plan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -528,11 +728,13 @@ def test_ray_backend_constructor_signature_keeps_option_objects_primary() -> Non
 
     assert "block_planning" in parameters
     assert "execution_options" in parameters
+    assert "data_context_options" in parameters
     assert "batch_size" in parameters
     assert "output" in parameters
     assert "auto_init" in parameters
     assert "override_num_blocks" not in parameters
     assert "num_cpus" not in parameters
+    assert "max_errored_blocks" not in parameters
 
 
 def test_ray_backend_accepts_legacy_option_kwargs_as_compatibility_shims() -> None:
