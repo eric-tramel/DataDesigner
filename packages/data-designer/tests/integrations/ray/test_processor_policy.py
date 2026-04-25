@@ -238,6 +238,20 @@ def test_ray_processor_policy_accepts_legacy_ray_safe_metadata(stub_model_config
     validate_ray_safe_processors(config_builder)
 
 
+def test_ray_processor_policy_allows_dataset_artifact_processors_when_artifact_writes_enabled(
+    stub_model_configs: Any,
+) -> None:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_processor(
+        SchemaTransformProcessorConfig(
+            name="schema-transform",
+            template={"combined": "{{ x_label }}"},
+        )
+    )
+
+    validate_ray_safe_processors(config_builder, allow_dataset_artifacts=True)
+
+
 def test_ray_processor_policy_rejects_after_generation_processor_implementation(stub_model_configs: Any) -> None:
     config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
     config_builder.add_processor(AfterGenerationProcessorConfig(name="global-processor"))

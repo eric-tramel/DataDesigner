@@ -18,8 +18,9 @@ from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.processors import ProcessorType
 from data_designer.engine.column_generators.utils.generator_classification import column_type_is_model_generated
 from data_designer.engine.dataset_builders.block_execution import execute_dataset_block
-from data_designer.engine.storage.artifact_storage import ArtifactStorage
+from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, ArtifactStorage
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
+from data_designer.integrations.ray.artifact_output import DataDesignerRayDatasink
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayDatasetAnalysis
@@ -140,10 +141,12 @@ class RayDatasetCreationResults:
         ray: Any | None = None,
         metrics_collector: Any | None = None,
         throttle_manager: Any | None = None,
+        artifact_storage: ArtifactStorage | None = None,
         output: Any | None = None,
         observability_options: _RayObservabilityOptions | None = None,
     ) -> None:
         del config_builder, observability_options
+        self.artifact_storage = artifact_storage
         self._artifacts = RayResultArtifacts(
             dataset=dataset,
             metrics=metrics,
@@ -230,14 +233,23 @@ class RayDatasetCreationResults:
         """
         return self._artifacts.output
 
+    def load_processor_dataset(self, processor_name: str) -> Any:
+        """Load a persisted processor output dataset as pandas."""
+        if self.artifact_storage is None:
+            raise RuntimeError("RayBackend was not configured to write artifacts.")
+        return self.artifact_storage.load_processor_dataset(processor_name)
+
 
 class RayBackend:
     """Ray Data execution backend for in-memory Data Designer jobs.
 
     The backend maps Data Designer generation over Ray Data blocks and returns
-    Ray-resident outputs. Ray is imported lazily so base Data Designer installs
-    do not require the optional dependency. input_dataset may be a Ray Dataset
-    or a sequence of ObjectRefs containing Arrow tables or pandas DataFrames.
+    Ray-resident outputs. When ``write_artifacts`` is enabled, the mapped Ray
+    Dataset is also written through a Ray Datasink-compatible artifact writer
+    using the standard Data Designer artifact layout. Ray is imported lazily so
+    base Data Designer installs do not require the optional dependency.
+    input_dataset may be a Ray Dataset or a sequence of ObjectRefs containing
+    Arrow tables or pandas DataFrames.
 
     Prefer ``block_planning=RayBlockPlanning(...)``,
     ``execution_options=RayExecutionOptions(...)``, and
@@ -279,6 +291,10 @@ class RayBackend:
         max_worker_profiles: int = 1000,
         max_throttle_snapshots: int = 1000,
         output_chunk_rows: int | None = None,
+        write_artifacts: bool = False,
+        artifact_write_concurrency: int | None = None,
+        artifact_write_ray_remote_args: dict[str, Any] | None = None,
+        distributed_artifact_writes: bool = True,
         **legacy_options: Any,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
@@ -323,6 +339,10 @@ class RayBackend:
         self.max_worker_profiles = max_worker_profiles
         self.max_throttle_snapshots = max_throttle_snapshots
         self.output_chunk_rows = output_chunk_rows
+        self.write_artifacts = write_artifacts
+        self.artifact_write_concurrency = artifact_write_concurrency
+        self.artifact_write_ray_remote_args = artifact_write_ray_remote_args
+        self.distributed_artifact_writes = distributed_artifact_writes
 
     def create(
         self,
@@ -333,7 +353,6 @@ class RayBackend:
         dataset_name: str,
         input_dataset: Any | None = None,
     ) -> RayDatasetCreationResults:
-        del dataset_name
         start_time = time.perf_counter()
         ray = _import_ray()
         if not ray.is_initialized():
@@ -352,6 +371,7 @@ class RayBackend:
                 config_builder=config_builder,
                 num_records=num_records,
                 start_time=start_time,
+                dataset_name=dataset_name,
                 input_dataset=input_dataset,
             )
         with _ray_data_context_scope(ray, data_context):
@@ -361,6 +381,7 @@ class RayBackend:
                 config_builder=config_builder,
                 num_records=num_records,
                 start_time=start_time,
+                dataset_name=dataset_name,
                 input_dataset=input_dataset,
             )
 
@@ -372,6 +393,7 @@ class RayBackend:
         config_builder: DataDesignerConfigBuilder,
         num_records: int,
         start_time: float,
+        dataset_name: str,
         input_dataset: Any | None,
     ) -> RayDatasetCreationResults:
         plan = RayDriverPlanner(backend=self, ray=ray).plan(
@@ -380,7 +402,20 @@ class RayBackend:
             num_records=num_records,
             input_dataset=input_dataset,
         )
-        result_dataset, mapped, output = self._execute_plan(ray, plan)
+        result_dataset, mapped, output = self._execute_plan(ray, plan, materialize_output=not self.write_artifacts)
+        artifact_storage = None
+        if self.write_artifacts:
+            artifact_storage = self._write_artifacts(
+                ray=ray,
+                mapped=mapped,
+                runtime_context=runtime_context,
+                config_builder=config_builder,
+                num_records=num_records,
+                dataset_name=dataset_name,
+                batch_size=int(plan.map_batches_kwargs["batch_size"]),
+            )
+            result_dataset = ray.data.read_parquet(str(artifact_storage.final_dataset_path))
+            output = result_dataset.to_arrow_refs() if plan.output == "arrow_refs" else None
         metrics = _create_driver_metrics(
             plan,
             mapped=mapped,
@@ -394,11 +429,14 @@ class RayBackend:
             ray=ray,
             metrics_collector=plan.metrics_collector,
             throttle_manager=plan.throttle_manager,
+            artifact_storage=artifact_storage,
             output=output,
             observability_options=plan.observability_options,
         )
 
-    def _execute_plan(self, ray: Any, plan: RayJobPlan) -> tuple[Any, Any, Any | None]:
+    def _execute_plan(
+        self, ray: Any, plan: RayJobPlan, *, materialize_output: bool = True
+    ) -> tuple[Any, Any, Any | None]:
         try:
             mapped = plan.dataset_source.dataset.map_batches(_RayBatchWorker, **plan.map_batches_kwargs)
         except RayDatasetGenerationError:
@@ -415,6 +453,9 @@ class RayBackend:
         except Exception as exc:
             raise RayDatasetGenerationError("RayBackend failed while applying Ray output ordering.") from exc
 
+        if not materialize_output:
+            return mapped, mapped, None
+
         try:
             output = mapped.to_arrow_refs() if plan.output == "arrow_refs" else None
             result_dataset = _dataset_from_arrow_refs(ray, output) if output is not None else mapped
@@ -425,6 +466,43 @@ class RayBackend:
                 "RayBackend failed while materializing Ray output blocks for output='arrow_refs'."
             ) from exc
         return result_dataset, mapped, output
+
+    def _write_artifacts(
+        self,
+        *,
+        ray: Any,
+        mapped: Any,
+        runtime_context: BackendRuntimeContext,
+        config_builder: DataDesignerConfigBuilder,
+        num_records: int,
+        dataset_name: str,
+        batch_size: int,
+    ) -> ArtifactStorage:
+        del ray
+        ArtifactStorage.mkdir_if_needed(runtime_context.artifact_path)
+        artifact_storage = ArtifactStorage(artifact_path=runtime_context.artifact_path, dataset_name=dataset_name)
+        ArtifactStorage.mkdir_if_needed(artifact_storage.base_dataset_path)
+        config_builder.get_builder_config().to_json(artifact_storage.base_dataset_path / SDG_CONFIG_FILENAME)
+
+        datasink = DataDesignerRayDatasink(
+            base_dataset_path=artifact_storage.base_dataset_path,
+            dataset_name=artifact_storage.resolved_dataset_name,
+            target_num_records=num_records,
+            buffer_size=batch_size,
+            min_rows_per_write=batch_size,
+            supports_distributed_writes=self.distributed_artifact_writes,
+        )
+        try:
+            mapped.write_datasink(
+                datasink,
+                ray_remote_args=self.artifact_write_ray_remote_args,
+                concurrency=self.artifact_write_concurrency,
+            )
+        except RayDatasetGenerationError:
+            raise
+        except Exception as exc:
+            raise RayDatasetGenerationError("RayBackend failed while writing Data Designer artifacts.") from exc
+        return artifact_storage
 
     def _resolve_input_dataset(
         self,
@@ -518,7 +596,7 @@ class RayDriverPlanner:
 
         validate_no_ray_after_generation_processors(config_builder)
         if not self._backend.allow_unsafe_processors:
-            validate_ray_safe_processors(config_builder)
+            validate_ray_safe_processors(config_builder, allow_dataset_artifacts=self._backend.write_artifacts)
         row_count_preserving = _is_row_count_preserving_config(config_builder)
 
         model_aliases = _model_health_check_aliases(config_builder)
@@ -592,6 +670,7 @@ class RayDriverPlanner:
             hidden_order_column=ordering_mode.hidden_order_column,
             preserve_output_row_count=row_count_preserving,
             output_chunk_rows=self._backend.output_chunk_rows,
+            capture_artifacts=self._backend.write_artifacts,
         )
 
         map_batches_kwargs: dict[str, Any] = {
@@ -912,6 +991,7 @@ def _generate_batch(
     hidden_order_column: str | None = None,
     preserve_output_row_count: bool = False,
     output_chunk_rows: int | None = None,
+    capture_artifacts: bool = False,
     metrics_collector: Any | None = None,
     observability_options: _RayObservabilityOptions | None = None,
 ) -> Any:
@@ -927,6 +1007,7 @@ def _generate_batch(
         hidden_order_column=hidden_order_column,
         preserve_output_row_count=preserve_output_row_count,
         output_chunk_rows=output_chunk_rows,
+        capture_artifacts=capture_artifacts,
     )
     return _RayBatchWorker(
         execution_payload=execution_payload,

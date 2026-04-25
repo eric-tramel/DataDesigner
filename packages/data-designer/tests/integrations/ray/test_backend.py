@@ -15,7 +15,7 @@ from data_designer.config.base import ProcessorConfig
 from data_designer.config.column_configs import CustomColumnConfig, ExpressionColumnConfig, LLMTextColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.custom_column import custom_column_generator
-from data_designer.config.processors import SchemaTransformProcessorConfig
+from data_designer.config.processors import DropColumnsProcessorConfig, SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import IndexRange, SamplingStrategy
 from data_designer.config.seed_source import DirectorySeedSource, FileContentsSeedSource, LocalFileSeedSource
@@ -23,6 +23,7 @@ from data_designer.config.seed_source_dataframe import DataFrameSeedSource
 from data_designer.engine.dataset_builders.block_execution import BlockExecutionResult
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
+from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, BatchStage
 from data_designer.engine.testing.seed_readers import LineFanoutDirectorySeedReader
 from data_designer.integrations.ray import (
     RayBackend,
@@ -227,6 +228,7 @@ def test_ray_backend_validates_row_count_when_marked_preserving(
         )
 
     monkeypatch.setattr(ray_backend_module, "execute_dataset_block", execute_short_block)
+
     designer = DataDesigner(
         artifact_path=tmp_path,
         model_providers=stub_model_providers,
@@ -284,6 +286,106 @@ def test_ray_backend_rejects_invalid_output_chunk_rows() -> None:
 def test_ray_backend_rejects_row_count_hint_remote_override() -> None:
     with pytest.raises(RayBackendConfigurationError, match="udf_modifying_row_count"):
         RayBackend(ray_remote_args={"udf_modifying_row_count": False})
+
+
+def test_ray_backend_writes_data_designer_artifacts_with_fake_ray(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_dataset = fake_ray.data.dataset([lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=2,
+            write_artifacts=True,
+            artifact_write_concurrency=3,
+            artifact_write_ray_remote_args={"num_cpus": 0.25},
+        ),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset, num_records=2, dataset_name="ray-output")
+    artifact_storage = results.artifact_storage
+
+    assert artifact_storage is not None
+    assert (artifact_storage.base_dataset_path / SDG_CONFIG_FILENAME).is_file()
+    assert artifact_storage.metadata_file_path.is_file()
+    assert fake_ray.data.write_datasink_kwargs == {"ray_remote_args": {"num_cpus": 0.25}, "concurrency": 3}
+    assert fake_ray.data.read_parquet_input == str(artifact_storage.final_dataset_path)
+    assert results.load_dataset().to_pandas().to_dict(orient="records") == [
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+    ]
+    assert artifact_storage.load_dataset().to_dict(orient="records") == [
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+    ]
+
+    metadata = artifact_storage.read_metadata()
+    assert metadata["dataset_name"] == "ray-output"
+    assert metadata["target_num_records"] == 2
+    assert metadata["actual_num_records"] == 2
+    assert metadata["num_completed_batches"] == 1
+    assert metadata["file_paths"]["parquet-files"] == ["parquet-files/batch_00000.parquet"]
+    assert metadata["schema"] == {"label": "string", "x": "int64", "x_label": "string"}
+
+
+def test_ray_backend_writes_dropped_columns_and_processor_artifacts_with_fake_ray(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_dataset = fake_ray.data.dataset([lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="kept_label", expr="{{ label }}"))
+    config_builder.add_processor(
+        SchemaTransformProcessorConfig(
+            name="schema-transform",
+            template={"combined": "{{ x_label }}"},
+        )
+    )
+    config_builder.add_processor(DropColumnsProcessorConfig(name="drop-x-label", column_names=["x_label"]))
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2, write_artifacts=True),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset, num_records=2, dataset_name="ray-output")
+    artifact_storage = results.artifact_storage
+
+    assert artifact_storage is not None
+    assert results.load_dataset().to_pandas().to_dict(orient="records") == [
+        {"x": 1, "label": "a", "kept_label": "a"},
+        {"x": 2, "label": "b", "kept_label": "b"},
+    ]
+    assert artifact_storage.load_dataset(batch_stage=BatchStage.DROPPED_COLUMNS).to_dict(orient="records") == [
+        {"x_label": "1-a"},
+        {"x_label": "2-b"},
+    ]
+    assert results.load_processor_dataset("schema-transform").to_dict(orient="records") == [
+        {"combined": "1-a"},
+        {"combined": "2-b"},
+    ]
+
+    metadata = artifact_storage.read_metadata()
+    assert metadata["file_paths"]["dropped-columns-parquet-files"] == [
+        "dropped-columns-parquet-files/batch_00000.parquet"
+    ]
+    assert metadata["file_paths"]["processor-files"] == {
+        "schema-transform": ["processors-files/schema-transform/batch_00000.parquet"]
+    }
 
 
 def test_ray_backend_uses_override_num_blocks_for_from_scratch_dataset(
