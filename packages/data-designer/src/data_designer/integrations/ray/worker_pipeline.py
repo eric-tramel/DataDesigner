@@ -9,7 +9,7 @@ import os
 import pickle
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +27,11 @@ from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import SeedReader
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
-from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
+from data_designer.integrations.ray.errors import (
+    RayBackendConfigurationError,
+    RayBackendRowCountError,
+    RayDatasetGenerationError,
+)
 from data_designer.integrations.ray.metrics import RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayTraceEvent
 from data_designer.integrations.ray.observability_collection import (
@@ -71,6 +75,8 @@ class _RayExecutionPayload:
     seed_window: ray_seed_planning.RaySeedWindow | None = None
     seed_config: SeedConfig | None = None
     hidden_order_column: str | None = None
+    preserve_output_row_count: bool = False
+    output_chunk_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,11 @@ class _RayWorkerGenerationPipeline:
         try:
             batch_observer.record_generation_started(worker_batch)
             generation_result = self.generate_rows(worker_batch)
+            if self._execution_payload.preserve_output_row_count:
+                _validate_output_row_count(
+                    input_rows=worker_batch.num_records,
+                    output_rows=len(generation_result.dataframe),
+                )
             return self.complete_successful_batch(worker_batch, generation_result, batch_observer)
         except _RayWorkerAllRowsDroppedError as exc:
             batch_observer.record_all_rows_dropped(worker_batch, exc.block_result)
@@ -472,6 +483,8 @@ def _compile_ray_execution_payload(
     use_input_dataset: bool,
     seed_window: ray_seed_planning.RaySeedWindow | None = None,
     hidden_order_column: str | None = None,
+    preserve_output_row_count: bool = False,
+    output_chunk_rows: int | None = None,
 ) -> _RayExecutionPayload:
     data_designer_config = config_builder.build()
     payload_seed_config = data_designer_config.seed_config if seed_window is not None else None
@@ -487,6 +500,8 @@ def _compile_ray_execution_payload(
         seed_window=seed_window,
         seed_config=payload_seed_config,
         hidden_order_column=hidden_order_column,
+        preserve_output_row_count=preserve_output_row_count,
+        output_chunk_rows=output_chunk_rows,
     )
     _validate_worker_payload_serializable(payload)
     return payload
@@ -550,6 +565,24 @@ def _append_hidden_order_column(
     output = output.copy()
     output[hidden_order_column] = order_values
     return output
+
+
+def _iter_dataframe_chunks(dataframe: Any, *, rows_per_chunk: int) -> Iterator[Any]:
+    if len(dataframe) == 0:
+        yield dataframe
+        return
+    for start in range(0, len(dataframe), rows_per_chunk):
+        yield dataframe.iloc[start : start + rows_per_chunk].copy()
+
+
+def _validate_output_row_count(*, input_rows: int, output_rows: int) -> None:
+    if output_rows == input_rows:
+        return
+    raise RayBackendRowCountError(
+        "RayBackend marked this map_batches transform as row-count preserving, but a worker returned "
+        f"{output_rows} row(s) for {input_rows} input row(s). Disable row-count-changing processors or "
+        "allow_resize columns before using the row-preserving Ray map optimization."
+    )
 
 
 def _metrics_from_block_result(

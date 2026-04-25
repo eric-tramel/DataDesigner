@@ -6,11 +6,12 @@ from __future__ import annotations
 import copy
 import sys
 import types
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
-from typing import Any, ClassVar, Iterator
+from typing import Any, ClassVar
 
 import pytest
 
@@ -163,7 +164,10 @@ class FakeRayDataset:
             self.data_module.validate_map_batches_kwargs(kwargs)
         self.map_batches_kwargs = kwargs
         self.map_batches_fn = fn
-        self.map_batches_calls.append(FakeMapBatchesCall(fn=fn, kwargs=dict(kwargs)))
+        call = FakeMapBatchesCall(fn=fn, kwargs=dict(kwargs))
+        self.map_batches_calls.append(call)
+        if self.data_module is not None:
+            self.data_module.map_batches_calls.append(call)
         blocks = map_batches_blocks(fn, self.blocks, kwargs, data_context=self.data_context)
         if self.reverse_mapped_blocks:
             blocks.reverse()
@@ -341,6 +345,7 @@ class FakeRayDataModule:
         self.DataContext = FakeDataContext
         self.ExecutionResources = FakeExecutionResources
         self.latest_dataset_context: FakeDataContext | None = None
+        self.map_batches_calls: list[FakeMapBatchesCall] = []
 
     def dataset(
         self,
@@ -524,7 +529,11 @@ def map_batches_blocks(
     max_errored_blocks = data_context.max_errored_blocks if data_context is not None else 0
     for block in blocks:
         try:
-            mapped_blocks.append(coerce_pandas_dataframe(map_fn(coerce_pandas_dataframe(block), **fn_kwargs)))
+            result = map_fn(coerce_pandas_dataframe(block), **fn_kwargs)
+            if isinstance(result, Iterator):
+                mapped_blocks.extend(coerce_pandas_dataframe(chunk) for chunk in result)
+            else:
+                mapped_blocks.append(coerce_pandas_dataframe(result))
         except Exception:
             failed_blocks += 1
             if max_errored_blocks < 0 or failed_blocks <= max_errored_blocks:

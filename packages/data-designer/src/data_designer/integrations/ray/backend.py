@@ -15,6 +15,7 @@ import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import CustomColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.data_designer_config import DataDesignerConfig
+from data_designer.config.processors import ProcessorType
 from data_designer.engine.column_generators.utils.generator_classification import column_type_is_model_generated
 from data_designer.engine.dataset_builders.block_execution import execute_dataset_block
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
@@ -44,6 +45,7 @@ from data_designer.integrations.ray.worker_pipeline import (
     _RAY_INTERNAL_ROW_ID_COLUMN,
     _coerce_pandas_dataframe,
     _compile_ray_execution_payload,
+    _iter_dataframe_chunks,
     _RayExecutionPayload,
     _RayWorkerGenerationPipeline,
     _RayWorkerOptions,
@@ -60,6 +62,10 @@ RayDatasetSourceKind = Literal[
     "ray_native_seed",
     "seed_window",
 ]
+_ROW_COUNT_PRESERVING_PROCESSOR_TYPES = {
+    ProcessorType.DROP_COLUMNS.value,
+    ProcessorType.SCHEMA_TRANSFORM.value,
+}
 
 
 @dataclass(frozen=True)
@@ -272,6 +278,7 @@ class RayBackend:
         max_trace_events: int = 1000,
         max_worker_profiles: int = 1000,
         max_throttle_snapshots: int = 1000,
+        output_chunk_rows: int | None = None,
         **legacy_options: Any,
     ) -> None:
         if output not in ("dataset", "arrow_refs"):
@@ -284,6 +291,7 @@ class RayBackend:
         _validate_ray_backend_non_negative_int("max_trace_events", max_trace_events)
         _validate_ray_backend_non_negative_int("max_worker_profiles", max_worker_profiles)
         _validate_ray_backend_non_negative_int("max_throttle_snapshots", max_throttle_snapshots)
+        _validate_ray_backend_output_chunk_rows(output_chunk_rows)
         resolved_options = resolve_ray_backend_options(
             block_planning=block_planning,
             execution_options=execution_options,
@@ -314,6 +322,7 @@ class RayBackend:
         self.max_trace_events = max_trace_events
         self.max_worker_profiles = max_worker_profiles
         self.max_throttle_snapshots = max_throttle_snapshots
+        self.output_chunk_rows = output_chunk_rows
 
     def create(
         self,
@@ -510,6 +519,7 @@ class RayDriverPlanner:
         validate_no_ray_after_generation_processors(config_builder)
         if not self._backend.allow_unsafe_processors:
             validate_ray_safe_processors(config_builder)
+        row_count_preserving = _is_row_count_preserving_config(config_builder)
 
         model_aliases = _model_health_check_aliases(config_builder)
         if self._backend.preflight_model_health_check:
@@ -580,6 +590,8 @@ class RayDriverPlanner:
             use_input_dataset=use_input_dataset,
             seed_window=seed_window,
             hidden_order_column=ordering_mode.hidden_order_column,
+            preserve_output_row_count=row_count_preserving,
+            output_chunk_rows=self._backend.output_chunk_rows,
         )
 
         map_batches_kwargs: dict[str, Any] = {
@@ -595,6 +607,7 @@ class RayDriverPlanner:
             "zero_copy_batch": self._backend.zero_copy_batch,
         }
         map_batches_kwargs.update(self._backend.execution_options.to_map_batches_kwargs(self._ray))
+        map_batches_kwargs["udf_modifying_row_count"] = not row_count_preserving
 
         return RayJobPlan(
             dataset_source=RayDatasetSource(
@@ -691,6 +704,27 @@ def _validate_ray_backend_non_negative_int(field_name: str, value: int) -> None:
         raise RayBackendConfigurationError(f"RayBackend {field_name} must be a non-negative integer.")
 
 
+def _validate_ray_backend_output_chunk_rows(output_chunk_rows: int | None) -> None:
+    if output_chunk_rows is None:
+        return
+    if isinstance(output_chunk_rows, bool) or not isinstance(output_chunk_rows, int) or output_chunk_rows <= 0:
+        raise RayBackendConfigurationError("RayBackend output_chunk_rows must be a positive integer or None.")
+
+
+def _is_row_count_preserving_config(config_builder: DataDesignerConfigBuilder) -> bool:
+    if any(getattr(column_config, "allow_resize", False) for column_config in config_builder.get_column_configs()):
+        return False
+    return all(
+        _processor_type_value(processor_config.processor_type) in _ROW_COUNT_PRESERVING_PROCESSOR_TYPES
+        for processor_config in config_builder.get_processor_configs()
+    )
+
+
+def _processor_type_value(processor_type: Any) -> str:
+    value = getattr(processor_type, "value", processor_type)
+    return str(value)
+
+
 def _model_health_check_aliases(config_builder: DataDesignerConfigBuilder) -> list[str]:
     model_aliases: set[str] = set()
     for config in config_builder.get_column_configs():
@@ -770,6 +804,7 @@ def _attach_hidden_row_id_column(ray: Any, dataset: Any, *, hidden_order_column:
             _rename_range_id_column,
             fn_kwargs={"hidden_order_column": hidden_order_column},
             batch_format="pandas",
+            udf_modifying_row_count=False,
         )
         zip_dataset = getattr(dataset, "zip", None)
         if not callable(zip_dataset):
@@ -850,7 +885,10 @@ class _RayBatchWorker:
         self._worker_options: _RayWorkerOptions = self._pipeline.worker_options
 
     def __call__(self, batch: Any) -> Any:
-        return _generate_batch(batch, worker=self, metrics_collector=self._metrics_collector)
+        output = _generate_batch(batch, worker=self, metrics_collector=self._metrics_collector)
+        if self._execution_payload.output_chunk_rows is None:
+            return output
+        return _iter_dataframe_chunks(output, rows_per_chunk=self._execution_payload.output_chunk_rows)
 
     def close(self) -> None:
         return None
@@ -872,6 +910,8 @@ def _generate_batch(
     use_input_dataset: bool | None = None,
     seed_window: ray_seed_planning.RaySeedWindow | None = None,
     hidden_order_column: str | None = None,
+    preserve_output_row_count: bool = False,
+    output_chunk_rows: int | None = None,
     metrics_collector: Any | None = None,
     observability_options: _RayObservabilityOptions | None = None,
 ) -> Any:
@@ -885,6 +925,8 @@ def _generate_batch(
         use_input_dataset=use_input_dataset,
         seed_window=seed_window,
         hidden_order_column=hidden_order_column,
+        preserve_output_row_count=preserve_output_row_count,
+        output_chunk_rows=output_chunk_rows,
     )
     return _RayBatchWorker(
         execution_payload=execution_payload,

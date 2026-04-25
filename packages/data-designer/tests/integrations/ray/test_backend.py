@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fake_ray_harness import FakeRayDataset, install_fake_ray
+from fake_ray_harness import FakeMapBatchesCall, FakeRayDataset, install_fake_ray
 
 import data_designer.lazy_heavy_imports as lazy
-from data_designer.config.column_configs import ExpressionColumnConfig, LLMTextColumnConfig
+from data_designer.config.base import ProcessorConfig
+from data_designer.config.column_configs import CustomColumnConfig, ExpressionColumnConfig, LLMTextColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
+from data_designer.config.custom_column import custom_column_generator
 from data_designer.config.processors import SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import IndexRange, SamplingStrategy
@@ -25,6 +27,7 @@ from data_designer.engine.testing.seed_readers import LineFanoutDirectorySeedRea
 from data_designer.integrations.ray import (
     RayBackend,
     RayBackendConfigurationError,
+    RayBackendRowCountError,
     RayBlockPlanning,
     RayDataCheckpointConfig,
     RayDataContextOptions,
@@ -89,6 +92,33 @@ def _block_result(*, dataframe: Any, input_rows: int) -> BlockExecutionResult:
     )
 
 
+def _map_batches_call_for(fake_ray: Any, fn: Any) -> FakeMapBatchesCall:
+    for call in fake_ray.data.map_batches_calls:
+        if call.fn is fn:
+            return call
+    raise AssertionError(f"fake Ray did not record map_batches call for {fn!r}")
+
+
+@custom_column_generator(required_columns=["x"])
+def _expand_x(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {**row, "expanded": f"{row['x']}-a"},
+        {**row, "expanded": f"{row['x']}-b"},
+    ]
+
+
+class UnknownProcessorConfig(ProcessorConfig):
+    processor_type: str = "unknown_plugin_processor"
+
+
+class RecordingRayDataset(FakeRayDataset):
+    def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
+        del fn
+        self.map_batches_kwargs = kwargs
+        self.map_batches_fn = None
+        return FakeRayDataset([], data_module=self.data_module)
+
+
 def test_ray_backend_uses_input_dataset_as_in_memory_seed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -113,13 +143,147 @@ def test_ray_backend_uses_input_dataset_as_in_memory_seed(
 
     assert input_dataset.map_batches_kwargs is not None
     assert input_dataset.map_batches_kwargs["num_cpus"] == 0.5
+    assert input_dataset.map_batches_kwargs["udf_modifying_row_count"] is False
     assert "fn_kwargs" not in input_dataset.map_batches_kwargs
-    assert input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"].use_input_dataset is True
+    execution_payload = input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
+    assert execution_payload.use_input_dataset is True
+    assert execution_payload.preserve_output_row_count is True
     assert "ray_remote_args" not in input_dataset.map_batches_kwargs
     assert output_df.to_dict(orient="records") == [
         {"x": 1, "label": "a", "x_label": "1-a"},
         {"x": 2, "label": "b", "x_label": "2-b"},
     ]
+
+
+def test_ray_backend_does_not_mark_allow_resize_configs_as_row_preserving(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = RecordingRayDataset([lazy.pd.DataFrame({"x": [1, 2]})])
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(
+        CustomColumnConfig(
+            name="expanded",
+            generator_function=_expand_x,
+            allow_resize=True,
+        )
+    )
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["udf_modifying_row_count"] is True
+    execution_payload = input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
+    assert execution_payload.preserve_output_row_count is False
+    assert isinstance(results, RayDatasetCreationResults)
+
+
+def test_ray_row_count_predicate_fails_closed_for_unknown_processors() -> None:
+    class FakeConfigBuilder:
+        def get_column_configs(self) -> list[Any]:
+            return []
+
+        def get_processor_configs(self) -> list[UnknownProcessorConfig]:
+            return [UnknownProcessorConfig(name="plugin_processor")]
+
+    assert ray_backend_module._is_row_count_preserving_config(FakeConfigBuilder()) is False
+
+
+def test_ray_backend_validates_row_count_when_marked_preserving(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+
+    def execute_short_block(**kwargs: Any) -> BlockExecutionResult:
+        input_frame = kwargs["input_frame"]
+        dataframe = input_frame.iloc[:1].copy()
+        return BlockExecutionResult(
+            dataframe=dataframe,
+            raw_dataframe=dataframe.copy(),
+            task_traces=[],
+            model_usage_stats={},
+            model_usage_deltas={},
+            processor_artifacts={},
+            input_rows=len(input_frame),
+            output_rows=len(dataframe),
+            dropped_rows=len(input_frame) - len(dataframe),
+            all_rows_dropped=False,
+            partial_rows_dropped=True,
+        )
+
+    monkeypatch.setattr(ray_backend_module, "execute_dataset_block", execute_short_block)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=2),
+    )
+
+    with pytest.raises(RayBackendRowCountError, match="row-count preserving"):
+        designer.create(config_builder, input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["udf_modifying_row_count"] is False
+
+
+def test_ray_backend_can_yield_output_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1, 2, 3, 4, 5], "label": ["a", "b", "c", "d", "e"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=5, output_chunk_rows=2),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset)
+    output_dataset = results.load_dataset()
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["udf_modifying_row_count"] is False
+    execution_payload = input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
+    assert execution_payload.output_chunk_rows == 2
+    assert [len(block) for block in output_dataset.blocks] == [2, 2, 1]
+    assert output_dataset.to_pandas().to_dict(orient="records") == [
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+        {"x": 3, "label": "c", "x_label": "3-c"},
+        {"x": 4, "label": "d", "x_label": "4-d"},
+        {"x": 5, "label": "e", "x_label": "5-e"},
+    ]
+
+
+def test_ray_backend_rejects_invalid_output_chunk_rows() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="output_chunk_rows"):
+        RayBackend(output_chunk_rows=0)
+
+
+def test_ray_backend_rejects_row_count_hint_remote_override() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="udf_modifying_row_count"):
+        RayBackend(ray_remote_args={"udf_modifying_row_count": False})
 
 
 def test_ray_backend_uses_override_num_blocks_for_from_scratch_dataset(
@@ -599,6 +763,8 @@ def test_ray_driver_planner_captures_from_scratch_plan(
     assert fake_ray.data.range_kwargs == {"override_num_blocks": 3}
     assert plan.worker_payload is plan.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
     assert plan.map_batches_kwargs["batch_size"] == 2
+    assert plan.map_batches_kwargs["udf_modifying_row_count"] is False
+    assert plan.worker_payload.preserve_output_row_count is True
     assert plan.output == "arrow_refs"
     assert plan.input_blocks == 3
     assert plan.metrics_collector is None
@@ -637,6 +803,8 @@ def test_ray_driver_planner_captures_preserve_order_input_resolution(
     assert plan.ordering_mode.hidden_order_column == ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN
     assert plan.worker_payload.hidden_order_column == ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN
     assert ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN in plan.dataset_source.dataset.to_pandas().columns
+    order_call = _map_batches_call_for(fake_ray, ray_backend_module._rename_range_id_column)
+    assert order_call.kwargs["udf_modifying_row_count"] is False
     assert plan.block_plan is None
 
 
@@ -1230,6 +1398,10 @@ def test_ray_backend_hydrates_filesystem_seed_reader_fanout_with_ray_data(
         {"relative_path": "b.txt"},
     ]
     assert fake_ray.data.range_kwargs is None
+    hydrate_call = _map_batches_call_for(fake_ray, ray_seed_planning._hydrate_filesystem_seed_manifest_batch)
+    assert hydrate_call.kwargs["udf_modifying_row_count"] is True
+    main_call = _map_batches_call_for(fake_ray, ray_backend_module._RayBatchWorker)
+    assert main_call.kwargs["udf_modifying_row_count"] is False
     assert output_df.to_dict(orient="records") == [
         {"relative_path": "a.txt", "line_index": 0, "line": "alpha", "line_label": "a.txt:0:alpha"},
         {"relative_path": "a.txt", "line_index": 1, "line": "beta", "line_label": "a.txt:1:beta"},
@@ -1303,6 +1475,8 @@ def test_ray_backend_applies_local_file_seed_range_without_leaking_ordinal(
     assert fake_ray.data.read_json_input == str(seed_path)
     assert fake_ray.data.read_json_kwargs == {"lines": True, "partitioning": None}
     assert fake_ray.data.from_pandas_input is None
+    ordinal_call = _map_batches_call_for(fake_ray, ray_seed_planning._rename_range_id_to_seed_ordinal)
+    assert ordinal_call.kwargs["udf_modifying_row_count"] is False
     assert "__data_designer_ray_seed_ordinal" not in output_df.columns
     assert output_df.to_dict(orient="records") == [
         {"value": 20, "label": "b", "value_label": "20:b"},
@@ -1370,6 +1544,8 @@ def test_ray_backend_reads_file_contents_seed_with_ray_data(
     ]
     assert fake_ray.data.read_binary_files_kwargs == {"include_paths": True, "partitioning": None}
     assert fake_ray.data.from_pandas_input is None
+    contents_call = _map_batches_call_for(fake_ray, ray_seed_planning._file_contents_seed_batch_to_dataframe)
+    assert contents_call.kwargs["udf_modifying_row_count"] is False
     assert output_df.to_dict(orient="records") == [
         {
             "source_kind": "file_contents",
