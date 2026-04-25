@@ -25,7 +25,9 @@ from data_designer.integrations.ray.errors import RayBackendConfigurationError, 
 from data_designer.integrations.ray.llm import (
     RayDataLLMStageOptions,
     RayDataLLMStagePlan,
+    apply_ray_data_llm_stage,
     plan_ray_data_llm_stage,
+    validate_ray_data_llm_execution_plan,
 )
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayDatasetAnalysis
@@ -130,6 +132,7 @@ class RayJobPlan:
     throttle_manager: Any | None
     observability_options: _RayObservabilityOptions
     llm_stage_plan: RayDataLLMStagePlan
+    llm_stage_config_builder: DataDesignerConfigBuilder
     output: RayOutputMode
     num_records: int
     input_blocks: int | None
@@ -452,14 +455,24 @@ class RayBackend:
     def _execute_plan(
         self, ray: Any, plan: RayJobPlan, *, materialize_output: bool = True
     ) -> tuple[Any, Any, Any | None]:
-        try:
-            mapped = plan.dataset_source.dataset.map_batches(_RayBatchWorker, **plan.map_batches_kwargs)
-        except RayDatasetGenerationError:
-            raise
-        except Exception as exc:
-            raise RayDatasetGenerationError(
-                "RayBackend failed while constructing the Ray map_batches execution plan."
-            ) from exc
+        if plan.llm_stage_plan.should_execute:
+            mapped = apply_ray_data_llm_stage(
+                plan.dataset_source.dataset,
+                config_builder=plan.llm_stage_config_builder,
+                plan=plan.llm_stage_plan,
+                preserve_input_columns=plan.dataset_source.use_input_dataset,
+                hidden_order_column=plan.ordering_mode.hidden_order_column,
+                range_order_column=ray_seed_planning.RAY_RANGE_ID_COLUMN,
+            )
+        else:
+            try:
+                mapped = plan.dataset_source.dataset.map_batches(_RayBatchWorker, **plan.map_batches_kwargs)
+            except RayDatasetGenerationError:
+                raise
+            except Exception as exc:
+                raise RayDatasetGenerationError(
+                    "RayBackend failed while constructing the Ray map_batches execution plan."
+                ) from exc
 
         try:
             mapped = plan.ordering_mode.apply(mapped)
@@ -668,6 +681,12 @@ class RayDriverPlanner:
             options=self._backend.llm_stage_options,
         )
         _validate_llm_stage_plan(llm_stage_plan)
+        validate_ray_data_llm_execution_plan(config_builder=config_builder, plan=llm_stage_plan)
+        _validate_llm_stage_execution_backend_support(
+            plan=llm_stage_plan,
+            dataset_source_kind=dataset_source_kind,
+            output_chunk_rows=self._backend.output_chunk_rows,
+        )
         worker_config_builder = _clone_config_builder_for_worker(
             config_builder,
             worker_model_health_checks=self._backend.worker_model_health_checks,
@@ -733,6 +752,7 @@ class RayDriverPlanner:
             throttle_manager=throttle_manager,
             observability_options=observability_options,
             llm_stage_plan=llm_stage_plan,
+            llm_stage_config_builder=config_builder,
             output=self._backend.output,
             num_records=num_records,
             input_blocks=_get_num_blocks(dataset),
@@ -1079,6 +1099,12 @@ def _generate_batch(
 
 
 def _validate_llm_stage_plan(plan: RayDataLLMStagePlan) -> None:
+    if plan.should_execute and not plan.has_eligible_stage:
+        reason = plan.disabled_reason or "no eligible Ray Data LLM stage candidate was found"
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution was explicitly requested but cannot be planned: "
+            f"{reason} Disable execute=True to use the existing ModelFacade execution path."
+        )
     if not plan.enabled or plan.has_eligible_stage or plan.options.allow_model_facade_fallback:
         return
     reason = plan.disabled_reason or "no eligible Ray Data LLM stage candidate was found"
@@ -1086,6 +1112,22 @@ def _validate_llm_stage_plan(plan: RayDataLLMStagePlan) -> None:
         "RayBackend Ray Data LLM stage was explicitly requested but cannot be planned: "
         f"{reason} Set allow_model_facade_fallback=True to use the existing ModelFacade execution path."
     )
+
+
+def _validate_llm_stage_execution_backend_support(
+    *,
+    plan: RayDataLLMStagePlan,
+    dataset_source_kind: RayDatasetSourceKind,
+    output_chunk_rows: int | None,
+) -> None:
+    if not plan.should_execute:
+        return
+    if dataset_source_kind == "seed_window":
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution does not yet support streaming seed-window hydration."
+        )
+    if output_chunk_rows is not None:
+        raise RayBackendConfigurationError("RayBackend Ray Data LLM execution does not yet support output_chunk_rows.")
 
 
 def _import_ray() -> Any:

@@ -2,13 +2,13 @@
 
 Issue: [#52](https://github.com/eric-tramel/DataDesigner/issues/52)  
 Date: 2026-04-25  
-Status: planning hook implemented; execution integration deferred
+Status: planning hook implemented; narrow opt-in execution prototype implemented
 
 ## Decision
 
 Ray Data LLM/vLLM should not be added as a first-class `ModelProvider` yet. Keep external provider behavior on the existing `ModelFacade` and HTTP client adapters. Treat Ray Data LLM as a future RayBackend-only stage optimization for local GPU inference after the Ray planner can prove a column stage is eligible.
 
-The safe slice is a capability and planning hook: `probe_ray_data_llm_capabilities()` detects the optional `ray.data.llm` surface at runtime, `assess_ray_data_llm_integration()` returns the current placement recommendation without importing Ray during package import, and `RayDataLLMStageOptions` lets `RayBackend` explicitly plan one opt-in local vLLM stage candidate while continuing to execute through the existing `ModelFacade` unless that fallback is disabled.
+The safe slice is a capability and planning hook plus a tightly bounded execution prototype: `probe_ray_data_llm_capabilities()` detects the optional `ray.data.llm` surface at runtime, `assess_ray_data_llm_integration()` returns the current placement recommendation without importing Ray during package import, and `RayDataLLMStageOptions` lets `RayBackend` explicitly plan one opt-in local vLLM stage candidate. `execute=True` replaces the standard worker path only for one independent plain `LLMTextColumnConfig`; otherwise the backend fails fast or falls back to the existing `ModelFacade` path depending on the configured fallback policy.
 
 ## Sources Reviewed
 
@@ -62,7 +62,18 @@ A narrow future prototype should only consider columns that meet all of these co
 
 All other model-generated columns should keep using the existing `ModelFacade`.
 
-The current implementation records this eligibility through `plan_ray_data_llm_stage()` and exposes the resolved plan as `RayDatasetCreationResults.llm_stage_plan`. `RayDataLLMStageOptions(allow_model_facade_fallback=False)` turns the hook into a fail-fast verifier so a job does not silently run through the existing facade when the requested Ray Data LLM stage is unavailable or ineligible.
+The current implementation records this eligibility through `plan_ray_data_llm_stage()` and exposes the resolved plan as `RayDatasetCreationResults.llm_stage_plan`. `RayDataLLMStageOptions(allow_model_facade_fallback=False)` turns the hook into a fail-fast verifier so a job does not silently run through the existing facade when the requested Ray Data LLM stage is unavailable or ineligible. `RayDataLLMStageOptions(execute=True)` is stricter: it requires the selected stage to be executable, imports optional Ray Data LLM and vLLM dependencies lazily, and bypasses the worker `ModelFacade` path only for the supported one-column prototype.
+
+## Execution Prototype
+
+The executable slice intentionally supports less than the planner can describe:
+
+- exactly one selected `LLMTextColumnConfig`
+- no prompt dependencies, tools, trace columns, reasoning-content side effects, `skip`, `drop`, `allow_resize`, or DataDesigner processor configs
+- fixed chat-completion sampling parameters only; timeout, `extra_body`, and distribution-sampled parameters continue through the `ModelFacade` path
+- no seed-window hydration and no `output_chunk_rows`
+
+The Ray Data LLM processor preprocess function builds OpenAI-style chat messages and preserves the original Ray row in an internal field. The postprocess function writes the vLLM `generated_text` into the selected DataDesigner column and restores pre-existing non-selected columns. From-scratch range ids are not exposed unless they are needed internally for `preserve_order=True`.
 
 ## Non-Goals For This Slice
 
@@ -70,9 +81,10 @@ The current implementation records this eligibility through `plan_ray_data_llm_s
 - No required `vllm` dependency.
 - No changes to existing external OpenAI-compatible provider behavior.
 - No planner rewrite or GPU benchmark in this PR.
+- No usage-stat parity, trace parity, MCP/tool loop support, structured parsing, or processor support in the execution prototype.
 
 ## Follow-Up Recommendation
 
 [Issue #118](https://github.com/eric-tramel/DataDesigner/issues/118) tracks a RayBackend-only proof of concept and benchmark. The POC should compare the existing RayBackend plus OpenAI-compatible vLLM server path against a Ray Data LLM processor stage for a single independent text column, then expand only if the result preserves usage stats, errors, ordering, dropped-row behavior, and observability.
 
-The remaining execution step needs an environment with `ray.data.llm` optional dependencies and a real local vLLM model source. Local package introspection on the current development environment found `ray.data.llm` imports fail because optional dependencies such as `boto3` are absent, so the merged hook intentionally fails fast or falls back instead of adding an unverified execution path.
+The remaining validation step needs an environment with `ray.data.llm` optional dependencies, vLLM, GPU resources, and a real local model source. Local package introspection on the current development environment found `ray.data.llm` imports fail because optional dependencies such as `boto3` are absent, so local tests use a fake Ray Data LLM processor and the real path fails fast when those optional dependencies are unavailable.

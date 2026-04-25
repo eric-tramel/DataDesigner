@@ -11,7 +11,8 @@ from typing import Any, Literal
 
 from data_designer.config.column_configs import EmbeddingColumnConfig, LLMTextColumnConfig, TraceType
 from data_designer.config.config_builder import DataDesignerConfigBuilder
-from data_designer.integrations.ray.errors import RayBackendConfigurationError
+from data_designer.config.models import ChatCompletionInferenceParams, ModelConfig
+from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 
 RayDataLLMPlacement = Literal["ray-backend-stage-optimization"]
 RayDataLLMTaskType = Literal["generate", "embed", "classify", "score"]
@@ -21,10 +22,10 @@ _REQUIRED_RAY_DATA_LLM_SYMBOLS = ("build_processor", "vLLMEngineProcessorConfig"
 _SUPPORTED_TASK_TYPES = ("generate", "embed", "classify", "score")
 _RECOMMENDED_PLACEMENT: RayDataLLMPlacement = "ray-backend-stage-optimization"
 _DEFAULT_SEMANTIC_CONTRACT = (
-    "The prototype hook is planning-only; selected stages still execute through the existing ModelFacade path.",
-    "Usage stats remain the ModelFacade source of truth until Ray Data LLM responses are normalized into model usage deltas.",
-    "Ray Data LLM execution must wrap Ray/vLLM exceptions in RayDatasetGenerationError before it replaces a worker stage.",
-    "Ordering and dropped-row semantics must remain owned by RayBackend ordering and row-count validation.",
+    "Ray Data LLM execution is opt-in and limited to one independent plain LLMTextColumnConfig stage.",
+    "Usage stats remain unavailable for the Ray Data LLM execution path until responses are normalized into model usage deltas.",
+    "Ray Data LLM execution wraps Ray/vLLM exceptions in RayDatasetGenerationError before replacing a worker stage.",
+    "Ordering semantics remain owned by RayBackend ordering; dropped-row and processor semantics are not supported by the prototype.",
     "Artifact and observability output must use existing RayBackend artifact columns, metrics, and dataset analysis payloads.",
 )
 _RECOMMENDATION = (
@@ -42,8 +43,10 @@ _BLOCKING_GAPS = (
 )
 _SAFE_FIRST_SLICE = (
     "Detect Ray Data LLM availability and keep external providers on the existing OpenAI-compatible facade. "
-    "A future prototype can add a RayBackend-only stage for one eligible independent LLM text column."
+    "The executable prototype is RayBackend-only and supports one eligible independent LLM text column."
 )
+_ORIGINAL_ROW_KEY = "__data_designer_ray_llm_original_row"
+_RAY_RANGE_ID_COLUMN = "id"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +54,7 @@ class RayDataLLMStageOptions:
     """Explicit opt-in controls for the RayBackend Ray Data LLM/vLLM prototype hook."""
 
     enabled: bool = False
+    execute: bool = False
     model_source: str | None = None
     column_names: tuple[str, ...] = ()
     model_aliases: tuple[str, ...] = ()
@@ -63,6 +67,7 @@ class RayDataLLMStageOptions:
 
     def __post_init__(self) -> None:
         _validate_bool("enabled", self.enabled)
+        _validate_bool("execute", self.execute)
         _validate_optional_non_empty_string("model_source", self.model_source)
         _validate_non_empty_string_tuple("column_names", self.column_names)
         _validate_non_empty_string_tuple("model_aliases", self.model_aliases)
@@ -80,6 +85,8 @@ class RayDataLLMStageOptions:
             raise RayBackendConfigurationError(
                 "RayDataLLMStageOptions enabled=True requires model_source for the local vLLM engine."
             )
+        if self.execute and not self.enabled:
+            raise RayBackendConfigurationError("RayDataLLMStageOptions execute=True requires enabled=True.")
         if self.enabled and not self.column_names and not self.model_aliases:
             raise RayBackendConfigurationError(
                 "RayDataLLMStageOptions enabled=True requires column_names or model_aliases."
@@ -89,6 +96,11 @@ class RayDataLLMStageOptions:
     def has_explicit_opt_in(self) -> bool:
         """Return whether the RayBackend should evaluate Ray Data LLM stage eligibility."""
         return self.enabled
+
+    @property
+    def should_execute(self) -> bool:
+        """Return whether the RayBackend should replace worker execution with Ray Data LLM."""
+        return self.enabled and self.execute
 
     def processor_config_kwargs(self) -> dict[str, Any]:
         """Return Ray Data LLM processor config kwargs for a future execution stage."""
@@ -183,6 +195,60 @@ class RayDataLLMStagePlan:
     def has_eligible_stage(self) -> bool:
         """Return whether the planner found exactly one executable prototype stage."""
         return self.selected_candidate is not None
+
+    @property
+    def should_execute(self) -> bool:
+        """Return whether this plan requests Ray Data LLM execution."""
+        return self.options.should_execute
+
+
+@dataclass(frozen=True, slots=True)
+class _RayDataLLMExecutionAPI:
+    build_processor: Any
+    vllm_engine_processor_config: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _RayDataLLMTextPreprocessor:
+    prompt: str
+    system_prompt: str | None
+    sampling_params: Mapping[str, Any]
+    preserve_input_columns: bool
+    hidden_order_column: str | None
+    range_order_column: str
+
+    def __call__(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        original_row = dict(row) if self.preserve_input_columns else {}
+        if self.hidden_order_column is not None:
+            if self.hidden_order_column in row:
+                original_row[self.hidden_order_column] = row[self.hidden_order_column]
+            elif self.range_order_column in row:
+                original_row[self.hidden_order_column] = row[self.range_order_column]
+        messages: list[dict[str, str]] = []
+        if self.system_prompt is not None:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": self.prompt})
+        output: dict[str, Any] = {
+            _ORIGINAL_ROW_KEY: original_row,
+            "messages": messages,
+        }
+        if self.sampling_params:
+            output["sampling_params"] = dict(self.sampling_params)
+        return output
+
+
+@dataclass(frozen=True, slots=True)
+class _RayDataLLMTextPostprocessor:
+    column_name: str
+
+    def __call__(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        if _ORIGINAL_ROW_KEY not in row:
+            raise RayDatasetGenerationError("Ray Data LLM postprocess did not receive the preserved original row.")
+        if "generated_text" not in row:
+            raise RayDatasetGenerationError("Ray Data LLM vLLM response did not contain generated_text.")
+        output = dict(row[_ORIGINAL_ROW_KEY])
+        output[self.column_name] = row["generated_text"]
+        return output
 
 
 def probe_ray_data_llm_capabilities() -> RayDataLLMCapabilities:
@@ -289,11 +355,200 @@ def plan_ray_data_llm_stage(
     )
 
 
+def validate_ray_data_llm_execution_plan(
+    *,
+    config_builder: DataDesignerConfigBuilder,
+    plan: RayDataLLMStagePlan,
+) -> None:
+    """Validate the executable Ray Data LLM prototype slice.
+
+    The planner can record broader future candidates. Actual execution is much
+    narrower so the backend does not silently bypass ModelFacade-only semantics.
+    """
+    if not plan.should_execute:
+        return
+    if not plan.has_eligible_stage:
+        reason = plan.disabled_reason or "no eligible Ray Data LLM stage candidate was found"
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution was requested but cannot be planned: "
+            f"{reason} Disable execute=True to use the existing ModelFacade execution path."
+        )
+    selected_candidate = plan.selected_candidate
+    if selected_candidate is None or selected_candidate.task_type != "generate":
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution currently supports only task_type='generate'."
+        )
+
+    column_configs = config_builder.get_column_configs()
+    if len(column_configs) != 1:
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution currently supports configs with exactly one selected "
+            "LLMTextColumnConfig and no other generated columns."
+        )
+    column_config = column_configs[0]
+    if type(column_config) is not LLMTextColumnConfig or column_config.name != selected_candidate.column_name:
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution currently supports exactly one selected LLMTextColumnConfig."
+        )
+    if config_builder.get_processor_configs():
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution does not yet support DataDesigner processor configs."
+        )
+
+    model_config = _model_config_for_alias(config_builder, selected_candidate.model_alias)
+    blocked_reasons = _text_execution_blocked_reasons(column_config, model_config, plan.options)
+    if blocked_reasons:
+        raise RayBackendConfigurationError(
+            "RayBackend Ray Data LLM execution cannot preserve this LLM text column yet: " + " ".join(blocked_reasons)
+        )
+
+
+def apply_ray_data_llm_stage(
+    dataset: Any,
+    *,
+    config_builder: DataDesignerConfigBuilder,
+    plan: RayDataLLMStagePlan,
+    preserve_input_columns: bool,
+    hidden_order_column: str | None = None,
+    range_order_column: str = _RAY_RANGE_ID_COLUMN,
+) -> Any:
+    """Apply the optional Ray Data LLM processor stage to a Ray Dataset."""
+    validate_ray_data_llm_execution_plan(config_builder=config_builder, plan=plan)
+    selected_candidate = plan.selected_candidate
+    if selected_candidate is None:
+        raise RayDatasetGenerationError("RayBackend Ray Data LLM execution has no selected stage candidate.")
+    column_config = _selected_text_column_config(config_builder, selected_candidate)
+    model_config = _model_config_for_alias(config_builder, selected_candidate.model_alias)
+    execution_api = _load_ray_data_llm_execution_api()
+    try:
+        processor_config = execution_api.vllm_engine_processor_config(**plan.options.processor_config_kwargs())
+        processor = execution_api.build_processor(
+            processor_config,
+            preprocess=_RayDataLLMTextPreprocessor(
+                prompt=column_config.prompt,
+                system_prompt=column_config.system_prompt,
+                sampling_params=_sampling_params_from_model_config(model_config),
+                preserve_input_columns=preserve_input_columns,
+                hidden_order_column=hidden_order_column,
+                range_order_column=range_order_column,
+            ),
+            postprocess=_RayDataLLMTextPostprocessor(column_name=column_config.name),
+        )
+        return processor(dataset)
+    except RayDatasetGenerationError:
+        raise
+    except RayBackendConfigurationError:
+        raise
+    except Exception as exc:
+        raise RayDatasetGenerationError("RayBackend Ray Data LLM execution failed.") from exc
+
+
 def _package_version(package_name: str) -> str | None:
     try:
         return version(package_name)
     except PackageNotFoundError:
         return None
+
+
+def _load_ray_data_llm_execution_api() -> _RayDataLLMExecutionAPI:
+    try:
+        ray_data_llm = importlib.import_module("ray.data.llm")
+    except Exception as exc:
+        raise RayDatasetGenerationError(
+            "RayBackend Ray Data LLM execution requires Ray LLM optional dependencies. "
+            "Install the Ray LLM extra, including dependencies such as boto3 and vLLM."
+        ) from exc
+
+    missing_symbols = tuple(symbol for symbol in _REQUIRED_RAY_DATA_LLM_SYMBOLS if not hasattr(ray_data_llm, symbol))
+    if missing_symbols:
+        raise RayDatasetGenerationError(
+            "RayBackend Ray Data LLM execution requires ray.data.llm symbols "
+            f"{_REQUIRED_RAY_DATA_LLM_SYMBOLS!r}; missing {missing_symbols!r}."
+        )
+    try:
+        importlib.import_module("vllm")
+    except Exception as exc:
+        raise RayDatasetGenerationError(
+            "RayBackend Ray Data LLM execution requires vLLM to be importable on the driver and Ray workers."
+        ) from exc
+    return _RayDataLLMExecutionAPI(
+        build_processor=ray_data_llm.build_processor,
+        vllm_engine_processor_config=ray_data_llm.vLLMEngineProcessorConfig,
+    )
+
+
+def _selected_text_column_config(
+    config_builder: DataDesignerConfigBuilder,
+    selected_candidate: RayDataLLMStageCandidate,
+) -> LLMTextColumnConfig:
+    for column_config in config_builder.get_column_configs():
+        if type(column_config) is LLMTextColumnConfig and column_config.name == selected_candidate.column_name:
+            return column_config
+    raise RayBackendConfigurationError(
+        f"RayBackend Ray Data LLM selected column {selected_candidate.column_name!r} was not found."
+    )
+
+
+def _model_config_for_alias(
+    config_builder: DataDesignerConfigBuilder,
+    model_alias: str | None,
+) -> ModelConfig:
+    if model_alias is None:
+        raise RayBackendConfigurationError("RayBackend Ray Data LLM selected column has no model alias.")
+    for model_config in config_builder.model_configs:
+        if model_config.alias == model_alias:
+            return model_config
+    raise RayBackendConfigurationError(f"RayBackend Ray Data LLM model alias {model_alias!r} was not found.")
+
+
+def _text_execution_blocked_reasons(
+    column_config: LLMTextColumnConfig,
+    model_config: ModelConfig,
+    options: RayDataLLMStageOptions,
+) -> list[str]:
+    blocked_reasons: list[str] = []
+    if column_config.drop:
+        blocked_reasons.append("drop=True is not supported.")
+    if column_config.skip is not None:
+        blocked_reasons.append("skip expressions are not supported.")
+    if column_config.allow_resize:
+        blocked_reasons.append("allow_resize is not supported.")
+    if not isinstance(model_config.inference_parameters, ChatCompletionInferenceParams):
+        blocked_reasons.append("the selected model must use ChatCompletionInferenceParams.")
+    if isinstance(options.concurrency, tuple) and len(options.concurrency) != 2:
+        blocked_reasons.append("execution supports only integer concurrency or a 2-item autoscaling tuple.")
+    blocked_reasons.extend(_sampling_params_blocked_reasons(model_config))
+    return blocked_reasons
+
+
+def _sampling_params_blocked_reasons(model_config: ModelConfig) -> list[str]:
+    inference_params = model_config.inference_parameters
+    if not isinstance(inference_params, ChatCompletionInferenceParams):
+        return []
+    blocked_reasons: list[str] = []
+    if inference_params.timeout is not None:
+        blocked_reasons.append("per-request timeout is not a vLLM sampling parameter.")
+    if inference_params.extra_body:
+        blocked_reasons.append("extra_body passthrough is not supported by the prototype.")
+    for field_name in ("temperature", "top_p"):
+        value = getattr(inference_params, field_name)
+        if hasattr(value, "sample"):
+            blocked_reasons.append(f"{field_name} distributions are not supported by the prototype.")
+    return blocked_reasons
+
+
+def _sampling_params_from_model_config(model_config: ModelConfig) -> dict[str, Any]:
+    inference_params = model_config.inference_parameters
+    if not isinstance(inference_params, ChatCompletionInferenceParams):
+        return {}
+    sampling_params: dict[str, Any] = {}
+    if inference_params.temperature is not None:
+        sampling_params["temperature"] = inference_params.temperature
+    if inference_params.top_p is not None:
+        sampling_params["top_p"] = inference_params.top_p
+    if inference_params.max_tokens is not None:
+        sampling_params["max_tokens"] = inference_params.max_tokens
+    return sampling_params
 
 
 def _assess_stage_candidate(column_config: Any, options: RayDataLLMStageOptions) -> RayDataLLMStageCandidate | None:

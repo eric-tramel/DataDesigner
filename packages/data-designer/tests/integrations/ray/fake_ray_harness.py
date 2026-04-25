@@ -157,8 +157,28 @@ class FakeRayDataset:
         self.map_batches_kwargs: dict[str, Any] | None = None
         self.map_batches_fn: Any | None = None
         self.map_batches_calls: list[FakeMapBatchesCall] = []
+        self.map_calls: list[dict[str, Any]] = []
         self.repartition_calls: list[dict[str, Any]] = []
         self.write_datasink_kwargs: dict[str, Any] | None = None
+
+    def map(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
+        self.map_calls.append({"fn": fn, "kwargs": dict(kwargs)})
+        if self.data_module is not None:
+            self.data_module.map_calls.append({"fn": fn, "kwargs": dict(kwargs)})
+        blocks: list[lazy.pd.DataFrame] = []
+        for block in self.blocks:
+            dataframe = coerce_pandas_dataframe(block)
+            records = [fn(row, **(kwargs.get("fn_kwargs") or {})) for row in dataframe.to_dict(orient="records")]
+            blocks.append(lazy.pd.DataFrame(records))
+        mapped = FakeRayDataset(
+            blocks,
+            data_module=self.data_module,
+            reverse_mapped_blocks=self.reverse_mapped_blocks,
+            data_context=self.data_context,
+        )
+        mapped.repartition_calls = list(self.repartition_calls)
+        mapped.map_calls = list(self.map_calls)
+        return mapped
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         if self.data_module is not None:
@@ -179,6 +199,7 @@ class FakeRayDataset:
             data_context=self.data_context,
         )
         mapped.repartition_calls = list(self.repartition_calls)
+        mapped.map_calls = list(self.map_calls)
         return mapped
 
     def write_datasink(
@@ -227,6 +248,7 @@ class FakeRayDataset:
             data_context=self.data_context,
         )
         repartitioned.repartition_calls = list(self.repartition_calls)
+        repartitioned.map_calls = list(self.map_calls)
         return repartitioned
 
     def zip(self, other: FakeRayDataset) -> FakeRayDataset:
@@ -246,6 +268,7 @@ class FakeRayDataset:
             data_context=self.data_context or other.data_context,
         )
         zipped.repartition_calls = list(self.repartition_calls)
+        zipped.map_calls = list(self.map_calls)
         return zipped
 
     def filter(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
@@ -262,6 +285,7 @@ class FakeRayDataset:
             data_context=self.data_context,
         )
         filtered.repartition_calls = list(self.repartition_calls)
+        filtered.map_calls = list(self.map_calls)
         return filtered
 
     def limit(self, limit: int) -> FakeRayDataset:
@@ -283,6 +307,7 @@ class FakeRayDataset:
             data_context=self.data_context,
         )
         limited.repartition_calls = list(self.repartition_calls)
+        limited.map_calls = list(self.map_calls)
         return limited
 
     def union(self, *others: FakeRayDataset) -> FakeRayDataset:
@@ -293,6 +318,7 @@ class FakeRayDataset:
             data_context=self.data_context,
         )
         unioned.repartition_calls = list(self.repartition_calls)
+        unioned.map_calls = list(self.map_calls)
         return unioned
 
     def to_arrow_refs(self) -> list[Any]:
@@ -312,6 +338,7 @@ class FakeRayDataset:
         sorted_df = self.to_pandas().sort_values(column, kind="stable").reset_index(drop=True)
         sorted_dataset = FakeRayDataset([sorted_df], data_module=self.data_module, data_context=self.data_context)
         sorted_dataset.repartition_calls = list(self.repartition_calls)
+        sorted_dataset.map_calls = list(self.map_calls)
         return sorted_dataset
 
     def drop_columns(self, columns: list[str]) -> FakeRayDataset:
@@ -322,6 +349,7 @@ class FakeRayDataset:
             data_context=self.data_context,
         )
         dropped.repartition_calls = list(self.repartition_calls)
+        dropped.map_calls = list(self.map_calls)
         return dropped
 
     def num_blocks(self) -> int:
@@ -369,6 +397,7 @@ class FakeRayDataModule:
         self.ExecutionResources = FakeExecutionResources
         self.latest_dataset_context: FakeDataContext | None = None
         self.map_batches_calls: list[FakeMapBatchesCall] = []
+        self.map_calls: list[dict[str, Any]] = []
 
     def dataset(
         self,

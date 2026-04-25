@@ -88,9 +88,19 @@ def test_ray_data_llm_stage_options_require_explicit_model_source() -> None:
         ray_llm.RayDataLLMStageOptions(enabled=True, column_names=("summary",))
 
 
+def test_ray_data_llm_stage_options_require_enabled_before_execute() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="execute=True requires enabled=True"):
+        ray_llm.RayDataLLMStageOptions(
+            execute=True,
+            model_source="local-model",
+            column_names=("summary",),
+        )
+
+
 def test_ray_data_llm_stage_options_build_processor_config_kwargs() -> None:
     options = ray_llm.RayDataLLMStageOptions(
         enabled=True,
+        execute=True,
         model_source="local-model",
         column_names=("summary",),
         batch_size=8,
