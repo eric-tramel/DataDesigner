@@ -590,12 +590,12 @@ def _dataset_fingerprint(df: pd.DataFrame) -> str:
 
 def _run_single_benchmark(settings: BenchmarkSettings, engine_mode: str) -> BenchmarkResult:
     # Imports are deferred so engine selection respects DATA_DESIGNER_ASYNC_ENGINE.
-    from data_designer.engine.dataset_builders.artifact_storage import ArtifactStorage
     from data_designer.engine.dataset_builders.dataset_builder import DatasetBuilder
     from data_designer.engine.model_provider import resolve_model_provider_registry
     from data_designer.engine.resources.resource_provider import create_resource_provider
     from data_designer.engine.resources.seed_reader import SeedReaderRegistry
     from data_designer.engine.secret_resolver import CompositeResolver, EnvironmentResolver, PlaintextResolver
+    from data_designer.engine.storage.artifact_storage import ArtifactStorage
 
     random.seed(settings.seed)
     np.random.seed(settings.seed)
@@ -630,7 +630,6 @@ def _run_single_benchmark(settings: BenchmarkSettings, engine_mode: str) -> Benc
             secret_resolver=secret_resolver,
             model_provider_registry=model_provider_registry,
             seed_reader_registry=SeedReaderRegistry(readers=[]),
-            blob_storage=None,
             seed_dataset_source=None,
             run_config=run_config,
             mcp_providers=[mcp_provider],
