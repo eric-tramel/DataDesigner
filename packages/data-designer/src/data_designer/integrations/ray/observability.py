@@ -17,6 +17,17 @@ ModelUsageSummary = dict[str, dict[str, Any]]
 RayTraceEventPayload: TypeAlias = "RayTraceEvent | Mapping[str, Any]"
 RayWorkerProfilePayload: TypeAlias = "RayWorkerProfile | Mapping[str, Any]"
 RayThrottleSnapshotPayload: TypeAlias = "RayThrottleSnapshot | Mapping[str, Any]"
+_RAY_REPORT_SECTION_ALIASES = {
+    "overview": "summary",
+    "summary": "summary",
+    "worker_profiles": "worker_profiles",
+    "profiles": "worker_profiles",
+    "trace_events": "trace_events",
+    "traces": "trace_events",
+    "throttle_snapshots": "throttle_snapshots",
+    "throttles": "throttle_snapshots",
+}
+_RAY_REPORT_SECTIONS = frozenset(_RAY_REPORT_SECTION_ALIASES.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,17 +154,45 @@ class RayDatasetAnalysis:
         return asdict(self)
 
     def to_report(self, save_path: str | Path | None = None, include_sections: list[Any] | None = None) -> None:
-        """Write a compact JSON or HTML report for Ray-native analysis."""
-        del include_sections
+        """Write a compact JSON or HTML report for Ray-native analysis.
+
+        Ray-native reports are bounded worker summaries, not the standard local
+        dataset profiler report. include_sections filters top-level Ray report
+        sections and accepts ``summary``/``overview``, ``worker_profiles``,
+        ``trace_events``, and ``throttle_snapshots``.
+        """
+        sections = _normalize_include_sections(include_sections)
         if save_path is None:
             return
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self.to_dict(), indent=2, sort_keys=True)
+        payload = json.dumps(self._report_payload(sections), indent=2, sort_keys=True)
         if path.suffix.lower() in {".html", ".htm"}:
             path.write_text(_analysis_payload_to_html(payload), encoding="utf-8")
             return
         path.write_text(f"{payload}\n", encoding="utf-8")
+
+    def _report_payload(self, sections: frozenset[str] | None) -> dict[str, Any]:
+        if sections is None:
+            return self.to_dict()
+        payload: dict[str, Any] = {}
+        if "summary" in sections:
+            payload["summary"] = {
+                "total_rows": self.total_rows,
+                "blocks": self.blocks,
+                "failed_blocks": self.failed_blocks,
+                "successful_blocks": self.successful_blocks,
+                "column_names": self.column_names,
+                "trace_events_dropped": self.trace_events_dropped,
+            }
+        if "worker_profiles" in sections:
+            payload["worker_profiles"] = [profile.to_dict() for profile in self.worker_profiles]
+        if "trace_events" in sections:
+            payload["trace_events"] = [event.to_dict() for event in self.trace_events]
+            payload["trace_events_dropped"] = self.trace_events_dropped
+        if "throttle_snapshots" in sections:
+            payload["throttle_snapshots"] = [snapshot.to_dict() for snapshot in self.throttle_snapshots]
+        return payload
 
 
 def normalize_ray_trace_event(payload: RayTraceEventPayload) -> RayTraceEvent:
@@ -223,6 +262,31 @@ def _analysis_payload_to_html(payload: str) -> str:
         f"{escaped}"
         "</pre></body></html>\n"
     )
+
+
+def _normalize_include_sections(include_sections: list[Any] | None) -> frozenset[str] | None:
+    if include_sections is None:
+        return None
+    sections: set[str] = set()
+    for section in include_sections:
+        section_name = _section_name(section)
+        normalized = _RAY_REPORT_SECTION_ALIASES.get(section_name)
+        if normalized is None:
+            supported = ", ".join(sorted(_RAY_REPORT_SECTIONS))
+            raise RayMetricsError(
+                f"RayDatasetAnalysis.to_report include_sections supports only Ray-native sections: {supported}."
+            )
+        sections.add(normalized)
+    return frozenset(sections)
+
+
+def _section_name(section: Any) -> str:
+    value = getattr(section, "value", section)
+    if not isinstance(value, str):
+        value = getattr(section, "name", section)
+    if not isinstance(value, str):
+        raise RayMetricsError("RayDatasetAnalysis.to_report include_sections values must be strings or enums.")
+    return value.lower()
 
 
 def _coerce_str(payload: Mapping[str, Any], field_name: str) -> str:
