@@ -28,6 +28,7 @@ from data_designer.integrations.ray import (
     RayDatasetGenerationError,
     RayDatasetMetrics,
     RayExecutionOptions,
+    RayInputRepartition,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
@@ -176,6 +177,91 @@ def test_ray_backend_rejects_block_planning_with_input_dataset(
     assert input_dataset.map_batches_kwargs is None
 
 
+def test_ray_backend_repartitions_input_dataset_by_num_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1, 2, 3, 4], "label": ["a", "b", "c", "d"]})])
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=2,
+            input_repartition=RayInputRepartition(num_blocks=2, shuffle=True),
+        ),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset)
+    output_dataset = results.load_dataset()
+    output_df = output_dataset.to_pandas()
+
+    assert input_dataset.repartition_calls == [{"num_blocks": 2, "target_num_rows_per_block": None, "shuffle": True}]
+    assert output_dataset.repartition_calls == input_dataset.repartition_calls
+    assert output_dataset.num_blocks() == 2
+    assert output_df.to_dict(orient="records") == [
+        {"x": 1, "label": "a", "x_label": "1-a"},
+        {"x": 2, "label": "b", "x_label": "2-b"},
+        {"x": 3, "label": "c", "x_label": "3-c"},
+        {"x": 4, "label": "d", "x_label": "4-d"},
+    ]
+
+
+def test_ray_backend_repartitions_object_refs_by_target_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_refs = [
+        lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]}),
+        lazy.pd.DataFrame({"x": [3], "label": ["c"]}),
+    ]
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=2,
+            input_repartition=RayInputRepartition(target_num_rows_per_block=2),
+        ),
+    )
+
+    output_dataset = designer.create(config_builder, input_dataset=input_refs).load_dataset()
+
+    assert fake_ray.data.from_arrow_refs_input == input_refs
+    assert output_dataset.repartition_calls == [{"num_blocks": None, "target_num_rows_per_block": 2, "shuffle": False}]
+    assert [len(block) for block in output_dataset.blocks] == [2, 1]
+
+
+def test_ray_backend_rejects_input_repartition_without_input_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sampler_only_config_builder: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(input_repartition=RayInputRepartition(num_blocks=2)),
+    )
+
+    with pytest.raises(RayBackendConfigurationError, match="input_repartition requires input_dataset"):
+        designer.create(stub_sampler_only_config_builder, num_records=4)
+
+    assert fake_ray.data.range_kwargs is None
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -203,6 +289,11 @@ def test_ray_backend_validates_invalid_block_planning_options(kwargs: dict[str, 
 def test_ray_backend_constructor_uses_configuration_error(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(RayBackendConfigurationError, match=match):
         RayBackend(**kwargs)
+
+
+def test_ray_backend_rejects_invalid_input_repartition_object() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="input_repartition"):
+        RayBackend(input_repartition=object())
 
 
 def test_ray_backend_defaults_bound_observability_storage() -> None:
@@ -345,6 +436,41 @@ def test_ray_driver_planner_captures_preserve_order_input_resolution(
     assert plan.ordering_mode.hidden_order_column == ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN
     assert plan.worker_payload.hidden_order_column == ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN
     assert ray_backend_module._RAY_INTERNAL_ROW_ID_COLUMN in plan.dataset_source.dataset.to_pandas().columns
+    assert plan.block_plan is None
+
+
+def test_ray_driver_planner_applies_input_repartition_before_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset(
+        [lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]}), lazy.pd.DataFrame({"x": [3], "label": ["c"]})]
+    )
+    backend = RayBackend(input_repartition=RayInputRepartition(num_blocks=3))
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=backend,
+    )
+
+    plan = ray_backend_module.RayDriverPlanner(backend=backend, ray=fake_ray).plan(
+        runtime_context=designer._create_backend_runtime_context(),
+        config_builder=_input_expression_config_builder(stub_model_configs),
+        num_records=3,
+        input_dataset=input_dataset,
+    )
+
+    assert plan.dataset_source.kind == "input_dataset"
+    assert plan.dataset_source.external_input_dataset is True
+    assert plan.dataset_source.dataset.repartition_calls == [
+        {"num_blocks": 3, "target_num_rows_per_block": None, "shuffle": False}
+    ]
+    assert plan.input_blocks == 3
     assert plan.block_plan is None
 
 
@@ -774,7 +900,7 @@ def test_ray_backend_rejects_invalid_input_dataset_type(
         backend=RayBackend(),
     )
 
-    with pytest.raises(TypeError, match="ray.data.Dataset or a sequence of Ray ObjectRefs"):
+    with pytest.raises(RayBackendConfigurationError, match="ray.data.Dataset or a sequence of Ray ObjectRefs"):
         designer.create(stub_sampler_only_config_builder, input_dataset=object())
 
 

@@ -231,17 +231,56 @@ class RayExecutionOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class RayInputRepartition:
+    """Controls for Ray Data repartitioning of an existing input dataset."""
+
+    num_blocks: int | None = None
+    target_num_rows_per_block: int | None = None
+    shuffle: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_optional_positive_int("num_blocks", self.num_blocks)
+        _validate_optional_positive_int("target_num_rows_per_block", self.target_num_rows_per_block)
+        if not isinstance(self.shuffle, bool):
+            raise RayBackendConfigurationError("RayInputRepartition shuffle must be a boolean.")
+        if self.num_blocks is not None and self.target_num_rows_per_block is not None:
+            raise RayBackendConfigurationError(
+                "RayInputRepartition num_blocks cannot be combined with target_num_rows_per_block."
+            )
+        if self.shuffle and self.target_num_rows_per_block is not None:
+            raise RayBackendConfigurationError(
+                "RayInputRepartition shuffle can only be used with num_blocks. "
+                "Ray target_num_rows_per_block repartitioning is streaming and does not shuffle."
+            )
+
+    @property
+    def has_explicit_controls(self) -> bool:
+        """Return whether the input dataset should be repartitioned."""
+        return self.num_blocks is not None or self.target_num_rows_per_block is not None
+
+    def to_repartition_kwargs(self) -> dict[str, Any]:
+        """Return keyword arguments accepted by ``ray.data.Dataset.repartition``."""
+        if self.num_blocks is not None:
+            return {"num_blocks": self.num_blocks, "shuffle": self.shuffle}
+        if self.target_num_rows_per_block is not None:
+            return {"target_num_rows_per_block": self.target_num_rows_per_block}
+        return {}
+
+
+@dataclass(frozen=True, slots=True)
 class RayBackendOptionResolution:
     """Resolved RayBackend option objects after applying compatibility shims."""
 
     block_planning: RayBlockPlanning
     execution_options: RayExecutionOptions
+    input_repartition: RayInputRepartition
 
 
 def resolve_ray_backend_options(
     *,
     block_planning: RayBlockPlanning | None = None,
     execution_options: RayExecutionOptions | None = None,
+    input_repartition: RayInputRepartition | None = None,
     legacy_options: Mapping[str, Any] | None = None,
 ) -> RayBackendOptionResolution:
     """Resolve RayBackend planning and execution option objects.
@@ -249,6 +288,7 @@ def resolve_ray_backend_options(
     Args:
         block_planning: Primary block-planning option object.
         execution_options: Primary Ray execution option object.
+        input_repartition: Primary input-dataset repartition option object.
         legacy_options: Backwards-compatible constructor kwargs for individual
             block-planning or execution settings.
 
@@ -279,6 +319,7 @@ def resolve_ray_backend_options(
     return RayBackendOptionResolution(
         block_planning=_resolve_ray_block_planning(block_planning, block_planning_kwargs),
         execution_options=_resolve_ray_execution_options(execution_options, execution_options_kwargs),
+        input_repartition=_resolve_ray_input_repartition(input_repartition),
     )
 
 
@@ -334,6 +375,14 @@ def _resolve_ray_execution_options(
         actor_pool_max_size=legacy_options.get("actor_pool_max_size"),
         actor_pool_initial_size=legacy_options.get("actor_pool_initial_size"),
     )
+
+
+def _resolve_ray_input_repartition(input_repartition: RayInputRepartition | None) -> RayInputRepartition:
+    if input_repartition is None:
+        return RayInputRepartition()
+    if not isinstance(input_repartition, RayInputRepartition):
+        raise RayBackendConfigurationError("RayBackend input_repartition must be a RayInputRepartition instance.")
+    return input_repartition
 
 
 def _has_effective_execution_legacy_options(legacy_options: Mapping[str, Any]) -> bool:

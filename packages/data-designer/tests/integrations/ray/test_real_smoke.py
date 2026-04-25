@@ -21,7 +21,7 @@ from data_designer.config.default_model_settings import (
     resolve_seed_default_model_settings,
 )
 from data_designer.engine.secret_resolver import PlaintextResolver
-from data_designer.integrations.ray import RayBackend
+from data_designer.integrations.ray import RayBackend, RayInputRepartition
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = pytest.mark.ray_real_smoke
@@ -157,6 +157,38 @@ def test_real_ray_streaming_out_of_core_parquet_smoke(
     assert sample["ticket_key"].notna().all()
     assert sample["routing_key"].str.contains("::").all()
     assert list(parquet_dir.glob("*.parquet"))
+
+
+def test_real_ray_input_dataset_repartition_smoke(
+    local_ray: Any,
+    real_ray_smoke_paths: Any,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    input_dataframe = lazy.pd.DataFrame({"x": [1, 2, 3, 4], "label": ["a", "b", "c", "d"]})
+    input_dataset = local_ray.data.from_pandas(input_dataframe)
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="x_label", expr="{{ x }}-{{ label }}"))
+    designer = DataDesigner(
+        artifact_path=real_ray_smoke_paths.artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=real_ray_smoke_paths.managed_assets_path,
+        backend=RayBackend(
+            batch_size=2,
+            output="arrow_refs",
+            input_repartition=RayInputRepartition(num_blocks=2),
+        ),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset)
+    output_df = results.load_dataset().to_pandas()
+    metrics = results.load_metrics()
+
+    assert len(results.output) == 2
+    assert metrics.blocks == 2
+    assert sorted(output_df["x"].tolist()) == [1, 2, 3, 4]
+    assert output_df["x_label"].notna().all()
 
 
 def _repo_root() -> Path:

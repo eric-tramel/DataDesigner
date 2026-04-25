@@ -41,6 +41,7 @@ class FakeRayDataset:
         self.map_batches_kwargs: dict[str, Any] | None = None
         self.map_batches_fn: Any | None = None
         self.map_batches_calls: list[FakeMapBatchesCall] = []
+        self.repartition_calls: list[dict[str, Any]] = []
 
     def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
         if self.data_module is not None:
@@ -51,11 +52,39 @@ class FakeRayDataset:
         blocks = map_batches_blocks(fn, self.blocks, kwargs)
         if self.reverse_mapped_blocks:
             blocks.reverse()
-        return FakeRayDataset(
+        mapped = FakeRayDataset(
             blocks,
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
         )
+        mapped.repartition_calls = list(self.repartition_calls)
+        return mapped
+
+    def repartition(
+        self,
+        num_blocks: int | None = None,
+        *,
+        target_num_rows_per_block: int | None = None,
+        shuffle: bool = False,
+    ) -> FakeRayDataset:
+        self.repartition_calls.append(
+            {
+                "num_blocks": num_blocks,
+                "target_num_rows_per_block": target_num_rows_per_block,
+                "shuffle": shuffle,
+            }
+        )
+        repartitioned = FakeRayDataset(
+            repartition_blocks(
+                self.blocks,
+                num_blocks=num_blocks,
+                target_num_rows_per_block=target_num_rows_per_block,
+            ),
+            data_module=self.data_module,
+            reverse_mapped_blocks=self.reverse_mapped_blocks,
+        )
+        repartitioned.repartition_calls = list(self.repartition_calls)
+        return repartitioned
 
     def zip(self, other: FakeRayDataset) -> FakeRayDataset:
         other_df = other.to_pandas()
@@ -67,11 +96,13 @@ class FakeRayDataset:
             other_block = other_df.iloc[offset : offset + block_len].reset_index(drop=True)
             blocks.append(lazy.pd.concat([block_df.reset_index(drop=True), other_block], axis=1))
             offset += block_len
-        return FakeRayDataset(
+        zipped = FakeRayDataset(
             blocks,
             data_module=self.data_module or other.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
         )
+        zipped.repartition_calls = list(self.repartition_calls)
+        return zipped
 
     def to_arrow_refs(self) -> list[Any]:
         if self.data_module is None:
@@ -88,14 +119,18 @@ class FakeRayDataset:
 
     def sort(self, column: str) -> FakeRayDataset:
         sorted_df = self.to_pandas().sort_values(column, kind="stable").reset_index(drop=True)
-        return FakeRayDataset([sorted_df], data_module=self.data_module)
+        sorted_dataset = FakeRayDataset([sorted_df], data_module=self.data_module)
+        sorted_dataset.repartition_calls = list(self.repartition_calls)
+        return sorted_dataset
 
     def drop_columns(self, columns: list[str]) -> FakeRayDataset:
-        return FakeRayDataset(
+        dropped = FakeRayDataset(
             [coerce_pandas_dataframe(block).drop(columns=columns) for block in self.blocks],
             data_module=self.data_module,
             reverse_mapped_blocks=self.reverse_mapped_blocks,
         )
+        dropped.repartition_calls = list(self.repartition_calls)
+        return dropped
 
     def num_blocks(self) -> int:
         return len(self.blocks)
@@ -270,6 +305,40 @@ def map_batches_blocks(fn: Any, blocks: list[Any], kwargs: dict[str, Any]) -> li
     fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
     map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
     return [coerce_pandas_dataframe(map_fn(coerce_pandas_dataframe(block), **fn_kwargs)) for block in blocks]
+
+
+def repartition_blocks(
+    blocks: list[Any],
+    *,
+    num_blocks: int | None,
+    target_num_rows_per_block: int | None,
+) -> list[lazy.pd.DataFrame]:
+    if num_blocks is None and target_num_rows_per_block is None:
+        return [coerce_pandas_dataframe(block) for block in blocks]
+    dataframe = (
+        lazy.pd.concat([coerce_pandas_dataframe(block) for block in blocks], ignore_index=True)
+        if blocks
+        else lazy.pd.DataFrame()
+    )
+    if num_blocks is not None:
+        return split_exact_blocks(dataframe, num_blocks)
+    if target_num_rows_per_block is None:
+        return [coerce_pandas_dataframe(block) for block in blocks]
+    return [
+        dataframe.iloc[start : start + target_num_rows_per_block].reset_index(drop=True)
+        for start in range(0, max(len(dataframe), 1), target_num_rows_per_block)
+    ]
+
+
+def split_exact_blocks(dataframe: lazy.pd.DataFrame, num_blocks: int) -> list[lazy.pd.DataFrame]:
+    block_size, remainder = divmod(len(dataframe), num_blocks)
+    blocks: list[lazy.pd.DataFrame] = []
+    start = 0
+    for block_index in range(num_blocks):
+        stop = start + block_size + (1 if block_index < remainder else 0)
+        blocks.append(dataframe.iloc[start:stop].reset_index(drop=True))
+        start = stop
+    return blocks
 
 
 def coerce_pandas_dataframe(value: Any) -> lazy.pd.DataFrame:

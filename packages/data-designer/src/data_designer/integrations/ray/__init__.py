@@ -30,6 +30,7 @@ from data_designer.integrations.ray.observability import (
 from data_designer.integrations.ray.options import (
     RayBlockPlanning,
     RayExecutionOptions,
+    RayInputRepartition,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "RayDatasetGenerationError",
     "RayDatasetMetrics",
     "RayExecutionOptions",
+    "RayInputRepartition",
     "RayIntegrationError",
     "RayMetricsError",
     "RayThrottleSnapshot",
