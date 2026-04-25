@@ -7,7 +7,12 @@ from typing import Any
 
 import pytest
 
-from data_designer.integrations.ray import RayBackendConfigurationError, RayBlockPlanning, RayExecutionOptions
+from data_designer.integrations.ray import (
+    RayBackendConfigurationError,
+    RayBlockPlanning,
+    RayExecutionOptions,
+    RayInputRepartition,
+)
 from data_designer.integrations.ray.options import resolve_ray_backend_options
 
 pytestmark = pytest.mark.ray_fake
@@ -100,10 +105,12 @@ def test_ray_backend_option_resolution_rejects_execution_option_conflicts() -> N
 def test_ray_backend_option_resolution_allows_noop_legacy_values_with_option_objects() -> None:
     block_planning = RayBlockPlanning(override_num_blocks=2)
     execution_options = RayExecutionOptions(num_cpus=0.5)
+    input_repartition = RayInputRepartition(num_blocks=4)
 
     resolved = resolve_ray_backend_options(
         block_planning=block_planning,
         execution_options=execution_options,
+        input_repartition=input_repartition,
         legacy_options={
             "override_num_blocks": None,
             "num_cpus": None,
@@ -113,8 +120,40 @@ def test_ray_backend_option_resolution_allows_noop_legacy_values_with_option_obj
 
     assert resolved.block_planning is block_planning
     assert resolved.execution_options is execution_options
+    assert resolved.input_repartition is input_repartition
 
 
 def test_ray_backend_option_resolution_rejects_unknown_legacy_options() -> None:
     with pytest.raises(RayBackendConfigurationError, match="unsupported Ray option arguments: unknown"):
         resolve_ray_backend_options(legacy_options={"unknown": 1})
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"num_blocks": 0}, "num_blocks.*positive integer"),
+        ({"target_num_rows_per_block": 0}, "target_num_rows_per_block.*positive integer"),
+        ({"shuffle": "yes"}, "shuffle.*boolean"),
+        ({"num_blocks": 2, "target_num_rows_per_block": 100}, "cannot be combined"),
+        ({"target_num_rows_per_block": 100, "shuffle": True}, "shuffle can only be used"),
+    ],
+)
+def test_ray_input_repartition_validation_uses_configuration_error(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(RayBackendConfigurationError, match=match):
+        RayInputRepartition(**kwargs)
+
+
+def test_ray_input_repartition_resolves_repartition_kwargs() -> None:
+    assert RayInputRepartition(num_blocks=3, shuffle=True).to_repartition_kwargs() == {
+        "num_blocks": 3,
+        "shuffle": True,
+    }
+    assert RayInputRepartition(target_num_rows_per_block=100).to_repartition_kwargs() == {
+        "target_num_rows_per_block": 100,
+    }
+    assert RayInputRepartition().to_repartition_kwargs() == {}
+
+
+def test_ray_backend_option_resolution_rejects_invalid_input_repartition_object() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="input_repartition"):
+        resolve_ray_backend_options(input_repartition=object())

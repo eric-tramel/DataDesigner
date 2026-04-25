@@ -154,7 +154,12 @@ to Ray workers so each worker can construct its local generation engine.
 Use option objects for Ray-specific planning and execution controls, while keeping common constructor arguments direct:
 
 ```python
-from data_designer.integrations.ray import RayBackend, RayBlockPlanning, RayExecutionOptions
+from data_designer.integrations.ray import (
+    RayBackend,
+    RayBlockPlanning,
+    RayExecutionOptions,
+    RayInputRepartition,
+)
 
 backend = RayBackend(
     batch_size=128,
@@ -169,6 +174,24 @@ backend = RayBackend(
 Ray planning and execution kwargs such as `override_num_blocks`, `read_concurrency`, `num_cpus`, and
 `map_concurrency` are still accepted as compatibility shims, but do not combine them with `block_planning` or
 `execution_options`; effective mixed values raise a configuration error. Prefer the option objects for new code.
+
+When passing an existing Ray Dataset or ObjectRefs through `input_dataset`, use `RayInputRepartition` to retune input
+blocks before Data Designer maps generation over them:
+
+```python
+backend = RayBackend(
+    batch_size=512,
+    input_repartition=RayInputRepartition(num_blocks=64),
+)
+
+results = dd.create(config_builder, input_dataset=ray_dataset)
+```
+
+Use `num_blocks` when downstream file or task parallelism needs an exact block count. Use
+`target_num_rows_per_block` when large input blocks should be split with Ray's streaming repartitioning. These controls
+are only for existing `input_dataset` inputs; for from-scratch generation, keep using `RayBlockPlanning`. If an upstream
+Ray pipeline already performs domain-specific partitioning, prefer repartitioning there and leave
+`input_repartition` unset so Data Designer preserves the upstream block layout.
 
 Ray observability is bounded on the metrics actor. `profile_workers=True` is enabled by default and computes
 per-block worker summaries before retaining up to `max_worker_profiles=1000` profiles. Trace events are retained up

@@ -20,6 +20,7 @@ def test_ray_package_root_exports_stable_public_api() -> None:
         "RayDatasetGenerationError",
         "RayDatasetMetrics",
         "RayExecutionOptions",
+        "RayInputRepartition",
         "RayIntegrationError",
         "RayMetricsError",
         "RayThrottleSnapshot",

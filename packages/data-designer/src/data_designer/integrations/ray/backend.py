@@ -26,7 +26,12 @@ from data_designer.integrations.ray.observability_collection import (
     _create_metrics_collector,
     _RayObservabilityOptions,
 )
-from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, resolve_ray_backend_options
+from data_designer.integrations.ray.options import (
+    RayBlockPlanning,
+    RayExecutionOptions,
+    RayInputRepartition,
+    resolve_ray_backend_options,
+)
 from data_designer.integrations.ray.processor_policy import (
     validate_no_ray_after_generation_processors,
     validate_ray_safe_processors,
@@ -241,6 +246,7 @@ class RayBackend:
         zero_copy_batch: bool = True,
         block_planning: RayBlockPlanning | None = None,
         execution_options: RayExecutionOptions | None = None,
+        input_repartition: RayInputRepartition | None = None,
         preflight_model_health_check: bool = True,
         worker_model_health_checks: bool = False,
         order_column: str | None = None,
@@ -269,10 +275,12 @@ class RayBackend:
         resolved_options = resolve_ray_backend_options(
             block_planning=block_planning,
             execution_options=execution_options,
+            input_repartition=input_repartition,
             legacy_options=legacy_options,
         )
         self.block_planning = resolved_options.block_planning
         self.execution_options = resolved_options.execution_options
+        self.input_repartition = resolved_options.input_repartition
         self.batch_size = batch_size
         self.output = output
         self.object_ref_format = object_ref_format
@@ -383,7 +391,7 @@ class RayBackend:
             if self.object_ref_format == "pandas":
                 return ray.data.from_pandas_refs(refs)
             return ray.data.from_arrow_refs(refs)
-        raise TypeError(
+        raise RayBackendConfigurationError(
             "RayBackend input_dataset must be a ray.data.Dataset or a sequence of Ray ObjectRefs "
             "containing PyArrow tables or pandas DataFrames."
         )
@@ -418,6 +426,11 @@ class RayDriverPlanner:
                 "range dataset. Remove override_num_blocks, target_block_size, min_blocks, max_blocks, "
                 "and read_concurrency when passing input_dataset."
             )
+        if not external_input_dataset and self._backend.input_repartition.has_explicit_controls:
+            raise RayBackendConfigurationError(
+                "RayBackend input_repartition requires input_dataset. "
+                "Use RayBlockPlanning for from-scratch range datasets."
+            )
 
         seed_window: ray_seed_planning.RaySeedWindow | None = None
         if not use_input_dataset and seed_config is not None:
@@ -449,6 +462,8 @@ class RayDriverPlanner:
             num_records=num_records,
             block_plan=block_plan,
         )
+        if external_input_dataset:
+            dataset = _repartition_input_dataset(dataset, self._backend.input_repartition)
         ordering_mode = RayOrderingMode(
             order_column=self._backend.order_column,
             hidden_order_column=(
@@ -560,6 +575,19 @@ def _initial_dataset_source_kind(input_dataset: Any | None) -> RayDatasetSourceK
     if hasattr(input_dataset, "map_batches"):
         return "input_dataset"
     return "object_refs"
+
+
+def _repartition_input_dataset(dataset: Any, input_repartition: RayInputRepartition) -> Any:
+    repartition_kwargs = input_repartition.to_repartition_kwargs()
+    if not repartition_kwargs:
+        return dataset
+    repartition = getattr(dataset, "repartition", None)
+    if not callable(repartition):
+        raise RayBackendConfigurationError("RayBackend input_repartition requires ray.data.Dataset.repartition().")
+    try:
+        return repartition(**repartition_kwargs)
+    except Exception as exc:
+        raise RayDatasetGenerationError("RayBackend failed to repartition the input dataset.") from exc
 
 
 def _create_driver_metrics(
