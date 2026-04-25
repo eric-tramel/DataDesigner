@@ -125,7 +125,7 @@ class RayJobPlan:
 
     dataset_source: RayDatasetSource
     block_plan: Any | None
-    worker_payload: _RayExecutionPayload
+    worker_payload: _RayExecutionPayload | None
     map_batches_kwargs: dict[str, Any]
     ordering_mode: RayOrderingMode
     metrics_collector: Any | None
@@ -133,6 +133,7 @@ class RayJobPlan:
     observability_options: _RayObservabilityOptions
     llm_stage_plan: RayDataLLMStagePlan
     llm_stage_config_builder: DataDesignerConfigBuilder
+    llm_stage_jinja_rendering_engine: Any
     output: RayOutputMode
     num_records: int
     input_blocks: int | None
@@ -463,6 +464,7 @@ class RayBackend:
                 preserve_input_columns=plan.dataset_source.use_input_dataset,
                 hidden_order_column=plan.ordering_mode.hidden_order_column,
                 range_order_column=ray_seed_planning.RAY_RANGE_ID_COLUMN,
+                jinja_rendering_engine=plan.llm_stage_jinja_rendering_engine,
             )
         else:
             try:
@@ -485,14 +487,20 @@ class RayBackend:
             return mapped, mapped, None
 
         try:
+            if plan.llm_stage_plan.should_execute and plan.output == "dataset":
+                result_dataset = _materialize_ray_data_llm_dataset(mapped)
+                return result_dataset, result_dataset, None
             output = mapped.to_arrow_refs() if plan.output == "arrow_refs" else None
             result_dataset = _dataset_from_arrow_refs(ray, output) if output is not None else mapped
         except RayDatasetGenerationError:
             raise
         except Exception as exc:
-            raise RayDatasetGenerationError(
-                "RayBackend failed while materializing Ray output blocks for output='arrow_refs'."
-            ) from exc
+            message = (
+                "RayBackend Ray Data LLM execution failed while materializing Ray output blocks."
+                if plan.llm_stage_plan.should_execute
+                else "RayBackend failed while materializing Ray output blocks for output='arrow_refs'."
+            )
+            raise RayDatasetGenerationError(message) from exc
         return result_dataset, mapped, output
 
     def _write_artifacts(
@@ -627,16 +635,6 @@ class RayDriverPlanner:
             validate_ray_safe_processors(config_builder, allow_dataset_artifacts=self._backend.write_artifacts)
         row_count_preserving = _is_row_count_preserving_config(config_builder)
 
-        model_aliases = _model_health_check_aliases(config_builder)
-        if self._backend.preflight_model_health_check:
-            _run_driver_model_health_check(runtime_context, config_builder, model_aliases)
-        execution_options = self._backend.execution_options.resolve_actor_pool_defaults(
-            model_configs=config_builder.model_configs,
-            model_providers=list(runtime_context.model_providers),
-            default_provider_name=runtime_context.default_provider_name,
-            model_aliases=model_aliases,
-        )
-
         block_plan = self._backend.block_planning.resolve(num_records=num_records) if input_dataset is None else None
         dataset = self._backend._resolve_input_dataset(
             self._ray,
@@ -675,7 +673,6 @@ class RayDriverPlanner:
             max_worker_profiles=self._backend.max_worker_profiles,
             max_throttle_snapshots=self._backend.max_throttle_snapshots,
         )
-        throttle_manager = self._create_throttle_manager(runtime_context, config_builder)
         llm_stage_plan = plan_ray_data_llm_stage(
             config_builder=config_builder,
             options=self._backend.llm_stage_options,
@@ -687,55 +684,73 @@ class RayDriverPlanner:
             dataset_source_kind=dataset_source_kind,
             output_chunk_rows=self._backend.output_chunk_rows,
         )
-        worker_config_builder = _clone_config_builder_for_worker(
-            config_builder,
-            worker_model_health_checks=self._backend.worker_model_health_checks,
-        )
-        worker_seed_readers = (
-            ray_seed_planning.input_dataset_seed_readers()
-            if use_input_dataset
-            else ray_seed_planning.clone_seed_readers_for_worker(runtime_context.seed_readers)
-        )
-        worker_options = _RayWorkerOptions(
-            model_providers=list(runtime_context.model_providers),
-            default_provider_name=runtime_context.default_provider_name,
-            secret_resolver=runtime_context.secret_resolver,
-            seed_readers=worker_seed_readers,
-            managed_assets_path=str(runtime_context.managed_assets_path),
-            person_reader=runtime_context.person_reader,
-            mcp_providers=list(runtime_context.mcp_providers),
-            run_config=runtime_context.run_config,
-            throttle_manager=throttle_manager,
-        )
-        execution_payload = _compile_ray_execution_payload(
-            config_builder=worker_config_builder,
-            worker_options=worker_options,
-            use_input_dataset=use_input_dataset,
-            seed_window=seed_window,
-            range_input_columns=_range_input_columns_for_config(
-                config_builder,
-                dataset_source_kind=dataset_source_kind,
-            ),
-            hidden_order_column=ordering_mode.hidden_order_column,
-            preserve_output_row_count=row_count_preserving,
-            output_chunk_rows=self._backend.output_chunk_rows,
-            capture_artifacts=self._backend.write_artifacts,
+        llm_stage_executes = llm_stage_plan.should_execute
+        model_aliases = [] if llm_stage_executes else _model_health_check_aliases(config_builder)
+        if self._backend.preflight_model_health_check and not llm_stage_executes:
+            _run_driver_model_health_check(runtime_context, config_builder, model_aliases)
+        throttle_manager = (
+            None if llm_stage_executes else self._create_throttle_manager(runtime_context, config_builder)
         )
 
-        map_batches_kwargs: dict[str, Any] = {
-            "fn_constructor_kwargs": {
-                "execution_payload": execution_payload,
-                "metrics_collector": metrics_collector,
-                "observability_options": observability_options,
-            },
-            "batch_size": self._backend.batch_size
-            if self._backend.batch_size is not None
-            else runtime_context.run_config.buffer_size,
-            "batch_format": "pandas",
-            "zero_copy_batch": self._backend.zero_copy_batch,
-        }
-        map_batches_kwargs.update(execution_options.to_map_batches_kwargs(self._ray))
-        map_batches_kwargs["udf_modifying_row_count"] = not row_count_preserving
+        batch_size = (
+            self._backend.batch_size if self._backend.batch_size is not None else runtime_context.run_config.buffer_size
+        )
+        execution_payload: _RayExecutionPayload | None = None
+        map_batches_kwargs: dict[str, Any] = {"batch_size": batch_size}
+        if not llm_stage_executes:
+            execution_options = self._backend.execution_options.resolve_actor_pool_defaults(
+                model_configs=config_builder.model_configs,
+                model_providers=list(runtime_context.model_providers),
+                default_provider_name=runtime_context.default_provider_name,
+                model_aliases=model_aliases,
+            )
+            worker_config_builder = _clone_config_builder_for_worker(
+                config_builder,
+                worker_model_health_checks=self._backend.worker_model_health_checks,
+            )
+            worker_seed_readers = (
+                ray_seed_planning.input_dataset_seed_readers()
+                if use_input_dataset
+                else ray_seed_planning.clone_seed_readers_for_worker(runtime_context.seed_readers)
+            )
+            worker_options = _RayWorkerOptions(
+                model_providers=list(runtime_context.model_providers),
+                default_provider_name=runtime_context.default_provider_name,
+                secret_resolver=runtime_context.secret_resolver,
+                seed_readers=worker_seed_readers,
+                managed_assets_path=str(runtime_context.managed_assets_path),
+                person_reader=runtime_context.person_reader,
+                mcp_providers=list(runtime_context.mcp_providers),
+                run_config=runtime_context.run_config,
+                throttle_manager=throttle_manager,
+            )
+            execution_payload = _compile_ray_execution_payload(
+                config_builder=worker_config_builder,
+                worker_options=worker_options,
+                use_input_dataset=use_input_dataset,
+                seed_window=seed_window,
+                range_input_columns=_range_input_columns_for_config(
+                    config_builder,
+                    dataset_source_kind=dataset_source_kind,
+                ),
+                hidden_order_column=ordering_mode.hidden_order_column,
+                preserve_output_row_count=row_count_preserving,
+                output_chunk_rows=self._backend.output_chunk_rows,
+                capture_artifacts=self._backend.write_artifacts,
+            )
+            map_batches_kwargs.update(
+                {
+                    "fn_constructor_kwargs": {
+                        "execution_payload": execution_payload,
+                        "metrics_collector": metrics_collector,
+                        "observability_options": observability_options,
+                    },
+                    "batch_format": "pandas",
+                    "zero_copy_batch": self._backend.zero_copy_batch,
+                    "udf_modifying_row_count": not row_count_preserving,
+                }
+            )
+            map_batches_kwargs.update(execution_options.to_map_batches_kwargs(self._ray))
 
         return RayJobPlan(
             dataset_source=RayDatasetSource(
@@ -753,6 +768,7 @@ class RayDriverPlanner:
             observability_options=observability_options,
             llm_stage_plan=llm_stage_plan,
             llm_stage_config_builder=config_builder,
+            llm_stage_jinja_rendering_engine=runtime_context.run_config.jinja_rendering_engine,
             output=self._backend.output,
             num_records=num_records,
             input_blocks=_get_num_blocks(dataset),
@@ -846,6 +862,22 @@ def _create_driver_metrics(
         blocks=output_blocks or plan.input_blocks or planned_blocks or 0,
         elapsed_seconds=elapsed_seconds,
     )
+
+
+def _materialize_ray_data_llm_dataset(dataset: Any) -> Any:
+    """Materialize the opt-in Ray Data LLM stage inside the RayBackend error boundary."""
+    materialize = getattr(dataset, "materialize", None)
+    try:
+        if callable(materialize):
+            return materialize()
+        count = getattr(dataset, "count", None)
+        if callable(count):
+            count()
+        return dataset
+    except RayDatasetGenerationError:
+        raise
+    except Exception as exc:
+        raise RayDatasetGenerationError("RayBackend Ray Data LLM execution failed while materializing output.") from exc
 
 
 def _validate_ray_backend_batch_size(batch_size: int | None) -> None:

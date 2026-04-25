@@ -122,7 +122,11 @@ def _map_batches_call_for(fake_ray: Any, fn: Any) -> FakeMapBatchesCall:
     raise AssertionError(f"fake Ray did not record map_batches call for {fn!r}")
 
 
-def _install_fake_ray_data_llm(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+def _install_fake_ray_data_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_vllm: bool = True,
+) -> list[dict[str, Any]]:
     processor_calls: list[dict[str, Any]] = []
 
     class FakeVLLMEngineProcessorConfig:
@@ -144,6 +148,7 @@ def _install_fake_ray_data_llm(monkeypatch: pytest.MonkeyPatch) -> list[dict[str
                 rows: list[dict[str, Any]] = []
                 for row in batch.to_dict(orient="records"):
                     messages = row["messages"]
+                    processor_calls[-1].setdefault("messages", []).append(messages)
                     row["generated_text"] = f"fake-vllm:{messages[-1]['content']}"
                     rows.append(row)
                 return lazy.pd.DataFrame(rows)
@@ -178,11 +183,47 @@ def _install_fake_ray_data_llm(monkeypatch: pytest.MonkeyPatch) -> list[dict[str
         if name == "ray.data.llm":
             return fake_ray_data_llm
         if name == "vllm":
+            if not include_vllm:
+                raise ModuleNotFoundError("No module named 'vllm'")
             return types.SimpleNamespace()
         return original_import_module(name)
 
     monkeypatch.setattr(ray_llm_module.importlib, "import_module", import_module)
     return processor_calls
+
+
+def _install_lazy_failing_ray_data_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeVLLMEngineProcessorConfig:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class LazyFailureDataset:
+        def materialize(self) -> None:
+            raise RuntimeError("lazy vllm execution failed")
+
+    def build_processor(
+        config: FakeVLLMEngineProcessorConfig,
+        preprocess: Any,
+        postprocess: Any,
+        **kwargs: Any,
+    ) -> Any:
+        del config, preprocess, postprocess, kwargs
+        return lambda dataset: LazyFailureDataset()
+
+    fake_ray_data_llm = types.SimpleNamespace(
+        build_processor=build_processor,
+        vLLMEngineProcessorConfig=FakeVLLMEngineProcessorConfig,
+    )
+    original_import_module = ray_llm_module.importlib.import_module
+
+    def import_module(name: str) -> Any:
+        if name == "ray.data.llm":
+            return fake_ray_data_llm
+        if name == "vllm":
+            return types.SimpleNamespace()
+        return original_import_module(name)
+
+    monkeypatch.setattr(ray_llm_module.importlib, "import_module", import_module)
 
 
 @custom_column_generator(required_columns=["x"])
@@ -1447,7 +1488,7 @@ def test_ray_backend_executes_opt_in_ray_data_llm_stage_with_fake_processor(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    install_fake_ray(monkeypatch)
+    fake_ray = install_fake_ray(monkeypatch)
     processor_calls = _install_fake_ray_data_llm(monkeypatch)
     input_dataset = FakeRayDataset(
         [
@@ -1502,7 +1543,82 @@ def test_ray_backend_executes_opt_in_ray_data_llm_stage_with_fake_processor(
     assert processor_calls[0]["config"].kwargs["model_source"] == "local-model"
     assert processor_calls[0]["config"].kwargs["batch_size"] == 4
     assert processor_calls[0]["config"].kwargs["concurrency"] == (1, 2)
-    assert all(call.fn is not ray_backend_module._RayBatchWorker for call in input_dataset.map_batches_calls)
+    assert all(call.fn is not ray_backend_module._RayBatchWorker for call in fake_ray.data.map_batches_calls)
+
+
+def test_ray_backend_ray_data_llm_execution_skips_unused_model_facade_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    _install_fake_ray_data_llm(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"id": [0]})])
+
+    def fail_preflight(*_: Any) -> None:
+        raise AssertionError("ModelFacade preflight should not run for Ray Data LLM execution")
+
+    monkeypatch.setattr(ray_backend_module, "_run_driver_model_health_check", fail_preflight)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            llm_stage_options=RayDataLLMStageOptions(
+                enabled=True,
+                execute=True,
+                model_source="local-model",
+                column_names=("text",),
+            ),
+        ),
+    )
+
+    results = designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert results.load_dataset().to_pandas().to_dict(orient="records") == [{"id": 0, "text": "fake-vllm:Say hello."}]
+    assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_backend_ray_data_llm_execution_renders_prompts_like_model_facade(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    processor_calls = _install_fake_ray_data_llm(monkeypatch)
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(
+        LLMTextColumnConfig(
+            name="text",
+            prompt="Say {{ 2 + 2 }}.",
+            system_prompt="",
+            model_alias="stub-model",
+        )
+    )
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            llm_stage_options=RayDataLLMStageOptions(
+                enabled=True,
+                execute=True,
+                model_source="local-model",
+                column_names=("text",),
+            ),
+        ),
+    )
+
+    results = designer.create(config_builder, num_records=1)
+
+    assert results.load_dataset().to_pandas().to_dict(orient="records") == [{"text": "fake-vllm:Say 4."}]
+    assert processor_calls[0]["messages"] == [[{"role": "user", "content": "Say 4."}]]
 
 
 def test_ray_backend_ray_data_llm_stage_drops_range_id_for_from_scratch_jobs(
@@ -1568,6 +1684,62 @@ def test_ray_backend_ray_data_llm_execution_requires_optional_dependencies(
         designer.create(_llm_config_builder(stub_model_configs), input_dataset=input_dataset)
 
     assert input_dataset.map_batches_kwargs is None
+
+
+def test_ray_backend_ray_data_llm_execution_requires_vllm_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    _install_fake_ray_data_llm(monkeypatch, include_vllm=False)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            llm_stage_options=RayDataLLMStageOptions(
+                enabled=True,
+                execute=True,
+                model_source="local-model",
+                column_names=("text",),
+            ),
+        ),
+    )
+
+    with pytest.raises(RayDatasetGenerationError, match="requires vLLM"):
+        designer.create(_llm_config_builder(stub_model_configs), num_records=1)
+
+
+def test_ray_backend_ray_data_llm_lazy_execution_failures_are_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    _install_lazy_failing_ray_data_llm(monkeypatch)
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(
+            batch_size=1,
+            llm_stage_options=RayDataLLMStageOptions(
+                enabled=True,
+                execute=True,
+                model_source="local-model",
+                column_names=("text",),
+            ),
+        ),
+    )
+
+    with pytest.raises(RayDatasetGenerationError, match="Ray Data LLM execution failed while materializing output"):
+        designer.create(_llm_config_builder(stub_model_configs), num_records=1)
 
 
 def test_ray_backend_default_llm_stage_planning_does_not_execute_ray_data_llm(

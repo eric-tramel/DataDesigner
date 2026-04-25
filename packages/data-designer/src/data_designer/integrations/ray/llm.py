@@ -12,6 +12,12 @@ from typing import Any, Literal
 from data_designer.config.column_configs import EmbeddingColumnConfig, LLMTextColumnConfig, TraceType
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.models import ChatCompletionInferenceParams, ModelConfig
+from data_designer.engine.column_generators.utils.prompt_renderer import (
+    PromptType,
+    RecordBasedPromptRenderer,
+    create_response_recipe,
+)
+from data_designer.engine.processing.utils import deserialize_json_values
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 
 RayDataLLMPlacement = Literal["ray-backend-stage-optimization"]
@@ -210,8 +216,8 @@ class _RayDataLLMExecutionAPI:
 
 @dataclass(frozen=True, slots=True)
 class _RayDataLLMTextPreprocessor:
-    prompt: str
-    system_prompt: str | None
+    column_config: LLMTextColumnConfig
+    jinja_rendering_engine: Any
     sampling_params: Mapping[str, Any]
     preserve_input_columns: bool
     hidden_order_column: str | None
@@ -224,10 +230,30 @@ class _RayDataLLMTextPreprocessor:
                 original_row[self.hidden_order_column] = row[self.hidden_order_column]
             elif self.range_order_column in row:
                 original_row[self.hidden_order_column] = row[self.range_order_column]
+        deserialized_record = deserialize_json_values(dict(row))
+        renderer = RecordBasedPromptRenderer(
+            response_recipe=create_response_recipe(self.column_config),
+            error_message_context={
+                "column_name": self.column_config.name,
+                "column_type": self.column_config.column_type,
+                "model_alias": str(self.column_config.model_alias),
+            },
+            jinja_rendering_engine=self.jinja_rendering_engine,
+        )
+        prompt = renderer.render(
+            record=deserialized_record,
+            prompt_template=self.column_config.prompt,
+            prompt_type=PromptType.USER_PROMPT,
+        )
+        system_prompt = renderer.render(
+            record=deserialized_record,
+            prompt_template=self.column_config.system_prompt,
+            prompt_type=PromptType.SYSTEM_PROMPT,
+        )
         messages: list[dict[str, str]] = []
-        if self.system_prompt is not None:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": self.prompt})
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt or ""})
         output: dict[str, Any] = {
             _ORIGINAL_ROW_KEY: original_row,
             "messages": messages,
@@ -409,6 +435,7 @@ def apply_ray_data_llm_stage(
     config_builder: DataDesignerConfigBuilder,
     plan: RayDataLLMStagePlan,
     preserve_input_columns: bool,
+    jinja_rendering_engine: Any,
     hidden_order_column: str | None = None,
     range_order_column: str = _RAY_RANGE_ID_COLUMN,
 ) -> Any:
@@ -425,8 +452,8 @@ def apply_ray_data_llm_stage(
         processor = execution_api.build_processor(
             processor_config,
             preprocess=_RayDataLLMTextPreprocessor(
-                prompt=column_config.prompt,
-                system_prompt=column_config.system_prompt,
+                column_config=column_config,
+                jinja_rendering_engine=jinja_rendering_engine,
                 sampling_params=_sampling_params_from_model_config(model_config),
                 preserve_input_columns=preserve_input_columns,
                 hidden_order_column=hidden_order_column,
