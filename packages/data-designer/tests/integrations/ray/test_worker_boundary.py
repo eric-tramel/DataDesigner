@@ -23,6 +23,7 @@ from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = [pytest.mark.ray_fake, pytest.mark.ray_worker_boundary]
@@ -87,7 +88,7 @@ def _worker_options_from_designer(data_designer: DataDesigner) -> ray_backend_mo
         model_providers=list(runtime_context.model_providers),
         default_provider_name=runtime_context.default_provider_name,
         secret_resolver=runtime_context.secret_resolver,
-        seed_readers=ray_backend_module._clone_seed_readers_for_worker(runtime_context.seed_readers),
+        seed_readers=ray_seed_planning.clone_seed_readers_for_worker(runtime_context.seed_readers),
         managed_assets_path=str(runtime_context.managed_assets_path),
         person_reader=runtime_context.person_reader,
         mcp_providers=list(runtime_context.mcp_providers),
@@ -104,7 +105,7 @@ def test_seed_reader_worker_clone_removes_attachment_state() -> None:
     assert reader.get_seed_dataset_size() == 1
     assert getattr(reader, "_duckdb_conn") is not None
 
-    clone = ray_backend_module._clone_seed_readers_for_worker([reader])[0]
+    clone = ray_seed_planning.clone_seed_readers_for_worker([reader])[0]
 
     assert clone is not reader
     assert isinstance(clone, DataFrameSeedReader)
