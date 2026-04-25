@@ -11,6 +11,7 @@ import socket
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
@@ -1534,32 +1535,70 @@ def _profile_worker_output(
 def _snapshot_worker_throttle(throttle_manager: Any | None) -> list[RayThrottleSnapshot]:
     if throttle_manager is None:
         return []
-    domains = getattr(throttle_manager, "_domains", None)
-    if not isinstance(domains, dict):
+    snapshot = getattr(throttle_manager, "snapshot", None)
+    if not callable(snapshot):
         return []
-    get_effective_max = getattr(throttle_manager, "get_effective_max", None)
+    try:
+        payload = snapshot()
+    except Exception:
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    global_caps = _effective_max_by_throttle_key(payload.get("global_caps"))
+    domains = payload.get("domains")
+    if not isinstance(domains, list):
+        return []
     snapshots: list[RayThrottleSnapshot] = []
-    for key, state in domains.items():
-        if not isinstance(key, tuple) or len(key) != 3:
+    for domain_payload in domains:
+        if not isinstance(domain_payload, Mapping):
             continue
-        provider_name, model_id, domain = key
+        provider_name = domain_payload.get("provider_name")
+        model_id = domain_payload.get("model_id")
+        domain = domain_payload.get("domain")
         if not all(isinstance(value, str) for value in (provider_name, model_id, domain)):
             continue
-        effective_max = get_effective_max(provider_name, model_id) if callable(get_effective_max) else None
+        effective_max = _safe_optional_int_mapping(domain_payload, "effective_max")
+        if effective_max is None:
+            effective_max = global_caps.get((provider_name, model_id))
         snapshots.append(
             RayThrottleSnapshot(
                 provider_name=provider_name,
                 model_id=model_id,
                 domain=domain,
-                current_limit=_safe_int_attr(state, "current_limit"),
+                current_limit=_safe_int_mapping(domain_payload, "current_limit"),
                 effective_max=effective_max,
-                in_flight=_safe_int_attr(state, "in_flight"),
-                waiters=_safe_int_attr(state, "waiters"),
-                rate_limit_ceiling=_safe_int_attr(state, "rate_limit_ceiling"),
-                consecutive_rate_limits=_safe_int_attr(state, "consecutive_429s"),
+                in_flight=_safe_int_mapping(domain_payload, "in_flight"),
+                waiters=_safe_int_mapping(domain_payload, "waiters"),
+                rate_limit_ceiling=_safe_int_mapping(domain_payload, "rate_limit_ceiling"),
+                consecutive_rate_limits=_safe_int_mapping(
+                    domain_payload,
+                    "consecutive_rate_limits",
+                    fallback_field_name="consecutive_429s",
+                ),
             )
         )
     return snapshots
+
+
+def _effective_max_by_throttle_key(global_caps: Any) -> dict[tuple[str, str], int]:
+    if not isinstance(global_caps, list):
+        return {}
+    effective_by_key: dict[tuple[str, str], int] = {}
+    for cap_payload in global_caps:
+        if not isinstance(cap_payload, Mapping):
+            continue
+        provider_name = cap_payload.get("provider_name")
+        model_id = cap_payload.get("model_id")
+        effective_max = cap_payload.get("effective_max")
+        if (
+            isinstance(provider_name, str)
+            and isinstance(model_id, str)
+            and isinstance(effective_max, int)
+            and not isinstance(effective_max, bool)
+            and effective_max >= 0
+        ):
+            effective_by_key[(provider_name, model_id)] = effective_max
+    return effective_by_key
 
 
 def _task_traces_to_events(
@@ -1656,9 +1695,23 @@ def _runtime_context_value(runtime_context: Any, method_name: str) -> str | None
     return str(value) if value is not None else None
 
 
-def _safe_int_attr(value: Any, attr_name: str) -> int:
-    attr = getattr(value, attr_name, 0)
-    return attr if isinstance(attr, int) and not isinstance(attr, bool) and attr >= 0 else 0
+def _safe_int_mapping(
+    payload: Mapping[str, Any],
+    field_name: str,
+    *,
+    fallback_field_name: str | None = None,
+) -> int:
+    value = payload.get(field_name)
+    if value is None and fallback_field_name is not None:
+        value = payload.get(fallback_field_name)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _safe_optional_int_mapping(payload: Mapping[str, Any], field_name: str) -> int | None:
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _safe_float_attr(value: Any, attr_name: str) -> float:

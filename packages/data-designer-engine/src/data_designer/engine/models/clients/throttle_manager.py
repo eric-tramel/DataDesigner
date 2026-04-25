@@ -72,12 +72,31 @@ class ThrottleManagerLike(Protocol):
         timeout: float = DEFAULT_ACQUIRE_TIMEOUT,
     ) -> None: ...
 
+    async def release_success_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None: ...
+
     def release_success(
         self,
         *,
         provider_name: str,
         model_id: str,
         domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None: ...
+
+    async def release_rate_limited_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        retry_after: float | None = None,
         now: float | None = None,
     ) -> None: ...
 
@@ -88,6 +107,15 @@ class ThrottleManagerLike(Protocol):
         model_id: str,
         domain: ThrottleDomain,
         retry_after: float | None = None,
+        now: float | None = None,
+    ) -> None: ...
+
+    async def release_failure_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
         now: float | None = None,
     ) -> None: ...
 
@@ -311,6 +339,16 @@ class ThrottleManager:
                         )
                 state.success_streak = 0
 
+    async def release_success_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None:
+        self.release_success(provider_name=provider_name, model_id=model_id, domain=domain, now=now)
+
     def release_rate_limited(
         self,
         *,
@@ -368,6 +406,23 @@ class ThrottleManager:
                     state.current_limit,
                 )
 
+    async def release_rate_limited_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        retry_after: float | None = None,
+        now: float | None = None,
+    ) -> None:
+        self.release_rate_limited(
+            provider_name=provider_name,
+            model_id=model_id,
+            domain=domain,
+            retry_after=retry_after,
+            now=now,
+        )
+
     def release_failure(
         self,
         *,
@@ -379,6 +434,16 @@ class ThrottleManager:
         with self._lock:
             state = self._get_or_create_domain(provider_name, model_id, domain)
             state.in_flight = max(0, state.in_flight - 1)
+
+    async def release_failure_async(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        domain: ThrottleDomain,
+        now: float | None = None,
+    ) -> None:
+        self.release_failure(provider_name=provider_name, model_id=model_id, domain=domain, now=now)
 
     # -------------------------------------------------------------------
     # Sync / async wrappers

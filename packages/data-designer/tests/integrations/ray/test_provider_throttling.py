@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fake_ray_harness import install_fake_ray
+from fake_ray_harness import fake_ray_get, install_fake_ray
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.run_config import RunConfig
-from data_designer.engine.models.clients.throttle_manager import CAPACITY_POLL_INTERVAL, ThrottleDomain
+from data_designer.engine.models.clients.throttle_manager import CAPACITY_POLL_INTERVAL, ThrottleDomain, ThrottleManager
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend
 from data_designer.integrations.ray import backend as ray_backend_module
@@ -59,6 +60,82 @@ def test_ray_throttle_proxy_coordinates_shared_provider_cap(monkeypatch: pytest.
             "limits_by_alias": {"writer": 1},
         }
     ]
+    worker_snapshots = ray_backend_module._snapshot_worker_throttle(second_worker)
+    assert len(worker_snapshots) == 1
+    assert worker_snapshots[0].provider_name == "openai"
+    assert worker_snapshots[0].model_id == "gpt-4.1"
+    assert worker_snapshots[0].domain == ThrottleDomain.CHAT.value
+    assert worker_snapshots[0].effective_max == 1
+
+
+def test_snapshot_worker_throttle_uses_local_manager_public_snapshot() -> None:
+    throttle_manager = ThrottleManager()
+    throttle_manager.register(
+        provider_name="openai",
+        model_id="gpt-4.1",
+        alias="writer",
+        max_parallel_requests=3,
+    )
+
+    assert throttle_manager.try_acquire(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT) == 0.0
+    throttle_manager.release_rate_limited(
+        provider_name="openai",
+        model_id="gpt-4.1",
+        domain=ThrottleDomain.CHAT,
+        retry_after=0.01,
+    )
+
+    snapshots = ray_backend_module._snapshot_worker_throttle(throttle_manager)
+
+    assert len(snapshots) == 1
+    assert snapshots[0].provider_name == "openai"
+    assert snapshots[0].model_id == "gpt-4.1"
+    assert snapshots[0].domain == ThrottleDomain.CHAT.value
+    assert snapshots[0].current_limit == 2
+    assert snapshots[0].effective_max == 3
+    assert snapshots[0].rate_limit_ceiling == 3
+    assert snapshots[0].consecutive_rate_limits == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_ray_throttle_proxy_async_paths_do_not_call_ray_get_on_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch, with_remote=True)
+    proxy = create_ray_throttle_manager(fake_ray, RunConfig())
+    proxy.register(
+        provider_name="openai",
+        model_id="gpt-4.1",
+        alias="writer",
+        max_parallel_requests=1,
+    )
+    event_loop_get_calls = 0
+
+    def guarded_get(ref: Any) -> Any:
+        nonlocal event_loop_get_calls
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fake_ray_get(ref)
+        event_loop_get_calls += 1
+        return fake_ray_get(ref)
+
+    fake_ray.get = guarded_get
+
+    await proxy.acquire_async(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
+    await proxy.release_success_async(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
+    await proxy.acquire_async(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
+    await proxy.release_rate_limited_async(
+        provider_name="openai",
+        model_id="gpt-4.1",
+        domain=ThrottleDomain.CHAT,
+        retry_after=0.01,
+    )
+    await asyncio.sleep(0.02)
+    await proxy.acquire_async(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
+    await proxy.release_failure_async(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
+
+    assert event_loop_get_calls == 0
 
 
 def test_ray_backend_exposes_global_throttle_snapshot_in_metrics(
