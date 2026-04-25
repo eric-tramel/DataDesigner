@@ -18,6 +18,12 @@ from data_designer.integrations.ray.errors import (
     RayIntegrationError,
     RayMetricsError,
 )
+from data_designer.integrations.ray.llm import (
+    RayDataLLMCapabilities,
+    RayDataLLMIntegrationAssessment,
+    assess_ray_data_llm_integration,
+    probe_ray_data_llm_capabilities,
+)
 from data_designer.integrations.ray.metrics import (
     RayDatasetMetrics,
     RayWorkerMetrics,
@@ -44,6 +50,8 @@ __all__ = [
     "RayBlockPlanning",
     "RayDataCheckpointConfig",
     "RayDataContextOptions",
+    "RayDataLLMCapabilities",
+    "RayDataLLMIntegrationAssessment",
     "RayDatasetAnalysis",
     "RayDatasetCreationResults",
     "RayDatasetGenerationError",
@@ -57,4 +65,6 @@ __all__ = [
     "RayTraceEvent",
     "RayWorkerMetrics",
     "RayWorkerProfile",
+    "assess_ray_data_llm_integration",
+    "probe_ray_data_llm_capabilities",
 ]

@@ -18,6 +18,8 @@ def test_ray_package_root_exports_stable_public_api() -> None:
         "RayBlockPlanning",
         "RayDataCheckpointConfig",
         "RayDataContextOptions",
+        "RayDataLLMCapabilities",
+        "RayDataLLMIntegrationAssessment",
         "RayDatasetAnalysis",
         "RayDatasetCreationResults",
         "RayDatasetGenerationError",
@@ -31,6 +33,8 @@ def test_ray_package_root_exports_stable_public_api() -> None:
         "RayTraceEvent",
         "RayWorkerMetrics",
         "RayWorkerProfile",
+        "assess_ray_data_llm_integration",
+        "probe_ray_data_llm_capabilities",
     }
 
     assert set(ray.__all__) == expected_public_api
