@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import types
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,10 @@ from data_designer.integrations.ray import (
 )
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
+from data_designer.integrations.ray.artifact_output import (
+    DataDesignerRayDatasink,
+    create_data_designer_ray_datasink,
+)
 from data_designer.interface.data_designer import DataDesigner
 
 pytestmark = pytest.mark.ray_fake
@@ -386,6 +392,45 @@ def test_ray_backend_writes_dropped_columns_and_processor_artifacts_with_fake_ra
     assert metadata["file_paths"]["processor-files"] == {
         "schema-transform": ["processors-files/schema-transform/batch_00000.parquet"]
     }
+
+
+def test_ray_datasink_metadata_uses_aggregate_write_result_count(tmp_path: Path) -> None:
+    datasink = DataDesignerRayDatasink(
+        base_dataset_path=tmp_path,
+        dataset_name="ray-output",
+        target_num_records=2,
+        buffer_size=1,
+        min_rows_per_write=1,
+        supports_distributed_writes=True,
+    )
+
+    datasink.on_write_complete(types.SimpleNamespace(num_rows=2, size_bytes=0, write_returns=[]))
+
+    with open(datasink.metadata_file_path, encoding="utf-8") as file:
+        metadata = json.load(file)
+    assert metadata["actual_num_records"] == 2
+    assert metadata["num_completed_batches"] == 0
+    assert metadata["file_paths"] == {"parquet-files": []}
+
+
+def test_create_data_designer_ray_datasink_subclasses_real_ray_datasink(tmp_path: Path) -> None:
+    class FakeRayDatasink:
+        pass
+
+    fake_ray = types.SimpleNamespace(data=types.SimpleNamespace(Datasink=FakeRayDatasink))
+
+    datasink = create_data_designer_ray_datasink(
+        ray=fake_ray,
+        base_dataset_path=tmp_path,
+        dataset_name="ray-output",
+        target_num_records=2,
+        buffer_size=1,
+        min_rows_per_write=1,
+        supports_distributed_writes=True,
+    )
+
+    assert isinstance(datasink, DataDesignerRayDatasink)
+    assert isinstance(datasink, FakeRayDatasink)
 
 
 def test_ray_backend_uses_override_num_blocks_for_from_scratch_dataset(

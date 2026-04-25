@@ -189,7 +189,10 @@ def test_real_ray_data_designer_artifact_write_smoke(
 
     assert artifact_storage is not None
     assert artifact_storage.metadata_file_path.is_file()
-    assert artifact_storage.read_metadata()["actual_num_records"] == 2
+    metadata = artifact_storage.read_metadata()
+    assert metadata["actual_num_records"] == 2
+    assert metadata["num_completed_batches"] >= 1
+    assert metadata["file_paths"]["parquet-files"]
     assert results.load_dataset().count() == 2
     assert sorted(artifact_storage.final_dataset_path.glob("*.parquet"))
 

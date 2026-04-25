@@ -114,7 +114,9 @@ class DataDesignerRayDatasink:
 
     def on_write_complete(self, write_result: Any) -> None:
         write_returns = [item for item in _write_result_returns(write_result) if item is not None]
-        actual_num_records = sum(int(item["num_rows"]) for item in write_returns)
+        actual_num_records = _write_result_num_rows(write_result)
+        if actual_num_records is None:
+            actual_num_records = sum(int(item["num_rows"]) for item in write_returns)
         metadata: dict[str, Any] = {
             "target_num_records": self.target_num_records,
             "actual_num_records": actual_num_records,
@@ -133,6 +135,42 @@ class DataDesignerRayDatasink:
 
     def on_write_failed(self, exception: Exception) -> None:
         del exception
+
+
+def create_data_designer_ray_datasink(
+    *,
+    ray: Any,
+    base_dataset_path: Path,
+    dataset_name: str,
+    target_num_records: int,
+    buffer_size: int,
+    min_rows_per_write: int | None,
+    supports_distributed_writes: bool,
+) -> DataDesignerRayDatasink:
+    """Create a datasink that real Ray recognizes without importing Ray eagerly."""
+    ray_data = getattr(ray, "data", None)
+    ray_datasink_cls = getattr(ray_data, "Datasink", None)
+    if ray_datasink_cls is None:
+        return DataDesignerRayDatasink(
+            base_dataset_path=base_dataset_path,
+            dataset_name=dataset_name,
+            target_num_records=target_num_records,
+            buffer_size=buffer_size,
+            min_rows_per_write=min_rows_per_write,
+            supports_distributed_writes=supports_distributed_writes,
+        )
+
+    class _RayDataDesignerRayDatasink(DataDesignerRayDatasink, ray_datasink_cls):  # type: ignore[misc, valid-type]
+        pass
+
+    return _RayDataDesignerRayDatasink(
+        base_dataset_path=base_dataset_path,
+        dataset_name=dataset_name,
+        target_num_records=target_num_records,
+        buffer_size=buffer_size,
+        min_rows_per_write=min_rows_per_write,
+        supports_distributed_writes=supports_distributed_writes,
+    )
 
 
 def append_ray_artifact_columns(dataframe: Any, block_result: BlockExecutionResult) -> Any:
@@ -245,6 +283,13 @@ def _write_result_returns(write_result: Any) -> list[Any]:
     if write_returns is None:
         return []
     return list(write_returns)
+
+
+def _write_result_num_rows(write_result: Any) -> int | None:
+    num_rows = getattr(write_result, "num_rows", None)
+    if num_rows is None:
+        return None
+    return int(num_rows)
 
 
 def _combine_file_paths(file_paths_items: Iterable[dict[str, Any]]) -> dict[str, Any]:

@@ -20,7 +20,7 @@ from data_designer.engine.column_generators.utils.generator_classification impor
 from data_designer.engine.dataset_builders.block_execution import execute_dataset_block
 from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, ArtifactStorage
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
-from data_designer.integrations.ray.artifact_output import DataDesignerRayDatasink
+from data_designer.integrations.ray.artifact_output import create_data_designer_ray_datasink
 from data_designer.integrations.ray.errors import RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray.metrics import RayDatasetMetrics, RayWorkerMetrics
 from data_designer.integrations.ray.observability import RayDatasetAnalysis
@@ -478,13 +478,13 @@ class RayBackend:
         dataset_name: str,
         batch_size: int,
     ) -> ArtifactStorage:
-        del ray
         ArtifactStorage.mkdir_if_needed(runtime_context.artifact_path)
         artifact_storage = ArtifactStorage(artifact_path=runtime_context.artifact_path, dataset_name=dataset_name)
         ArtifactStorage.mkdir_if_needed(artifact_storage.base_dataset_path)
         config_builder.get_builder_config().to_json(artifact_storage.base_dataset_path / SDG_CONFIG_FILENAME)
 
-        datasink = DataDesignerRayDatasink(
+        datasink = create_data_designer_ray_datasink(
+            ray=ray,
             base_dataset_path=artifact_storage.base_dataset_path,
             dataset_name=artifact_storage.resolved_dataset_name,
             target_num_records=num_records,

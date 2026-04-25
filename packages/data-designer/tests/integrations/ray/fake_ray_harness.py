@@ -193,11 +193,14 @@ class FakeRayDataset:
             self.data_module.write_datasink_kwargs = dict(self.write_datasink_kwargs)
         datasink.on_write_start(schema=None)
         write_returns = []
+        num_rows = 0
         for task_idx, block in enumerate(self.blocks):
-            write_return = datasink.write([coerce_pandas_dataframe(block)], types.SimpleNamespace(task_idx=task_idx))
+            dataframe = coerce_pandas_dataframe(block)
+            num_rows += len(dataframe)
+            write_return = datasink.write([dataframe], types.SimpleNamespace(task_idx=task_idx))
             if write_return is not None:
                 write_returns.append(write_return)
-        datasink.on_write_complete(types.SimpleNamespace(write_returns=write_returns))
+        datasink.on_write_complete(types.SimpleNamespace(num_rows=num_rows, size_bytes=0, write_returns=write_returns))
 
     def repartition(
         self,
