@@ -22,9 +22,11 @@ from data_designer.engine.testing.seed_readers import LineFanoutDirectorySeedRea
 from data_designer.integrations.ray import (
     RayBackend,
     RayBackendConfigurationError,
+    RayBlockPlanning,
     RayDatasetCreationResults,
     RayDatasetGenerationError,
     RayDatasetMetrics,
+    RayExecutionOptions,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.interface.data_designer import DataDesigner
@@ -181,8 +183,61 @@ def test_ray_backend_rejects_block_planning_with_input_dataset(
     ],
 )
 def test_ray_backend_validates_invalid_block_planning_options(kwargs: dict[str, Any], match: str) -> None:
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(RayBackendConfigurationError, match=match):
         RayBackend(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"output": "table"}, "output"),
+        ({"object_ref_format": "json"}, "object_ref_format"),
+        ({"order_column": ""}, "order_column"),
+        ({"max_trace_events": -1}, "max_trace_events"),
+    ],
+)
+def test_ray_backend_constructor_uses_configuration_error(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(RayBackendConfigurationError, match=match):
+        RayBackend(**kwargs)
+
+
+@pytest.mark.parametrize("batch_size", [True, "10", 0, -1])
+def test_ray_backend_rejects_invalid_batch_size(batch_size: Any) -> None:
+    with pytest.raises(RayBackendConfigurationError, match="batch_size"):
+        RayBackend(batch_size=batch_size)
+
+
+def test_ray_backend_batch_size_none_uses_run_config_buffer_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    install_fake_ray(monkeypatch)
+    input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=None),
+    )
+    designer.set_run_config(RunConfig(buffer_size=7))
+
+    designer.create(_input_expression_config_builder(stub_model_configs), input_dataset=input_dataset)
+
+    assert input_dataset.map_batches_kwargs is not None
+    assert input_dataset.map_batches_kwargs["batch_size"] == 7
+
+
+def test_ray_backend_rejects_grouped_block_planning_conflicts() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="block_planning"):
+        RayBackend(block_planning=RayBlockPlanning(), override_num_blocks=1)
+
+
+def test_ray_backend_rejects_grouped_execution_option_conflicts() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="execution_options"):
+        RayBackend(execution_options=RayExecutionOptions(), num_cpus=1)
 
 
 def test_ray_backend_propagates_execution_resource_options(
@@ -249,12 +304,18 @@ def test_ray_backend_actor_pool_uses_autoscaling_strategy_and_constructor_payloa
     assert input_dataset.map_batches_fn is ray_backend_module._RayBatchWorker
     assert "fn_kwargs" not in input_dataset.map_batches_kwargs
     assert "fn_constructor_kwargs" in input_dataset.map_batches_kwargs
+    assert "concurrency" not in input_dataset.map_batches_kwargs
     assert input_dataset.map_batches_kwargs["scheduling_strategy"] == "DEFAULT"
     assert input_dataset.map_batches_kwargs["compute"].kwargs == {
         "min_size": 1,
         "max_size": 4,
         "initial_size": 2,
     }
+
+
+def test_ray_backend_rejects_actor_pool_with_map_concurrency() -> None:
+    with pytest.raises(RayBackendConfigurationError, match="use_actor_pool"):
+        RayBackend(use_actor_pool=True, map_concurrency=2)
 
 
 def test_ray_backend_driver_model_health_check_runs_once_and_workers_skip_by_default(
