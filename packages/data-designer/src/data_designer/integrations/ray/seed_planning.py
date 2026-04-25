@@ -155,6 +155,7 @@ def create_ray_file_contents_seed_dataset(
         _file_contents_seed_batch_to_dataframe,
         fn_kwargs={"root_path": str(context.root_path), "encoding": source.encoding},
         batch_format="pandas",
+        udf_modifying_row_count=False,
     )
     return _apply_ordered_seed_selection_and_cycling(
         ray=ray,
@@ -203,6 +204,7 @@ def create_ray_filesystem_seed_dataset(
             "output_columns": output_columns,
         },
         batch_format="pandas",
+        udf_modifying_row_count=True,
     ).limit(num_records)
 
 
@@ -286,6 +288,7 @@ def _select_seed_dataset_range(
     ordinal_dataset = ray.data.range(seed_dataset_size).map_batches(
         _rename_range_id_to_seed_ordinal,
         batch_format="pandas",
+        udf_modifying_row_count=False,
     )
     return (
         dataset.zip(ordinal_dataset)

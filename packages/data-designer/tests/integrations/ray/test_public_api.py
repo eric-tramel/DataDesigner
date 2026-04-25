@@ -14,6 +14,7 @@ def test_ray_package_root_exports_stable_public_api() -> None:
     expected_public_api = {
         "RayBackend",
         "RayBackendConfigurationError",
+        "RayBackendRowCountError",
         "RayBlockPlanning",
         "RayDataCheckpointConfig",
         "RayDataContextOptions",

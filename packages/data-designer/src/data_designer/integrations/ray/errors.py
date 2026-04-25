@@ -19,5 +19,9 @@ class RayDatasetGenerationError(RayIntegrationError, DataDesignerGenerationError
     """Raised when Ray-backed dataset generation fails."""
 
 
+class RayBackendRowCountError(RayDatasetGenerationError):
+    """Raised when a Ray worker violates a row-preserving map_batches contract."""
+
+
 class RayMetricsError(RayIntegrationError):
     """Raised when Ray metrics cannot be normalized or aggregated."""

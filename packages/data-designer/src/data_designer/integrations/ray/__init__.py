@@ -13,6 +13,7 @@ from __future__ import annotations
 from data_designer.integrations.ray.backend import RayBackend, RayDatasetCreationResults
 from data_designer.integrations.ray.errors import (
     RayBackendConfigurationError,
+    RayBackendRowCountError,
     RayDatasetGenerationError,
     RayIntegrationError,
     RayMetricsError,
@@ -39,6 +40,7 @@ from data_designer.integrations.ray.options import (
 __all__ = [
     "RayBackend",
     "RayBackendConfigurationError",
+    "RayBackendRowCountError",
     "RayBlockPlanning",
     "RayDataCheckpointConfig",
     "RayDataContextOptions",

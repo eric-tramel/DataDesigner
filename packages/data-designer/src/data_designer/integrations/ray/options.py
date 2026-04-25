@@ -22,6 +22,7 @@ _DATA_DESIGNER_OWNED_MAP_BATCHES_KEYS = frozenset(
         "fn_constructor_args",
         "fn_constructor_kwargs",
         "fn_kwargs",
+        "udf_modifying_row_count",
         "zero_copy_batch",
     }
 )
