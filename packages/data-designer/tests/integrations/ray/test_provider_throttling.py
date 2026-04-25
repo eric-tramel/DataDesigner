@@ -17,6 +17,7 @@ from data_designer.engine.models.clients.throttle_manager import CAPACITY_POLL_I
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray import observability_collection as ray_observability_collection
 from data_designer.integrations.ray.metrics import RayWorkerMetrics
 from data_designer.integrations.ray.throttling import RayThrottleManagerProxy, create_ray_throttle_manager
 from data_designer.interface.data_designer import DataDesigner
@@ -60,7 +61,7 @@ def test_ray_throttle_proxy_coordinates_shared_provider_cap(monkeypatch: pytest.
             "limits_by_alias": {"writer": 1},
         }
     ]
-    worker_snapshots = ray_backend_module._snapshot_worker_throttle(second_worker)
+    worker_snapshots = ray_observability_collection._snapshot_worker_throttle(second_worker)
     assert len(worker_snapshots) == 1
     assert worker_snapshots[0].provider_name == "openai"
     assert worker_snapshots[0].model_id == "gpt-4.1"
@@ -85,7 +86,7 @@ def test_snapshot_worker_throttle_uses_local_manager_public_snapshot() -> None:
         retry_after=0.01,
     )
 
-    snapshots = ray_backend_module._snapshot_worker_throttle(throttle_manager)
+    snapshots = ray_observability_collection._snapshot_worker_throttle(throttle_manager)
 
     assert len(snapshots) == 1
     assert snapshots[0].provider_name == "openai"
@@ -164,7 +165,7 @@ def test_ray_backend_exposes_global_throttle_snapshot_in_metrics(
         )
         throttle_manager.acquire_sync(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
         throttle_manager.release_success(provider_name="openai", model_id="gpt-4.1", domain=ThrottleDomain.CHAT)
-        ray_backend_module._record_worker_metrics(
+        ray_observability_collection._record_worker_metrics(
             metrics_collector,
             RayWorkerMetrics(total_rows=len(batch), blocks=1, elapsed_seconds=0.25),
         )

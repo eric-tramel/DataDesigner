@@ -24,6 +24,7 @@ from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetGenerationError
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray import observability_collection as ray_observability_collection
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.integrations.ray import worker_pipeline as ray_worker_pipeline
 from data_designer.interface.data_designer import DataDesigner
@@ -296,10 +297,10 @@ def test_worker_observer_records_empty_batch_without_row_generation(
     fake_ray_installer: Any,
 ) -> None:
     fake_ray = fake_ray_installer(with_remote=True)
-    collector = ray_backend_module._create_metrics_collector(fake_ray)
+    collector = ray_observability_collection._create_metrics_collector(fake_ray)
     observer = ray_worker_pipeline._RayWorkerObserver(
         metrics_collector=collector,
-        observability_options=ray_worker_pipeline._RayObservabilityOptions(
+        observability_options=ray_observability_collection._RayObservabilityOptions(
             profile_workers=True,
             trace_enabled=True,
         ),
@@ -342,7 +343,7 @@ def test_ray_batch_worker_records_partial_row_drop_metrics(
     stub_model_providers: Any,
 ) -> None:
     fake_ray = fake_ray_installer(with_remote=True)
-    collector = ray_backend_module._create_metrics_collector(fake_ray)
+    collector = ray_observability_collection._create_metrics_collector(fake_ray)
     designer = DataDesigner(
         artifact_path=tmp_path,
         model_providers=stub_model_providers,
@@ -382,7 +383,7 @@ def test_ray_batch_worker_fails_all_row_drop_blocks(
     stub_model_providers: Any,
 ) -> None:
     fake_ray = fake_ray_installer(with_remote=True)
-    collector = ray_backend_module._create_metrics_collector(fake_ray)
+    collector = ray_observability_collection._create_metrics_collector(fake_ray)
     designer = DataDesigner(
         artifact_path=tmp_path,
         model_providers=stub_model_providers,

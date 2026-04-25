@@ -26,11 +26,12 @@ from data_designer.integrations.ray.metrics import (
     aggregate_ray_metrics,
     normalize_ray_worker_metrics,
 )
-from data_designer.integrations.ray.observability import (
-    RayDatasetAnalysis,
-    normalize_ray_throttle_snapshot,
-    normalize_ray_trace_event,
-    normalize_ray_worker_profile,
+from data_designer.integrations.ray.observability import RayDatasetAnalysis
+from data_designer.integrations.ray.observability_collection import (
+    _create_metrics_collector,
+    _has_observability_payload,
+    _RayObservabilityOptions,
+    assemble_ray_dataset_analysis,
 )
 from data_designer.integrations.ray.options import RayBlockPlanning, RayExecutionOptions, resolve_ray_backend_options
 from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
@@ -40,15 +41,8 @@ from data_designer.integrations.ray.worker_pipeline import (
     _coerce_pandas_dataframe,
     _compile_ray_execution_payload,
     _RayExecutionPayload,
-    _RayObservabilityOptions,
     _RayWorkerGenerationPipeline,
     _RayWorkerOptions,
-)
-from data_designer.integrations.ray.worker_pipeline import (
-    _record_worker_metrics as _record_worker_metrics,
-)
-from data_designer.integrations.ray.worker_pipeline import (
-    _snapshot_worker_throttle as _snapshot_worker_throttle,
 )
 from data_designer.interface.backends import BackendRuntimeContext
 
@@ -197,23 +191,7 @@ class RayDatasetCreationResults:
         if not _has_observability_payload(payload):
             return None
 
-        metrics = self.load_metrics()
-        worker_profiles = [
-            normalize_ray_worker_profile(profile) for profile in payload.get("worker_profiles", []) or []
-        ]
-        trace_events = [normalize_ray_trace_event(event) for event in payload.get("trace_events", []) or []]
-        throttle_snapshots = [
-            normalize_ray_throttle_snapshot(snapshot) for snapshot in payload.get("throttle_snapshots", []) or []
-        ]
-        self._analysis_cache = RayDatasetAnalysis(
-            total_rows=metrics.total_rows,
-            blocks=metrics.blocks,
-            failed_blocks=metrics.failed_blocks,
-            worker_profiles=worker_profiles,
-            trace_events=trace_events,
-            trace_events_dropped=int(payload.get("trace_events_dropped", 0) or 0),
-            throttle_snapshots=throttle_snapshots,
-        )
+        self._analysis_cache = assemble_ray_dataset_analysis(self.load_metrics(), payload)
         return self._analysis_cache
 
     @property
@@ -763,51 +741,6 @@ def _dataset_from_arrow_refs_via_items(ray: Any, refs: list[Any]) -> Any:
     return from_items(records, **kwargs)
 
 
-class _RayMetricsCollector:
-    def __init__(self, max_trace_events: int = 1000) -> None:
-        self._payloads: list[dict[str, Any]] = []
-        self._worker_profiles: list[dict[str, Any]] = []
-        self._trace_events: list[dict[str, Any]] = []
-        self._trace_events_dropped = 0
-        self._throttle_snapshots: list[dict[str, Any]] = []
-        self._max_trace_events = max_trace_events
-
-    def record(self, payload: dict[str, Any]) -> None:
-        self._payloads.append(payload)
-
-    def record_observability(self, payload: dict[str, Any]) -> None:
-        profile = payload.get("worker_profile")
-        if isinstance(profile, dict):
-            self._worker_profiles.append(profile)
-        for event in payload.get("trace_events", []) or []:
-            if len(self._trace_events) >= self._max_trace_events:
-                self._trace_events_dropped += 1
-                continue
-            if isinstance(event, dict):
-                self._trace_events.append(event)
-        for snapshot in payload.get("throttle_snapshots", []) or []:
-            if isinstance(snapshot, dict):
-                self._throttle_snapshots.append(snapshot)
-
-    def snapshot(self) -> list[dict[str, Any]]:
-        return list(self._payloads)
-
-    def observability_snapshot(self) -> dict[str, Any]:
-        return {
-            "worker_profiles": list(self._worker_profiles),
-            "trace_events": list(self._trace_events),
-            "trace_events_dropped": self._trace_events_dropped,
-            "throttle_snapshots": list(self._throttle_snapshots),
-        }
-
-
-def _create_metrics_collector(ray: Any, *, max_trace_events: int = 1000) -> Any | None:
-    remote = getattr(ray, "remote", None)
-    if not callable(remote):
-        return None
-    return remote(_RayMetricsCollector).remote(max_trace_events=max_trace_events)
-
-
 def _merge_driver_and_worker_metrics(
     driver_metrics: RayDatasetMetrics,
     worker_metrics: RayDatasetMetrics,
@@ -893,15 +826,6 @@ def _generate_batch(
         metrics_collector=metrics_collector,
         observability_options=observability_options,
     )(batch)
-
-
-def _has_observability_payload(payload: dict[str, Any]) -> bool:
-    return bool(
-        payload.get("worker_profiles")
-        or payload.get("trace_events")
-        or payload.get("trace_events_dropped")
-        or payload.get("throttle_snapshots")
-    )
 
 
 def _import_ray() -> Any:

@@ -15,6 +15,7 @@ from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayDatasetCreationResults, RayDatasetMetrics
 from data_designer.integrations.ray import backend as ray_backend_module
+from data_designer.integrations.ray import observability_collection as ray_observability_collection
 from data_designer.integrations.ray.metrics import RayWorkerMetrics, aggregate_ray_metrics
 from data_designer.interface.data_designer import DataDesigner
 
@@ -162,7 +163,7 @@ def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
         batch: lazy.pd.DataFrame, *, metrics_collector: Any | None = None, **_: Any
     ) -> lazy.pd.DataFrame:
         row_count = len(batch)
-        ray_backend_module._record_worker_metrics(
+        ray_observability_collection._record_worker_metrics(
             metrics_collector,
             RayWorkerMetrics(
                 total_rows=row_count,
