@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
@@ -56,7 +56,11 @@ from data_designer.engine.processing.processors.base import Processor
 from data_designer.engine.processing.processors.drop_columns import DropColumnsProcessor
 from data_designer.engine.registry.data_designer_registry import DataDesignerRegistry
 from data_designer.engine.resources.resource_provider import ResourceProvider
-from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, ArtifactStorage
+from data_designer.engine.storage.artifact_storage import (
+    BATCH_FILE_NAME_FORMAT,
+    SDG_CONFIG_FILENAME,
+    ArtifactStorage,
+)
 from data_designer.engine.storage.media_storage import StorageMode
 
 if TYPE_CHECKING:
@@ -125,10 +129,22 @@ class DatasetBlockChunk:
     row_group: int
     input_start: int
     input_rows: int
+    processor_artifacts: dict[str, pd.DataFrame] = field(default_factory=dict)
 
 
 def _is_async_trace_enabled(settings: RunConfig) -> bool:
     return settings.async_trace or os.environ.get("DATA_DESIGNER_ASYNC_TRACE", "0") == "1"
+
+
+def _row_group_batch_number(
+    *,
+    current_batch_number: int | None,
+    row_group: int,
+    capture_artifacts: bool,
+) -> int | None:
+    if not capture_artifacts:
+        return current_batch_number
+    return (current_batch_number or 0) + row_group
 
 
 class DatasetBuilder:
@@ -503,6 +519,7 @@ class DatasetBuilder:
         num_records: int,
         rows_per_chunk: int,
         current_batch_number: int | None = None,
+        capture_artifacts: bool = False,
     ) -> Iterator[DatasetBlockChunk]:
         """Build one block as ordered chunks when the async engine can stream row groups.
 
@@ -514,9 +531,14 @@ class DatasetBuilder:
             raise ValueError("rows_per_chunk must be a positive integer.")
 
         if self._processor_runner.has_processors_for(ProcessorStage.AFTER_GENERATION):
+            row_group_batch_number = _row_group_batch_number(
+                current_batch_number=current_batch_number,
+                row_group=0,
+                capture_artifacts=capture_artifacts,
+            )
             raw_dataset, dataset = self.build_block(
                 num_records=num_records,
-                current_batch_number=current_batch_number,
+                current_batch_number=row_group_batch_number,
             )
             yield DatasetBlockChunk(
                 raw_dataframe=raw_dataset,
@@ -524,6 +546,7 @@ class DatasetBuilder:
                 row_group=0,
                 input_start=0,
                 input_rows=num_records,
+                processor_artifacts=self._load_processor_artifacts_for_row_group(row_group_batch_number),
             )
             return
 
@@ -536,10 +559,15 @@ class DatasetBuilder:
         generators, self._graph = self._initialize_generators_and_graph()
         self._use_async = self._resolve_async_selection()
         if not self._use_async:
+            row_group_batch_number = _row_group_batch_number(
+                current_batch_number=current_batch_number,
+                row_group=0,
+                capture_artifacts=capture_artifacts,
+            )
             raw_dataset, dataset = self._build_sync_block_with_initialized_generators(
                 generators=generators,
                 num_records=num_records,
-                current_batch_number=current_batch_number,
+                current_batch_number=row_group_batch_number,
             )
             yield DatasetBlockChunk(
                 raw_dataframe=raw_dataset,
@@ -547,6 +575,7 @@ class DatasetBuilder:
                 row_group=0,
                 input_start=0,
                 input_rows=num_records,
+                processor_artifacts=self._load_processor_artifacts_for_row_group(row_group_batch_number),
             )
             return
 
@@ -555,6 +584,7 @@ class DatasetBuilder:
             num_records=num_records,
             rows_per_chunk=rows_per_chunk,
             current_batch_number=current_batch_number,
+            capture_artifacts=capture_artifacts,
         )
 
     def process_block(self, dataset: pd.DataFrame, *, current_batch_number: int | None = None) -> pd.DataFrame:
@@ -586,6 +616,7 @@ class DatasetBuilder:
         num_records: int,
         rows_per_chunk: int,
         current_batch_number: int | None,
+        capture_artifacts: bool,
     ) -> Iterator[DatasetBlockChunk]:
         """Async block path that emits row groups as soon as they finalize."""
         if num_records == 0:
@@ -602,9 +633,14 @@ class DatasetBuilder:
         def finalize_row_group(rg_id: int) -> None:
             try:
                 raw_df = buffer_manager.get_dataframe(rg_id)
+                row_group_batch_number = _row_group_batch_number(
+                    current_batch_number=current_batch_number,
+                    row_group=rg_id,
+                    capture_artifacts=capture_artifacts,
+                )
                 processed_df = self._processor_runner.run_post_batch(
                     raw_df.copy(),
-                    current_batch_number=current_batch_number,
+                    current_batch_number=row_group_batch_number,
                 )
                 chunk_queue.put(
                     DatasetBlockChunk(
@@ -613,6 +649,7 @@ class DatasetBuilder:
                         row_group=rg_id,
                         input_start=rg_id * rows_per_chunk,
                         input_rows=min(rows_per_chunk, num_records - rg_id * rows_per_chunk),
+                        processor_artifacts=self._load_processor_artifacts_for_row_group(row_group_batch_number),
                     )
                 )
             except DatasetGenerationError as exc:
@@ -674,6 +711,17 @@ class DatasetBuilder:
         finally:
             if not future.done():
                 future.cancel()
+
+    def _load_processor_artifacts_for_row_group(self, batch_number: int | None) -> dict[str, pd.DataFrame]:
+        if batch_number is None:
+            return {}
+        parquet_file_name = BATCH_FILE_NAME_FORMAT.format(batch_number=batch_number)
+        artifacts: dict[str, pd.DataFrame] = {}
+        for processor_name in self.artifact_storage.list_processor_names():
+            file_path = self.artifact_storage.processors_outputs_path / processor_name / parquet_file_name
+            if file_path.is_file():
+                artifacts[processor_name] = lazy.pd.read_parquet(file_path)
+        return artifacts
 
     def _has_image_columns(self) -> bool:
         """Check if config has any image generation columns."""

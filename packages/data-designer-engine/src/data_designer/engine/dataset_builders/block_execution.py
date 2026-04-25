@@ -73,6 +73,7 @@ class BlockExecutionOptions:
     use_async: bool = True
     dataset_name: str = "dataset-block"
     current_batch_number: int | None = None
+    capture_stream_artifacts: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ class BlockExecutionChunk:
     input_start: int
     input_rows: int
     output_rows: int
+    processor_artifacts: dict[str, pd.DataFrame] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -385,6 +387,7 @@ def _execute_stream_with_storage(
                 num_records=num_records,
                 rows_per_chunk=rows_per_chunk,
                 current_batch_number=options.current_batch_number,
+                capture_artifacts=options.capture_stream_artifacts,
             ):
                 output_rows += len(chunk.dataframe)
                 yield _block_execution_chunk(chunk)
@@ -392,7 +395,9 @@ def _execute_stream_with_storage(
             elapsed = time.perf_counter() - start_time
             model_usage_stats = block_resource_provider.model_registry.get_model_usage_stats(elapsed)
             model_usage_deltas = block_resource_provider.model_registry.get_usage_deltas(usage_snapshot)
-            processor_artifacts = _load_processor_artifacts(artifact_storage)
+            processor_artifacts = (
+                {} if options.capture_stream_artifacts else _load_processor_artifacts(artifact_storage)
+            )
             dropped_rows = max(num_records - output_rows, 0)
             summary_holder["summary"] = BlockExecutionStreamSummary(
                 task_traces=builder.task_traces,
@@ -420,6 +425,7 @@ def _block_execution_chunk(chunk: DatasetBlockChunk) -> BlockExecutionChunk:
         input_start=chunk.input_start,
         input_rows=chunk.input_rows,
         output_rows=len(chunk.dataframe),
+        processor_artifacts=chunk.processor_artifacts,
     )
 
 

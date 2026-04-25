@@ -31,7 +31,10 @@ from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import SeedReader
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
-from data_designer.integrations.ray.artifact_output import append_ray_artifact_columns
+from data_designer.integrations.ray.artifact_output import (
+    append_ray_artifact_chunk_columns,
+    append_ray_artifact_columns,
+)
 from data_designer.integrations.ray.errors import (
     RayBackendConfigurationError,
     RayBackendRowCountError,
@@ -212,8 +215,6 @@ class _RayWorkerGenerationPipeline:
     def should_stream_worker_output(self) -> bool:
         if self._execution_payload.output_chunk_rows is None:
             return False
-        if self._execution_payload.capture_artifacts:
-            return False
         return not (
             self._execution_payload.hidden_order_column is not None
             and not self._execution_payload.preserve_output_row_count
@@ -280,6 +281,8 @@ class _RayWorkerGenerationPipeline:
                 emitted_rows += len(output)
                 if self._observability_options.profile_workers:
                     profile.observe(output, input_frame=input_profile_frame)
+                if self._execution_payload.capture_artifacts:
+                    output = append_ray_artifact_chunk_columns(output, chunk)
                 yield output
 
             block_summary = stream.summary
@@ -380,7 +383,11 @@ class _RayWorkerGenerationPipeline:
             runtime_context=self._worker_options,
             input_frame=input_frame,
             num_records=worker_batch.num_records,
-            options=BlockExecutionOptions(use_async=True, dataset_name="ray-block"),
+            options=BlockExecutionOptions(
+                use_async=True,
+                dataset_name="ray-block",
+                capture_stream_artifacts=self._execution_payload.capture_artifacts,
+            ),
         )
 
     def complete_empty_batch(self, worker_batch: _RayWorkerBatch, batch_observer: _RayWorkerBatchObserver) -> Any:

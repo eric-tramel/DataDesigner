@@ -514,6 +514,80 @@ def test_ray_backend_writes_dropped_columns_and_processor_artifacts_with_fake_ra
     }
 
 
+def test_ray_backend_streams_artifact_chunks_with_fake_ray(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    fake_ray = install_fake_ray(monkeypatch)
+    input_dataset = fake_ray.data.dataset(
+        [lazy.pd.DataFrame({"x": [1, 2, 3, 4, 5], "label": ["a", "b", "c", "d", "e"]})]
+    )
+    config_builder = _input_expression_config_builder(stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="kept_label", expr="{{ label }}"))
+    config_builder.add_processor(
+        SchemaTransformProcessorConfig(name="schema-transform", template={"combined": "{{ x_label }}"})
+    )
+    config_builder.add_processor(DropColumnsProcessorConfig(name="drop-x-label", column_names=["x_label"]))
+    designer = DataDesigner(
+        artifact_path=tmp_path,
+        model_providers=stub_model_providers,
+        secret_resolver=PlaintextResolver(),
+        managed_assets_path=_managed_assets_path(tmp_path),
+        backend=RayBackend(batch_size=5, output_chunk_rows=2, write_artifacts=True),
+    )
+
+    results = designer.create(config_builder, input_dataset=input_dataset, num_records=5, dataset_name="ray-output")
+    artifact_storage = results.artifact_storage
+
+    assert artifact_storage is not None
+    assert input_dataset.map_batches_kwargs is not None
+    execution_payload = input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
+    assert execution_payload.capture_artifacts is True
+    assert execution_payload.output_chunk_rows == 2
+    assert results.load_dataset().to_pandas().to_dict(orient="records") == [
+        {"x": 1, "label": "a", "kept_label": "a"},
+        {"x": 2, "label": "b", "kept_label": "b"},
+        {"x": 3, "label": "c", "kept_label": "c"},
+        {"x": 4, "label": "d", "kept_label": "d"},
+        {"x": 5, "label": "e", "kept_label": "e"},
+    ]
+    assert artifact_storage.load_dataset(batch_stage=BatchStage.DROPPED_COLUMNS).to_dict(orient="records") == [
+        {"x_label": "1-a"},
+        {"x_label": "2-b"},
+        {"x_label": "3-c"},
+        {"x_label": "4-d"},
+        {"x_label": "5-e"},
+    ]
+    assert results.load_processor_dataset("schema-transform").to_dict(orient="records") == [
+        {"combined": "1-a"},
+        {"combined": "2-b"},
+        {"combined": "3-c"},
+        {"combined": "4-d"},
+        {"combined": "5-e"},
+    ]
+
+    metadata = artifact_storage.read_metadata()
+    assert metadata["actual_num_records"] == 5
+    assert metadata["num_completed_batches"] == 3
+    assert metadata["file_paths"]["parquet-files"] == [
+        "parquet-files/batch_00000.parquet",
+        "parquet-files/batch_00001.parquet",
+        "parquet-files/batch_00002.parquet",
+    ]
+    assert metadata["file_paths"]["dropped-columns-parquet-files"] == [
+        "dropped-columns-parquet-files/batch_00000.parquet",
+        "dropped-columns-parquet-files/batch_00001.parquet",
+        "dropped-columns-parquet-files/batch_00002.parquet",
+    ]
+    assert metadata["file_paths"]["processor-files"]["schema-transform"] == [
+        "processors-files/schema-transform/batch_00000.parquet",
+        "processors-files/schema-transform/batch_00001.parquet",
+        "processors-files/schema-transform/batch_00002.parquet",
+    ]
+
+
 def test_ray_datasink_metadata_uses_aggregate_write_result_count(tmp_path: Path) -> None:
     datasink = DataDesignerRayDatasink(
         base_dataset_path=tmp_path,

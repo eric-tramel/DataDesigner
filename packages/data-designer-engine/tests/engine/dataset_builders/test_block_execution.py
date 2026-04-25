@@ -11,7 +11,7 @@ import pytest
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import ExpressionColumnConfig, LLMTextColumnConfig, SamplerColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
-from data_designer.config.processors import ProcessorType
+from data_designer.config.processors import ProcessorType, SchemaTransformProcessorConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.sampler_params import SamplerType
 from data_designer.engine.dataset_builders import block_execution as block_execution_module
@@ -130,6 +130,40 @@ def test_execute_dataset_block_streams_ordered_chunks_and_summary(
     assert stream.summary.output_rows == 5
     assert stream.summary.dropped_rows == 0
     assert stream.summary.all_rows_dropped is False
+
+
+def test_execute_dataset_block_stream_captures_chunk_processor_artifacts(
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="x_label", expr="{{ x }}-{{ label }}"))
+    config_builder.add_processor(
+        SchemaTransformProcessorConfig(name="schema-transform", template={"combined": "{{ x_label }}"})
+    )
+    config_builder.add_processor(processor_type=ProcessorType.DROP_COLUMNS, name="drop-label", column_names=["label"])
+    input_frame = lazy.pd.DataFrame({"x": [1, 2, 3], "label": ["a", "b", "c"]})
+
+    stream = execute_dataset_block_stream(
+        rows_per_chunk=2,
+        config_builder=config_builder,
+        runtime_context=_runtime_context(tmp_path, stub_model_providers),
+        input_frame=input_frame,
+        options=BlockExecutionOptions(use_async=True, capture_stream_artifacts=True),
+    )
+
+    chunks = list(stream)
+
+    assert [chunk.processor_artifacts["schema-transform"].to_dict(orient="records") for chunk in chunks] == [
+        [{"combined": "1-a"}, {"combined": "2-b"}],
+        [{"combined": "3-c"}],
+    ]
+    assert lazy.pd.concat([chunk.dataframe for chunk in chunks], ignore_index=True).to_dict(orient="records") == [
+        {"x": 1, "x_label": "1-a"},
+        {"x": 2, "x_label": "2-b"},
+        {"x": 3, "x_label": "3-c"},
+    ]
 
 
 def test_execute_dataset_block_uses_model_columns(
