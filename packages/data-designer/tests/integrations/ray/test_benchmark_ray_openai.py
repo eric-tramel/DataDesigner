@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 import data_designer.lazy_heavy_imports as lazy
-from data_designer.integrations.ray import RayDatasetAnalysis, RayDatasetStats, RayTraceEvent
+from data_designer.integrations.ray import RayDatasetAnalysis, RayDatasetStats, RayTraceEvent, RayWorkerProfile
 
 pytestmark = pytest.mark.ray_benchmark
 
@@ -54,6 +54,39 @@ def test_ray_benchmark_scripts_import_with_shared_helpers() -> None:
     assert modules["benchmark_ray_openai"].RESULT_PREFIX == "RAY_OPENAI_BENCHMARK_RESULT="
     assert modules["benchmark_ray_mock_provider"].RESULT_PREFIX == "RAY_MOCK_PROVIDER_BENCHMARK_RESULT="
     assert modules["benchmark_ray_streaming_out_of_core"].RESULT_PREFIX == "RAY_STREAMING_OUT_OF_CORE_RESULT="
+
+
+def test_streaming_benchmark_summarizes_worker_memory_profiles() -> None:
+    module = _load_benchmark_module(
+        "benchmark_ray_streaming_out_of_core",
+        _benchmark_dir() / "benchmark_ray_streaming_out_of_core.py",
+    )
+    analysis = RayDatasetAnalysis(
+        worker_profiles=[
+            RayWorkerProfile(
+                block_id="block-a",
+                total_rows=2,
+                input_memory_usage_bytes=100,
+                memory_usage_bytes=150,
+                process_maxrss_bytes=1024,
+            ),
+            RayWorkerProfile(
+                block_id="block-b",
+                total_rows=2,
+                input_memory_usage_bytes=200,
+                memory_usage_bytes=250,
+                process_maxrss_bytes=2048,
+            ),
+        ]
+    )
+
+    summary = module._worker_memory_summary(analysis)
+
+    assert summary["profile_count"] == 2
+    assert summary["input_memory_usage_bytes"]["max"] == 200.0
+    assert summary["output_memory_usage_bytes"]["total"] == 400.0
+    assert summary["process_maxrss_bytes"]["max"] == 2048.0
+    assert summary["max_output_to_input_memory_ratio"] == 1.5
 
 
 def test_parse_backends_supports_full_apples_to_apples_suite() -> None:

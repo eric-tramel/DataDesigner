@@ -262,10 +262,13 @@ def test_ray_batch_worker_delegates_to_engine_block_api(
 
 def test_ray_batch_worker_uses_engine_block_stream_for_output_chunks(
     monkeypatch: pytest.MonkeyPatch,
+    fake_ray_installer: Any,
     tmp_path: Path,
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
+    fake_ray = fake_ray_installer(with_remote=True)
+    collector = ray_observability_collection._create_metrics_collector(fake_ray)
     designer = DataDesigner(
         artifact_path=tmp_path,
         model_providers=stub_model_providers,
@@ -303,11 +306,21 @@ def test_ray_batch_worker_uses_engine_block_stream_for_output_chunks(
         return _block_chunk_stream(chunks, input_rows=3)
 
     monkeypatch.setattr(ray_backend_module, "execute_dataset_block_stream", execute_dataset_block_stream)
-    worker = ray_backend_module._RayBatchWorker(execution_payload=payload)
+    worker = ray_backend_module._RayBatchWorker(
+        execution_payload=payload,
+        metrics_collector=collector,
+        observability_options=ray_observability_collection._RayObservabilityOptions(profile_workers=True),
+    )
 
     output = list(worker(lazy.pd.DataFrame({"x": [1, 2, 3], "label": ["a", "b", "c"]})))
+    observability = fake_ray.get(collector.observability_snapshot.remote())
+    worker_profile = observability["worker_profiles"][0]
 
     assert [chunk.to_dict(orient="records") for chunk in output] == [[{"row": 0}, {"row": 1}], [{"row": 2}]]
+    assert worker_profile["total_rows"] == 3
+    assert worker_profile["memory_usage_bytes"] > 0
+    assert worker_profile["input_memory_usage_bytes"] > 0
+    assert worker_profile["process_maxrss_bytes"] is None or worker_profile["process_maxrss_bytes"] > 0
     assert len(calls) == 1
     assert calls[0]["rows_per_chunk"] == 2
     assert calls[0]["input_frame"].to_dict(orient="records") == [

@@ -99,6 +99,8 @@ class RayWorkerProfile:
     non_null_counts: dict[str, int] = field(default_factory=dict)
     null_counts: dict[str, int] = field(default_factory=dict)
     memory_usage_bytes: int | None = None
+    input_memory_usage_bytes: int | None = None
+    process_maxrss_bytes: int | None = None
     model_usage: ModelUsageSummary | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -109,6 +111,18 @@ class RayWorkerProfile:
             validate_non_negative_int_field(
                 "memory_usage_bytes",
                 self.memory_usage_bytes,
+                field_label=_OBSERVABILITY_FIELD_LABEL,
+            )
+        if self.input_memory_usage_bytes is not None:
+            validate_non_negative_int_field(
+                "input_memory_usage_bytes",
+                self.input_memory_usage_bytes,
+                field_label=_OBSERVABILITY_FIELD_LABEL,
+            )
+        if self.process_maxrss_bytes is not None:
+            validate_non_negative_int_field(
+                "process_maxrss_bytes",
+                self.process_maxrss_bytes,
                 field_label=_OBSERVABILITY_FIELD_LABEL,
             )
         for column in self.columns:
@@ -466,6 +480,16 @@ def normalize_ray_worker_profile(payload: RayWorkerProfilePayload) -> RayWorkerP
         memory_usage_bytes=coerce_optional_int_field(
             payload.get("memory_usage_bytes"),
             "memory_usage_bytes",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        input_memory_usage_bytes=coerce_optional_int_field(
+            payload.get("input_memory_usage_bytes"),
+            "input_memory_usage_bytes",
+            field_label=_OBSERVABILITY_FIELD_LABEL,
+        ),
+        process_maxrss_bytes=coerce_optional_int_field(
+            payload.get("process_maxrss_bytes"),
+            "process_maxrss_bytes",
             field_label=_OBSERVABILITY_FIELD_LABEL,
         ),
         model_usage=coerce_model_usage(
