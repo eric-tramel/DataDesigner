@@ -17,7 +17,7 @@ from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.processors import ProcessorType
 from data_designer.engine.column_generators.utils.generator_classification import column_type_is_model_generated
-from data_designer.engine.dataset_builders.block_execution import execute_dataset_block
+from data_designer.engine.dataset_builders.block_execution import execute_dataset_block, execute_dataset_block_stream
 from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, ArtifactStorage
 from data_designer.integrations.ray import seed_planning as ray_seed_planning
 from data_designer.integrations.ray.artifact_output import create_data_designer_ray_datasink
@@ -1017,14 +1017,12 @@ class _RayBatchWorker:
             metrics_collector=metrics_collector,
             observability_options=self._observability_options,
             execute_block=execute_dataset_block,
+            execute_block_stream=execute_dataset_block_stream,
         )
         self._worker_options: _RayWorkerOptions = self._pipeline.worker_options
 
     def __call__(self, batch: Any) -> Any:
-        output = _generate_batch(batch, worker=self, metrics_collector=self._metrics_collector)
-        if self._execution_payload.output_chunk_rows is None:
-            return output
-        return _iter_dataframe_chunks(output, rows_per_chunk=self._execution_payload.output_chunk_rows)
+        return _generate_batch(batch, worker=self, metrics_collector=self._metrics_collector)
 
     def close(self) -> None:
         return None
@@ -1034,7 +1032,12 @@ class _RayBatchWorker:
         batch_observer = self._pipeline.begin_observability(worker_batch)
         if worker_batch.num_records == 0:
             return self._pipeline.complete_empty_batch(worker_batch, batch_observer)
-        return self._pipeline.generate_non_empty_batch(worker_batch, batch_observer)
+        if self._pipeline.should_stream_worker_output():
+            return self._pipeline.generate_non_empty_batch_stream(worker_batch, batch_observer)
+        output = self._pipeline.generate_non_empty_batch(worker_batch, batch_observer)
+        if self._execution_payload.output_chunk_rows is None:
+            return output
+        return _iter_dataframe_chunks(output, rows_per_chunk=self._execution_payload.output_chunk_rows)
 
 
 def _generate_batch(

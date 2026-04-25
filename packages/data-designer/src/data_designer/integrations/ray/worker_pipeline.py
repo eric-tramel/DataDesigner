@@ -10,7 +10,7 @@ import pickle
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import data_designer.lazy_heavy_imports as lazy
@@ -19,9 +19,13 @@ from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import SeedConfig
 from data_designer.engine.dataset_builders.block_execution import (
+    BlockExecutionChunk,
+    BlockExecutionChunkStream,
     BlockExecutionOptions,
     BlockExecutionResult,
+    BlockExecutionStreamSummary,
     execute_dataset_block,
+    execute_dataset_block_stream,
 )
 from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import SeedReader
@@ -34,7 +38,7 @@ from data_designer.integrations.ray.errors import (
     RayDatasetGenerationError,
 )
 from data_designer.integrations.ray.metrics import RayWorkerMetrics
-from data_designer.integrations.ray.observability import RayTraceEvent
+from data_designer.integrations.ray.observability import RayTraceEvent, RayWorkerProfile
 from data_designer.integrations.ray.observability_collection import (
     _create_trace_event,
     _get_ray_worker_context,
@@ -53,6 +57,10 @@ if TYPE_CHECKING:
 
 _RAY_INTERNAL_ROW_ID_COLUMN = "__data_designer_ray_row_id"
 _ExecuteDatasetBlock = Callable[..., BlockExecutionResult]
+_ExecuteDatasetBlockStream = Callable[..., BlockExecutionChunkStream]
+
+
+BlockExecutionOutcome = BlockExecutionResult | BlockExecutionStreamSummary
 
 
 @dataclass(frozen=True)
@@ -94,16 +102,64 @@ class _RayWorkerBatch:
 @dataclass(frozen=True)
 class _RayWorkerGenerationResult:
     dataframe: Any
-    block_result: BlockExecutionResult
+    block_result: BlockExecutionOutcome
     model_usage: dict[str, dict[str, Any]] | None
 
 
 class _RayWorkerAllRowsDroppedError(Exception):
-    def __init__(self, block_result: BlockExecutionResult) -> None:
+    def __init__(self, block_result: BlockExecutionOutcome) -> None:
         super().__init__(
             f"all input rows were dropped during block execution (input_rows={block_result.input_rows}, output_rows=0)"
         )
         self.block_result = block_result
+
+
+@dataclass
+class _RayWorkerProfileAccumulator:
+    """Accumulate chunk profiles without rebuilding a full worker output frame."""
+
+    block_id: str
+    total_rows: int = 0
+    columns: list[str] = field(default_factory=list)
+    column_dtypes: dict[str, str] = field(default_factory=dict)
+    non_null_counts: dict[str, int] = field(default_factory=dict)
+    null_counts: dict[str, int] = field(default_factory=dict)
+    memory_usage_bytes: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+    def observe(self, dataframe: Any) -> None:
+        profile = _profile_worker_output(dataframe, block_id=self.block_id, model_usage=None)
+        self.total_rows += profile.total_rows
+        self.memory_usage_bytes += profile.memory_usage_bytes or 0
+        self.warnings.extend(profile.warnings)
+        if not self.columns:
+            self.columns = list(profile.columns)
+            self.column_dtypes = dict(profile.column_dtypes)
+        elif set(self.columns) != set(profile.columns):
+            self.warnings.append("Streaming chunk column sets differed within one Ray worker block.")
+        for column, dtype in profile.column_dtypes.items():
+            existing_dtype = self.column_dtypes.get(column)
+            if existing_dtype is not None and existing_dtype != dtype:
+                self.warnings.append(
+                    f"Streaming chunk dtype for column {column!r} changed from {existing_dtype!r} to {dtype!r}."
+                )
+        for column, count in profile.non_null_counts.items():
+            self.non_null_counts[column] = self.non_null_counts.get(column, 0) + count
+        for column, count in profile.null_counts.items():
+            self.null_counts[column] = self.null_counts.get(column, 0) + count
+
+    def to_profile(self, *, model_usage: dict[str, dict[str, Any]] | None) -> RayWorkerProfile:
+        return RayWorkerProfile(
+            block_id=self.block_id,
+            total_rows=self.total_rows,
+            columns=self.columns,
+            column_dtypes=self.column_dtypes,
+            non_null_counts=self.non_null_counts,
+            null_counts=self.null_counts,
+            memory_usage_bytes=self.memory_usage_bytes,
+            model_usage=model_usage,
+            warnings=self.warnings,
+        )
 
 
 class _RayWorkerGenerationPipeline:
@@ -116,6 +172,7 @@ class _RayWorkerGenerationPipeline:
         metrics_collector: Any | None = None,
         observability_options: _RayObservabilityOptions | None = None,
         execute_block: _ExecuteDatasetBlock | None = None,
+        execute_block_stream: _ExecuteDatasetBlockStream | None = None,
     ) -> None:
         os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
         self._execution_payload = execution_payload
@@ -125,6 +182,7 @@ class _RayWorkerGenerationPipeline:
             observability_options=self._observability_options,
         )
         self._execute_block = execute_block or execute_dataset_block
+        self._execute_block_stream = execute_block_stream or execute_dataset_block_stream
         self._observer = _RayWorkerObserver(
             metrics_collector=metrics_collector,
             observability_options=self._observability_options,
@@ -139,7 +197,19 @@ class _RayWorkerGenerationPipeline:
         batch_observer = self.begin_observability(worker_batch)
         if worker_batch.num_records == 0:
             return self.complete_empty_batch(worker_batch, batch_observer)
+        if self.should_stream_worker_output():
+            return self.generate_non_empty_batch_stream(worker_batch, batch_observer)
         return self.generate_non_empty_batch(worker_batch, batch_observer)
+
+    def should_stream_worker_output(self) -> bool:
+        if self._execution_payload.output_chunk_rows is None:
+            return False
+        if self._execution_payload.capture_artifacts:
+            return False
+        return not (
+            self._execution_payload.hidden_order_column is not None
+            and not self._execution_payload.preserve_output_row_count
+        )
 
     def begin_observability(self, worker_batch: _RayWorkerBatch) -> _RayWorkerBatchObserver:
         return self._observer.begin_batch(worker_batch)
@@ -158,6 +228,77 @@ class _RayWorkerGenerationPipeline:
                     output_rows=len(generation_result.dataframe),
                 )
             return self.complete_successful_batch(worker_batch, generation_result, batch_observer)
+        except _RayWorkerAllRowsDroppedError as exc:
+            batch_observer.record_all_rows_dropped(worker_batch, exc.block_result)
+            raise RayDatasetGenerationError(
+                _format_worker_failure_message(dataframe=worker_batch.dataframe, exc=exc)
+            ) from None
+        except Exception as exc:
+            batch_observer.record_failure(worker_batch, exc)
+            if isinstance(exc, RayDatasetGenerationError):
+                raise
+            raise RayDatasetGenerationError(
+                _format_worker_failure_message(dataframe=worker_batch.dataframe, exc=exc)
+            ) from exc
+
+    def generate_non_empty_batch_stream(
+        self,
+        worker_batch: _RayWorkerBatch,
+        batch_observer: _RayWorkerBatchObserver,
+    ) -> Iterator[Any]:
+        try:
+            batch_observer.record_generation_started(worker_batch)
+            stream = self.generate_row_chunks(worker_batch)
+            profile = _RayWorkerProfileAccumulator(block_id=worker_batch.block_id)
+            emitted_rows = 0
+            output_columns: list[str] = []
+            for chunk in stream:
+                output = chunk.dataframe
+                if self._execution_payload.hidden_order_column is not None:
+                    output = _append_hidden_order_column(
+                        output,
+                        order_values=_chunk_order_values(
+                            worker_batch.dataframe,
+                            chunk=chunk,
+                            hidden_order_column=self._execution_payload.hidden_order_column,
+                        ),
+                        hidden_order_column=self._execution_payload.hidden_order_column,
+                    )
+                if self._execution_payload.preserve_output_row_count:
+                    _validate_output_row_count(input_rows=chunk.input_rows, output_rows=len(output))
+                if not output_columns:
+                    output_columns = [str(column) for column in output.columns]
+                emitted_rows += len(output)
+                if self._observability_options.profile_workers:
+                    profile.observe(output)
+                yield output
+
+            block_summary = stream.summary
+            if block_summary.all_rows_dropped:
+                raise _RayWorkerAllRowsDroppedError(block_summary)
+            if self._execution_payload.preserve_output_row_count:
+                _validate_output_row_count(
+                    input_rows=worker_batch.num_records,
+                    output_rows=block_summary.output_rows,
+                )
+            if emitted_rows != block_summary.output_rows:
+                raise RayDatasetGenerationError(
+                    "RayBackend engine stream emitted "
+                    f"{emitted_rows} row(s), but the block summary reported {block_summary.output_rows} row(s)."
+                )
+            batch_observer.record_success(
+                worker_batch,
+                _RayWorkerGenerationResult(
+                    dataframe=None,
+                    block_result=block_summary,
+                    model_usage=block_summary.model_usage_stats or None,
+                ),
+                throttle_manager=self._worker_options.throttle_manager,
+                worker_profile=profile.to_profile(model_usage=block_summary.model_usage_stats or None)
+                if self._observability_options.profile_workers
+                else None,
+                output_columns=output_columns,
+            )
         except _RayWorkerAllRowsDroppedError as exc:
             batch_observer.record_all_rows_dropped(worker_batch, exc.block_result)
             raise RayDatasetGenerationError(
@@ -213,6 +354,24 @@ class _RayWorkerGenerationPipeline:
             dataframe=output,
             block_result=block_result,
             model_usage=block_result.model_usage_stats or None,
+        )
+
+    def generate_row_chunks(self, worker_batch: _RayWorkerBatch) -> BlockExecutionChunkStream:
+        block_config = self.create_block_config(worker_batch.dataframe)
+        input_frame = _create_worker_input_frame(
+            worker_batch.dataframe,
+            use_input_dataset=self._execution_payload.use_input_dataset,
+            range_input_columns=self._execution_payload.range_input_columns,
+        )
+        if self._execution_payload.output_chunk_rows is None:
+            raise RayDatasetGenerationError("RayBackend output chunk rows are required for engine block streaming.")
+        return self._execute_block_stream(
+            rows_per_chunk=self._execution_payload.output_chunk_rows,
+            data_designer_config=block_config,
+            runtime_context=self._worker_options,
+            input_frame=input_frame,
+            num_records=worker_batch.num_records,
+            options=BlockExecutionOptions(use_async=True, dataset_name="ray-block"),
         )
 
     def complete_empty_batch(self, worker_batch: _RayWorkerBatch, batch_observer: _RayWorkerBatchObserver) -> Any:
@@ -348,9 +507,19 @@ class _RayWorkerBatchObserver:
         generation_result: _RayWorkerGenerationResult,
         *,
         throttle_manager: Any | None,
+        worker_profile: RayWorkerProfile | None = None,
+        output_columns: list[str] | None = None,
     ) -> None:
         elapsed_seconds = time.perf_counter() - worker_batch.start_time
         block_result = generation_result.block_result
+        output_row_count = (
+            len(generation_result.dataframe) if generation_result.dataframe is not None else block_result.output_rows
+        )
+        output_columns = (
+            [str(column) for column in generation_result.dataframe.columns]
+            if generation_result.dataframe is not None
+            else (output_columns or (worker_profile.columns if worker_profile is not None else []))
+        )
         if self._observability_options.trace_enabled:
             self._trace_events.extend(
                 _task_traces_to_events(
@@ -364,10 +533,10 @@ class _RayWorkerBatchObserver:
                     worker_batch.block_id,
                     "block_completed",
                     worker_batch.start_time,
-                    row_count=len(generation_result.dataframe),
+                    row_count=output_row_count,
                     worker_context=worker_batch.worker_context,
                     details={
-                        "output_columns": [str(column) for column in generation_result.dataframe.columns],
+                        "output_columns": output_columns,
                         "input_rows": block_result.input_rows,
                         "output_rows": block_result.output_rows,
                         "dropped_rows": block_result.dropped_rows,
@@ -384,7 +553,9 @@ class _RayWorkerBatchObserver:
         )
         _record_worker_observability(
             self._metrics_collector,
-            worker_profile=(
+            worker_profile=worker_profile
+            if worker_profile is not None
+            else (
                 _profile_worker_output(
                     generation_result.dataframe,
                     block_id=worker_batch.block_id,
@@ -397,7 +568,7 @@ class _RayWorkerBatchObserver:
             throttle_snapshots=_snapshot_worker_throttle(throttle_manager),
         )
 
-    def record_all_rows_dropped(self, worker_batch: _RayWorkerBatch, block_result: BlockExecutionResult) -> None:
+    def record_all_rows_dropped(self, worker_batch: _RayWorkerBatch, block_result: BlockExecutionOutcome) -> None:
         elapsed_seconds = time.perf_counter() - worker_batch.start_time
         if self._observability_options.trace_enabled:
             self._trace_events.append(
@@ -582,6 +753,16 @@ def _get_hidden_order_values(dataframe: Any, *, hidden_order_column: str | None)
     return [int(value) for value in values]
 
 
+def _chunk_order_values(
+    dataframe: Any,
+    *,
+    chunk: BlockExecutionChunk,
+    hidden_order_column: str,
+) -> list[int]:
+    order_values = _get_hidden_order_values(dataframe, hidden_order_column=hidden_order_column)
+    return order_values[chunk.input_start : chunk.input_start + chunk.input_rows]
+
+
 def _append_hidden_order_column(
     output: Any,
     *,
@@ -617,7 +798,7 @@ def _validate_output_row_count(*, input_rows: int, output_rows: int) -> None:
 
 
 def _metrics_from_block_result(
-    block_result: BlockExecutionResult,
+    block_result: BlockExecutionOutcome,
     *,
     elapsed_seconds: float,
     block_id: str,

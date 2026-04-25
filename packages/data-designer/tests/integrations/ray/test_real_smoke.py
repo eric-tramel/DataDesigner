@@ -130,6 +130,7 @@ def test_real_ray_streaming_out_of_core_parquet_smoke(
         managed_assets_path=real_ray_smoke_paths.managed_assets_path,
         backend=RayBackend(
             batch_size=4,
+            output_chunk_rows=2,
             output="dataset",
             profile_workers=True,
             trace_enabled=True,

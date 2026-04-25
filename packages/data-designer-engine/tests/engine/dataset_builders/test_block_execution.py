@@ -19,6 +19,7 @@ from data_designer.engine.dataset_builders.block_execution import (
     BlockExecutionOptions,
     DataDesignerBlockRuntimeContext,
     execute_dataset_block,
+    execute_dataset_block_stream,
 )
 from data_designer.engine.dataset_builders.utils.task_model import TaskTrace
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
@@ -91,6 +92,44 @@ def test_execute_dataset_block_uses_input_frame_as_seed(
         {"x": 2, "label": "b", "x_label": "2-b"},
     ]
     assert input_frame.to_dict(orient="records") == [{"x": 1, "label": "a"}, {"x": 2, "label": "b"}]
+
+
+def test_execute_dataset_block_streams_ordered_chunks_and_summary(
+    tmp_path: Path,
+    stub_model_configs: Any,
+    stub_model_providers: Any,
+) -> None:
+    config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
+    config_builder.add_column(ExpressionColumnConfig(name="x_label", expr="{{ x }}-{{ label }}"))
+    config_builder.add_processor(processor_type=ProcessorType.DROP_COLUMNS, name="drop-label", column_names=["label"])
+    input_frame = lazy.pd.DataFrame({"x": [1, 2, 3, 4, 5], "label": ["a", "b", "c", "d", "e"]})
+
+    stream = execute_dataset_block_stream(
+        rows_per_chunk=2,
+        config_builder=config_builder,
+        runtime_context=_runtime_context(tmp_path, stub_model_providers),
+        input_frame=input_frame,
+        options=BlockExecutionOptions(use_async=True),
+    )
+
+    chunks = list(stream)
+
+    assert [chunk.input_start for chunk in chunks] == [0, 2, 4]
+    assert [chunk.input_rows for chunk in chunks] == [2, 2, 1]
+    assert [len(chunk.dataframe) for chunk in chunks] == [2, 2, 1]
+    assert chunks[0].raw_dataframe.columns.to_list() == ["x", "label", "x_label"]
+    assert chunks[0].dataframe.columns.to_list() == ["x", "x_label"]
+    assert lazy.pd.concat([chunk.dataframe for chunk in chunks], ignore_index=True).to_dict(orient="records") == [
+        {"x": 1, "x_label": "1-a"},
+        {"x": 2, "x_label": "2-b"},
+        {"x": 3, "x_label": "3-c"},
+        {"x": 4, "x_label": "4-d"},
+        {"x": 5, "x_label": "5-e"},
+    ]
+    assert stream.summary.input_rows == 5
+    assert stream.summary.output_rows == 5
+    assert stream.summary.dropped_rows == 0
+    assert stream.summary.all_rows_dropped is False
 
 
 def test_execute_dataset_block_uses_model_columns(
