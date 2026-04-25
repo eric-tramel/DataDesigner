@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from data_designer.integrations.ray import RayDatasetMetrics, RayMetricsError, RayWorkerMetrics
@@ -56,7 +58,7 @@ def test_aggregate_ray_metrics_sums_worker_metrics_and_model_usage() -> None:
         total_rows=15,
         blocks=3,
         failed_blocks=1,
-        elapsed_seconds=5.0,
+        worker_elapsed_seconds=5.0,
         model_usage={
             "model-a": {
                 "token_usage": {"input_tokens": 5, "output_tokens": 15, "total_tokens": 20},
@@ -72,6 +74,28 @@ def test_aggregate_ray_metrics_sums_worker_metrics_and_model_usage() -> None:
     )
     assert metrics.successful_blocks == 2
     assert metrics.to_dict()["total_rows"] == 15
+    assert metrics.to_dict()["worker_elapsed_seconds"] == 5.0
+
+
+def test_aggregate_ray_metrics_preserves_driver_elapsed_seconds() -> None:
+    metrics = aggregate_ray_metrics(
+        [
+            RayWorkerMetrics(
+                total_rows=10,
+                blocks=1,
+                elapsed_seconds=2.0,
+            ),
+            RayWorkerMetrics(
+                total_rows=5,
+                blocks=1,
+                elapsed_seconds=3.0,
+            ),
+        ],
+        elapsed_seconds=1.25,
+    )
+
+    assert metrics.elapsed_seconds == 1.25
+    assert metrics.worker_elapsed_seconds == 5.0
 
 
 def test_normalize_ray_worker_metrics_uses_serializable_mapping_defaults() -> None:
@@ -114,3 +138,34 @@ def test_aggregate_ray_metrics_sums_row_outcomes() -> None:
 def test_normalize_ray_worker_metrics_rejects_invalid_payload() -> None:
     with pytest.raises(RayMetricsError, match="must be a mapping"):
         normalize_ray_worker_metrics(object())
+
+
+def test_normalize_ray_worker_metrics_rejects_dataset_metrics_dataclass() -> None:
+    with pytest.raises(RayMetricsError, match="dataset-level summaries"):
+        normalize_ray_worker_metrics(RayDatasetMetrics(total_rows=3, blocks=1, throttle={"domains": []}))
+
+
+def test_normalize_ray_worker_metrics_rejects_dataset_metrics_mapping() -> None:
+    payload = RayDatasetMetrics(
+        total_rows=3,
+        blocks=1,
+        elapsed_seconds=0.25,
+        worker_elapsed_seconds=1.0,
+        throttle={"domains": []},
+    ).to_dict()
+
+    with pytest.raises(RayMetricsError, match="dataset-level field"):
+        normalize_ray_worker_metrics(payload)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: RayWorkerMetrics(blocks=1, failed_blocks=2),
+        lambda: RayDatasetMetrics(blocks=1, failed_blocks=2),
+        lambda: normalize_ray_worker_metrics({"blocks": 1, "failed_blocks": 2}),
+    ],
+)
+def test_ray_metrics_reject_failed_blocks_greater_than_blocks(factory: Callable[[], object]) -> None:
+    with pytest.raises(RayMetricsError, match="failed_blocks.*greater than.*blocks"):
+        factory()

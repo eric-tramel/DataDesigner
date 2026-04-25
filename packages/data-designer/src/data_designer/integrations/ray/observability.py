@@ -137,12 +137,13 @@ class RayDatasetAnalysis:
         _validate_non_negative_int("total_rows", self.total_rows)
         _validate_non_negative_int("blocks", self.blocks)
         _validate_non_negative_int("failed_blocks", self.failed_blocks)
+        _validate_failed_blocks_not_greater_than_blocks(blocks=self.blocks, failed_blocks=self.failed_blocks)
         _validate_non_negative_int("trace_events_dropped", self.trace_events_dropped)
 
     @property
     def successful_blocks(self) -> int:
         """Return completed block count after failed blocks are subtracted."""
-        return max(self.blocks - self.failed_blocks, 0)
+        return self.blocks - self.failed_blocks
 
     @property
     def column_names(self) -> list[str]:
@@ -414,3 +415,8 @@ def _validate_non_negative_float(field_name: str, value: float) -> None:
     )
     if value < 0:
         raise RayMetricsError(f"Ray observability field {field_name!r} must be non-negative.")
+
+
+def _validate_failed_blocks_not_greater_than_blocks(*, blocks: int, failed_blocks: int) -> None:
+    if failed_blocks > blocks:
+        raise RayMetricsError("Ray observability field 'failed_blocks' cannot be greater than 'blocks'.")

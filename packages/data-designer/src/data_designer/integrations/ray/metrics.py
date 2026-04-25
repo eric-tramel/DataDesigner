@@ -11,7 +11,16 @@ from data_designer.integrations.ray._validation import validate_finite_number
 from data_designer.integrations.ray.errors import RayMetricsError
 
 ModelUsageSummary = dict[str, dict[str, Any]]
-RayMetricsPayload: TypeAlias = "RayDatasetMetrics | RayWorkerMetrics | Mapping[str, Any]"
+RayWorkerMetricsPayload: TypeAlias = "RayWorkerMetrics | Mapping[str, Any]"
+_DATASET_METRICS_ONLY_FIELDS = frozenset(
+    {
+        "all_rows_dropped_blocks",
+        "partial_rows_dropped_blocks",
+        "empty_input_blocks",
+        "worker_elapsed_seconds",
+        "throttle",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +52,7 @@ class RayWorkerMetrics:
         _validate_bool("empty_input", self.empty_input)
         _validate_non_negative_int("blocks", self.blocks)
         _validate_non_negative_int("failed_blocks", self.failed_blocks)
+        _validate_failed_blocks_not_greater_than_blocks(blocks=self.blocks, failed_blocks=self.failed_blocks)
         _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
         if self.block_id is not None and not isinstance(self.block_id, str):
             raise RayMetricsError("Ray metrics field 'block_id' must be a string when provided.")
@@ -58,6 +68,9 @@ class RayDatasetMetrics:
 
     total_rows is populated only when the backend knows the count without
     forcing Ray Dataset materialization on the driver.
+    elapsed_seconds is driver-observed wall-clock duration. worker_elapsed_seconds
+    is the cumulative elapsed duration reported by worker/block payloads.
+    Aggregated model usage rates use worker_elapsed_seconds when available.
     """
 
     total_rows: int = 0
@@ -70,6 +83,7 @@ class RayDatasetMetrics:
     blocks: int = 0
     failed_blocks: int = 0
     elapsed_seconds: float = 0.0
+    worker_elapsed_seconds: float = 0.0
     model_usage: ModelUsageSummary | None = None
     throttle: dict[str, Any] | None = None
 
@@ -85,12 +99,14 @@ class RayDatasetMetrics:
         _validate_non_negative_int("empty_input_blocks", self.empty_input_blocks)
         _validate_non_negative_int("blocks", self.blocks)
         _validate_non_negative_int("failed_blocks", self.failed_blocks)
+        _validate_failed_blocks_not_greater_than_blocks(blocks=self.blocks, failed_blocks=self.failed_blocks)
         _validate_non_negative_float("elapsed_seconds", self.elapsed_seconds)
+        _validate_non_negative_float("worker_elapsed_seconds", self.worker_elapsed_seconds)
 
     @property
     def successful_blocks(self) -> int:
         """Return completed block count after failed blocks are subtracted."""
-        return max(self.blocks - self.failed_blocks, 0)
+        return self.blocks - self.failed_blocks
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -108,17 +124,22 @@ class _MetricsAccumulator:
     empty_input_blocks: int = 0
     blocks: int = 0
     failed_blocks: int = 0
-    elapsed_seconds: float = 0.0
+    worker_elapsed_seconds: float = 0.0
     model_usage: ModelUsageSummary = field(default_factory=dict)
 
 
-def aggregate_ray_metrics(worker_metrics: Iterable[RayMetricsPayload]) -> RayDatasetMetrics:
+def aggregate_ray_metrics(
+    worker_metrics: Iterable[RayWorkerMetricsPayload],
+    *,
+    elapsed_seconds: float = 0.0,
+) -> RayDatasetMetrics:
     """Aggregate worker or block metrics into a dataset-level summary.
 
     The helper accepts plain mappings so Ray workers can return JSON-like
     payloads without importing Data Designer integration classes on the driver.
     Model usage is expected to follow Data Designer's model usage summary shape;
-    token and request rates are recomputed from aggregate counters.
+    token and request rates are recomputed from aggregate counters using
+    cumulative worker elapsed time when worker timings are available.
     """
     accumulator = _MetricsAccumulator()
     for payload in worker_metrics:
@@ -132,13 +153,19 @@ def aggregate_ray_metrics(worker_metrics: Iterable[RayMetricsPayload]) -> RayDat
         accumulator.empty_input_blocks += int(metrics.empty_input)
         accumulator.blocks += metrics.blocks
         accumulator.failed_blocks += metrics.failed_blocks
-        accumulator.elapsed_seconds += metrics.elapsed_seconds
+        accumulator.worker_elapsed_seconds += metrics.elapsed_seconds
         if metrics.model_usage:
             _merge_model_usage(accumulator.model_usage, metrics.model_usage)
 
     model_usage = accumulator.model_usage or None
     if model_usage is not None:
-        _recompute_model_usage_rates(model_usage, accumulator.elapsed_seconds)
+        _recompute_model_usage_rates(
+            model_usage,
+            _model_usage_rate_elapsed_seconds(
+                elapsed_seconds=elapsed_seconds,
+                worker_elapsed_seconds=accumulator.worker_elapsed_seconds,
+            ),
+        )
 
     return RayDatasetMetrics(
         total_rows=accumulator.total_rows,
@@ -150,32 +177,25 @@ def aggregate_ray_metrics(worker_metrics: Iterable[RayMetricsPayload]) -> RayDat
         empty_input_blocks=accumulator.empty_input_blocks,
         blocks=accumulator.blocks,
         failed_blocks=accumulator.failed_blocks,
-        elapsed_seconds=accumulator.elapsed_seconds,
+        elapsed_seconds=elapsed_seconds,
+        worker_elapsed_seconds=accumulator.worker_elapsed_seconds,
         model_usage=model_usage,
     )
 
 
-def normalize_ray_worker_metrics(payload: RayMetricsPayload) -> RayWorkerMetrics:
+def normalize_ray_worker_metrics(payload: RayWorkerMetricsPayload) -> RayWorkerMetrics:
     """Normalize a dataclass or mapping payload into RayWorkerMetrics."""
     if isinstance(payload, RayDatasetMetrics):
-        return RayWorkerMetrics(
-            total_rows=payload.total_rows,
-            input_rows=payload.input_rows,
-            output_rows=payload.output_rows,
-            dropped_rows=payload.dropped_rows,
-            all_rows_dropped=payload.all_rows_dropped_blocks > 0,
-            partial_rows_dropped=payload.partial_rows_dropped_blocks > 0,
-            empty_input=payload.empty_input_blocks > 0,
-            blocks=payload.blocks,
-            failed_blocks=payload.failed_blocks,
-            elapsed_seconds=payload.elapsed_seconds,
-            model_usage=payload.model_usage,
-            block_id=None,
+        raise RayMetricsError(
+            "RayDatasetMetrics payloads are dataset-level summaries and cannot be normalized as worker metrics."
         )
     if isinstance(payload, RayWorkerMetrics):
         return payload
     if not isinstance(payload, Mapping):
-        raise RayMetricsError(f"Ray metrics payload must be a mapping or metrics dataclass, got {type(payload)!r}.")
+        raise RayMetricsError(
+            f"Ray metrics payload must be a mapping or RayWorkerMetrics dataclass, got {type(payload)!r}."
+        )
+    _reject_dataset_metrics_mapping(payload)
 
     return RayWorkerMetrics(
         total_rows=_coerce_int(payload, "total_rows", default=0),
@@ -269,6 +289,21 @@ def _validate_bool(field_name: str, value: bool) -> None:
         raise RayMetricsError(f"Ray metrics field {field_name!r} must be a boolean.")
 
 
+def _validate_failed_blocks_not_greater_than_blocks(*, blocks: int, failed_blocks: int) -> None:
+    if failed_blocks > blocks:
+        raise RayMetricsError("Ray metrics field 'failed_blocks' cannot be greater than 'blocks'.")
+
+
+def _reject_dataset_metrics_mapping(payload: Mapping[str, Any]) -> None:
+    dataset_fields = sorted(_DATASET_METRICS_ONLY_FIELDS.intersection(payload))
+    if dataset_fields:
+        field_list = ", ".join(repr(field) for field in dataset_fields)
+        raise RayMetricsError(
+            "Ray worker metrics payload contains dataset-level field(s) "
+            f"{field_list}; dataset metrics cannot be normalized as worker metrics."
+        )
+
+
 def _merge_model_usage(target: ModelUsageSummary, source: ModelUsageSummary) -> None:
     for model_name, stats in source.items():
         target_stats = target.setdefault(model_name, {})
@@ -311,6 +346,12 @@ def _recompute_model_usage_rates(model_usage: ModelUsageSummary, elapsed_seconds
             total_requests = successful_requests + failed_requests
             request_usage["total_requests"] = total_requests
             stats["requests_per_minute"] = int(total_requests / elapsed_seconds * 60) if elapsed_seconds > 0 else 0
+
+
+def _model_usage_rate_elapsed_seconds(*, elapsed_seconds: float, worker_elapsed_seconds: float) -> float:
+    if worker_elapsed_seconds > 0:
+        return worker_elapsed_seconds
+    return elapsed_seconds
 
 
 def _numeric_value(value: Any) -> int | float:

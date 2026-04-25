@@ -136,7 +136,10 @@ class RayDatasetCreationResults:
             raise RayDatasetGenerationError("RayBackend failed to load worker metrics.") from exc
         if not worker_metrics_payloads:
             return self._driver_metrics
-        worker_metrics = aggregate_ray_metrics(worker_metrics_payloads)
+        worker_metrics = aggregate_ray_metrics(
+            worker_metrics_payloads,
+            elapsed_seconds=self._driver_metrics.elapsed_seconds,
+        )
         self._metrics_cache = _merge_driver_and_worker_metrics(
             self._driver_metrics,
             worker_metrics,
@@ -872,7 +875,8 @@ def _merge_driver_and_worker_metrics(
         empty_input_blocks=worker_metrics.empty_input_blocks,
         blocks=worker_metrics.blocks,
         failed_blocks=worker_metrics.failed_blocks,
-        elapsed_seconds=worker_metrics.elapsed_seconds,
+        elapsed_seconds=driver_metrics.elapsed_seconds,
+        worker_elapsed_seconds=worker_metrics.worker_elapsed_seconds,
         model_usage=worker_metrics.model_usage or driver_metrics.model_usage,
         throttle=throttle_metrics or worker_metrics.throttle or driver_metrics.throttle,
     )

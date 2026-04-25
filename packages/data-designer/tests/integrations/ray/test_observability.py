@@ -190,3 +190,8 @@ def test_normalize_ray_trace_event_rejects_non_finite_timestamp_seconds(value: f
                 "timestamp_seconds": value,
             }
         )
+
+
+def test_ray_dataset_analysis_rejects_failed_blocks_greater_than_blocks() -> None:
+    with pytest.raises(RayMetricsError, match="failed_blocks.*greater than.*blocks"):
+        RayDatasetAnalysis(blocks=1, failed_blocks=2)
