@@ -173,6 +173,7 @@ def run_ray_backend_benchmark(
         results = designer.create(config_builder, num_records=num_records)
         output = results.load_dataset().to_pandas()
         metrics = results.load_metrics().to_dict()
+        ray_diagnostics = load_ray_diagnostics_payload(results)
         elapsed_seconds = time.perf_counter() - start
         payload = result_payload(
             backend=backend,
@@ -191,6 +192,7 @@ def run_ray_backend_benchmark(
         )
         if ray_output == "arrow_refs":
             payload["arrow_ref_count"] = len(results.output)
+        payload["ray_diagnostics"] = ray_diagnostics
         return payload
 
 
@@ -289,6 +291,47 @@ def result_payload(
         "output_mode": output_mode,
         "batch_size": batch_size,
         "max_parallel_requests": max_parallel_requests,
+    }
+
+
+def load_ray_diagnostics_payload(results: Any) -> dict[str, Any] | None:
+    try:
+        analysis = results.load_analysis()
+    except Exception as exc:
+        return {
+            "ray_dataset_stats": None,
+            "diagnostic_warnings": [f"Ray analysis collection failed: {type(exc).__name__}: {exc}"],
+        }
+    return ray_diagnostics_payload(analysis)
+
+
+def ray_diagnostics_payload(analysis: Any | None) -> dict[str, Any] | None:
+    if analysis is None:
+        return None
+    dataset_stats = getattr(analysis, "ray_dataset_stats", None)
+    stats_payload = None
+    if dataset_stats is not None:
+        stats_payload = {
+            "stats_text_available": bool(getattr(dataset_stats, "has_stats_text", False)),
+            "stats_text_truncated": bool(getattr(dataset_stats, "stats_text_truncated", False)),
+            "stats_text_char_count": int(getattr(dataset_stats, "stats_text_char_count", 0) or 0),
+            "operator_diagnostics": list(getattr(dataset_stats, "operator_diagnostics", []) or []),
+            "operator_diagnostics_dropped": int(getattr(dataset_stats, "operator_diagnostics_dropped", 0) or 0),
+            "backpressure_diagnostics": list(getattr(dataset_stats, "backpressure_diagnostics", []) or []),
+            "backpressure_diagnostics_dropped": int(getattr(dataset_stats, "backpressure_diagnostics_dropped", 0) or 0),
+            "object_store_diagnostics": list(getattr(dataset_stats, "object_store_diagnostics", []) or []),
+            "object_store_diagnostics_dropped": int(getattr(dataset_stats, "object_store_diagnostics_dropped", 0) or 0),
+            "warnings": list(getattr(dataset_stats, "warnings", []) or []),
+        }
+    return {
+        "worker_profiles": len(getattr(analysis, "worker_profiles", []) or []),
+        "worker_profiles_dropped": int(getattr(analysis, "worker_profiles_dropped", 0) or 0),
+        "trace_events": len(getattr(analysis, "trace_events", []) or []),
+        "trace_events_dropped": int(getattr(analysis, "trace_events_dropped", 0) or 0),
+        "throttle_snapshots": len(getattr(analysis, "throttle_snapshots", []) or []),
+        "throttle_snapshots_dropped": int(getattr(analysis, "throttle_snapshots_dropped", 0) or 0),
+        "ray_dataset_stats": stats_payload,
+        "diagnostic_warnings": list(getattr(analysis, "diagnostic_warnings", []) or []),
     }
 
 
