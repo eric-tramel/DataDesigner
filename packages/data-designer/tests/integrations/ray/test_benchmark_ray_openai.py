@@ -5,15 +5,26 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import sys
+import types
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
+from fake_ray_harness import FakeRayDataset, install_fake_ray
 
 import data_designer.lazy_heavy_imports as lazy
+from data_designer.engine.models.clients.adapters.openai_compatible import OpenAICompatibleClient
+from data_designer.engine.models.clients.types import (
+    AssistantMessage,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Usage,
+)
 from data_designer.integrations.ray import RayDatasetAnalysis, RayDatasetStats, RayTraceEvent, RayWorkerProfile
+from data_designer.integrations.ray import llm as ray_llm_module
 
 pytestmark = pytest.mark.ray_benchmark
 
@@ -54,6 +65,133 @@ def test_ray_benchmark_scripts_import_with_shared_helpers() -> None:
     assert modules["benchmark_ray_openai"].RESULT_PREFIX == "RAY_OPENAI_BENCHMARK_RESULT="
     assert modules["benchmark_ray_mock_provider"].RESULT_PREFIX == "RAY_MOCK_PROVIDER_BENCHMARK_RESULT="
     assert modules["benchmark_ray_streaming_out_of_core"].RESULT_PREFIX == "RAY_STREAMING_OUT_OF_CORE_RESULT="
+    assert modules["benchmark_ray_data_llm_vllm"].RESULT_PREFIX == "RAY_DATA_LLM_VLLM_BENCHMARK_RESULT="
+
+
+def test_ray_data_llm_vllm_benchmark_requires_live_opt_in() -> None:
+    module = _load_benchmark_module(
+        "benchmark_ray_data_llm_vllm_opt_in",
+        _benchmark_dir() / "benchmark_ray_data_llm_vllm.py",
+    )
+
+    with pytest.raises(SystemExit, match="live vLLM execution"):
+        module.main(["--skip-provider-health-check"])
+
+
+def test_ray_data_llm_vllm_benchmark_skips_missing_prereqs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module(
+        "benchmark_ray_data_llm_vllm_skip",
+        _benchmark_dir() / "benchmark_ray_data_llm_vllm.py",
+    )
+    output_json = tmp_path / "skip-report.json"
+    unavailable_capabilities = module.RayDataLLMCapabilities(
+        available=False,
+        ray_version=None,
+        missing_symbols=("build_processor", "vLLMEngineProcessorConfig"),
+        has_build_processor=False,
+        has_vllm_engine_processor=False,
+        has_http_request_processor=False,
+        has_serve_deployment_processor=False,
+        import_error="ModuleNotFoundError: boto3",
+    )
+
+    monkeypatch.setattr(module, "probe_ray_data_llm_capabilities", lambda: unavailable_capabilities)
+    monkeypatch.setattr(module, "_module_importable", lambda module_name: False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        module.main(
+            [
+                "--run-live",
+                "--skip-missing-prereqs",
+                "--skip-provider-health-check",
+                "--model-source",
+                "local-model",
+                "--provider-model",
+                "local-model",
+                "--output-json",
+                str(output_json),
+            ]
+        )
+
+    assert exc_info.value.code == 0
+    report = json.loads(output_json.read_text())
+    assert report["summary"]["status"] == "skipped"
+    assert any("ray.data.llm" in failure for failure in report["summary"]["preflight"]["failures"])
+    assert any("vLLM is not importable" in failure for failure in report["summary"]["preflight"]["failures"])
+
+
+def test_ray_data_llm_vllm_benchmark_runs_fake_provider_and_processor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module(
+        "benchmark_ray_data_llm_vllm_fake",
+        _benchmark_dir() / "benchmark_ray_data_llm_vllm.py",
+    )
+    fake_ray = install_fake_ray(monkeypatch)
+    fake_ray.init = lambda **_: None
+    fake_ray.shutdown = lambda: None
+    processor_calls = _install_fake_ray_data_llm(monkeypatch)
+    provider_requests: list[ChatCompletionRequest] = []
+
+    def fake_completion(_: OpenAICompatibleClient, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        provider_requests.append(request)
+        prompt = request.messages[-1]["content"]
+        return ChatCompletionResponse(
+            message=AssistantMessage(content=f"fake-provider:{prompt}"),
+            usage=Usage(input_tokens=2, output_tokens=3, total_tokens=5),
+        )
+
+    async def fake_acompletion(_: OpenAICompatibleClient, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        return fake_completion(_, request)
+
+    monkeypatch.setattr(OpenAICompatibleClient, "completion", fake_completion)
+    monkeypatch.setattr(OpenAICompatibleClient, "acompletion", fake_acompletion)
+    output_json = tmp_path / "benchmark-report.json"
+
+    module.main(
+        [
+            "--run-live",
+            "--skip-provider-health-check",
+            "--skip-gpu-check",
+            "--model-source",
+            "local-model",
+            "--provider-model",
+            "local-model",
+            "--prompt",
+            "Say hello.",
+            "--num-records",
+            "2",
+            "--batch-size",
+            "1",
+            "--max-parallel-requests",
+            "2",
+            "--iterations",
+            "1",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--managed-assets-path",
+            str(tmp_path / "managed-assets"),
+            "--output-json",
+            str(output_json),
+        ]
+    )
+
+    report = json.loads(output_json.read_text())
+    backends = {result["backend"] for result in report["results"]}
+    ray_data_llm_result = next(result for result in report["results"] if result["backend"] == "ray-data-llm")
+
+    assert backends == {"ray-openai-vllm", "ray-data-llm"}
+    assert report["summary"]["all_output_valid"] is True
+    assert report["summary"]["baseline_backend"] == "ray-openai-vllm"
+    assert "comparisons_vs_ray_openai_vllm" in report["summary"]
+    assert ray_data_llm_result["llm_stage_plan"]["status"] == "eligible"
+    assert ray_data_llm_result["llm_stage_plan"]["should_execute"] is True
+    assert len(processor_calls) == 1
+    assert len(provider_requests) == 2
 
 
 def test_streaming_benchmark_summarizes_worker_memory_profiles() -> None:
@@ -313,3 +451,66 @@ def _benchmark_result(
             "throttle_count": 0,
         },
     }
+
+
+def _install_fake_ray_data_llm(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    processor_calls: list[dict[str, Any]] = []
+
+    class FakeVLLMEngineProcessorConfig:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class FakeRayDataLLMProcessor:
+        def __init__(self, *, preprocess: Any, postprocess: Any) -> None:
+            self._preprocess = preprocess
+            self._postprocess = postprocess
+
+        def __call__(self, dataset: FakeRayDataset) -> FakeRayDataset:
+            def preprocess_row(row: dict[str, Any]) -> dict[str, Any]:
+                output = dict(row)
+                output.update(self._preprocess(row))
+                return output
+
+            def run_vllm_batch(batch: lazy.pd.DataFrame) -> lazy.pd.DataFrame:
+                rows: list[dict[str, Any]] = []
+                for row in batch.to_dict(orient="records"):
+                    messages = row["messages"]
+                    row["generated_text"] = f"fake-vllm:{messages[-1]['content']}"
+                    rows.append(row)
+                return lazy.pd.DataFrame(rows)
+
+            return dataset.map(preprocess_row).map_batches(run_vllm_batch, batch_format="pandas").map(self._postprocess)
+
+    def build_processor(
+        config: FakeVLLMEngineProcessorConfig,
+        preprocess: Any,
+        postprocess: Any,
+        **kwargs: Any,
+    ) -> FakeRayDataLLMProcessor:
+        processor_calls.append(
+            {
+                "config": config,
+                "preprocess": preprocess,
+                "postprocess": postprocess,
+                "kwargs": kwargs,
+            }
+        )
+        return FakeRayDataLLMProcessor(preprocess=preprocess, postprocess=postprocess)
+
+    fake_ray_data_llm = types.SimpleNamespace(
+        build_processor=build_processor,
+        vLLMEngineProcessorConfig=FakeVLLMEngineProcessorConfig,
+        HttpRequestProcessorConfig=object(),
+        ServeDeploymentProcessorConfig=object(),
+    )
+    original_import_module = ray_llm_module.importlib.import_module
+
+    def import_module(name: str) -> Any:
+        if name == "ray.data.llm":
+            return fake_ray_data_llm
+        if name == "vllm":
+            return types.SimpleNamespace()
+        return original_import_module(name)
+
+    monkeypatch.setattr(ray_llm_module.importlib, "import_module", import_module)
+    return processor_calls
