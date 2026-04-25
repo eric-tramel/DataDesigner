@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import sys
-import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fake_ray_harness import FakeRayDataset, install_fake_ray
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import ExpressionColumnConfig
@@ -18,94 +17,7 @@ from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend
 from data_designer.interface.data_designer import DataDesigner
 
-
-class FakeRayDataset:
-    def __init__(self, blocks: list[lazy.pd.DataFrame], *, reverse_mapped_blocks: bool = False) -> None:
-        self.blocks = blocks
-        self.reverse_mapped_blocks = reverse_mapped_blocks
-
-    def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
-        blocks = _map_batches_blocks(fn, self.blocks, kwargs)
-        if self.reverse_mapped_blocks:
-            blocks.reverse()
-        return FakeRayDataset(blocks, reverse_mapped_blocks=self.reverse_mapped_blocks)
-
-    def zip(self, other: FakeRayDataset) -> FakeRayDataset:
-        other_df = other.to_pandas()
-        offset = 0
-        blocks: list[lazy.pd.DataFrame] = []
-        for block in self.blocks:
-            block_len = len(block)
-            other_block = other_df.iloc[offset : offset + block_len].reset_index(drop=True)
-            blocks.append(lazy.pd.concat([block.reset_index(drop=True), other_block], axis=1))
-            offset += block_len
-        return FakeRayDataset(blocks, reverse_mapped_blocks=self.reverse_mapped_blocks)
-
-    def to_arrow_refs(self) -> list[lazy.pd.DataFrame]:
-        return self.blocks
-
-    def to_pandas(self) -> lazy.pd.DataFrame:
-        return lazy.pd.concat(self.blocks, ignore_index=True)
-
-    def sort(self, column: str) -> FakeRayDataset:
-        sorted_df = self.to_pandas().sort_values(column, kind="stable").reset_index(drop=True)
-        return FakeRayDataset([sorted_df])
-
-    def drop_columns(self, columns: list[str]) -> FakeRayDataset:
-        return FakeRayDataset([block.drop(columns=columns) for block in self.blocks])
-
-    def num_blocks(self) -> int:
-        return len(self.blocks)
-
-    def count(self) -> int:
-        return sum(len(block) for block in self.blocks)
-
-
-class FakeRayDataModule:
-    Dataset = FakeRayDataset
-
-    def __init__(self) -> None:
-        self.from_arrow_refs_input: list[Any] | None = None
-        self.from_pandas_refs_input: list[Any] | None = None
-        self.range_blocks: list[lazy.pd.DataFrame] | None = None
-        self.reverse_mapped_blocks = False
-
-    def range(self, num_records: int) -> FakeRayDataset:
-        blocks = self.range_blocks or [lazy.pd.DataFrame({"id": list(range(num_records))})]
-        return FakeRayDataset(blocks, reverse_mapped_blocks=self.reverse_mapped_blocks)
-
-    def from_arrow_refs(self, refs: list[Any]) -> FakeRayDataset:
-        self.from_arrow_refs_input = refs
-        return FakeRayDataset(
-            [_arrow_ref_to_pandas(ref) for ref in refs],
-            reverse_mapped_blocks=self.reverse_mapped_blocks,
-        )
-
-    def from_pandas_refs(self, refs: list[Any]) -> FakeRayDataset:
-        self.from_pandas_refs_input = refs
-        return FakeRayDataset(list(refs), reverse_mapped_blocks=self.reverse_mapped_blocks)
-
-
-def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
-    fn_kwargs = kwargs.get("fn_kwargs") or {}
-    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
-    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
-    return [map_fn(block, **fn_kwargs) for block in blocks]
-
-
-def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
-    fake_ray = types.ModuleType("ray")
-    fake_ray.data = FakeRayDataModule()
-    fake_ray.is_initialized = lambda: True
-    fake_ray.init = lambda: None
-    monkeypatch.setitem(sys.modules, "ray", fake_ray)
-    return fake_ray
-
-
-def _arrow_ref_to_pandas(ref: Any) -> lazy.pd.DataFrame:
-    if hasattr(ref, "to_pandas"):
-        return ref.to_pandas()
-    return ref
+pytestmark = pytest.mark.ray_fake
 
 
 def _managed_assets_path(tmp_path: Path) -> Path:
@@ -161,7 +73,7 @@ def test_explicit_order_column_sorts_stably_and_can_be_dropped(
     drop_order_column: bool,
     expected_columns: list[str],
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset(
         [
             lazy.pd.DataFrame({"row_order": [2, 4], "sku": ["c", "e"], "label": ["third", "fifth"]}),
@@ -195,7 +107,7 @@ def test_hidden_row_id_preserves_input_dataset_order_without_schema_pollution(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset(
         [
             lazy.pd.DataFrame({"sku": ["a", "b"], "label": ["first", "second"]}),
@@ -236,7 +148,7 @@ def test_hidden_row_id_preserves_object_ref_order_without_schema_pollution(
     stub_model_providers: Any,
     object_ref_format: str,
 ) -> None:
-    fake_ray = _install_fake_ray(monkeypatch)
+    fake_ray = install_fake_ray(monkeypatch)
     fake_ray.data.reverse_mapped_blocks = True
     if object_ref_format == "pandas":
         input_refs: list[Any] = [
@@ -276,7 +188,7 @@ def test_hidden_row_id_preserves_arrow_ref_output_order_without_schema_pollution
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset(
         [
             lazy.pd.DataFrame({"sku": ["a"], "label": ["first"]}),
@@ -307,7 +219,7 @@ def test_hidden_row_id_preserves_from_scratch_order_without_schema_pollution(
     stub_sampler_only_config_builder: DataDesignerConfigBuilder,
     stub_model_providers: Any,
 ) -> None:
-    fake_ray = _install_fake_ray(monkeypatch)
+    fake_ray = install_fake_ray(monkeypatch)
     fake_ray.data.range_blocks = [
         lazy.pd.DataFrame({"id": [0, 1]}),
         lazy.pd.DataFrame({"id": [2]}),
@@ -333,7 +245,7 @@ def test_seed_config_without_input_dataset_reads_partition_offsets_once(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    fake_ray = _install_fake_ray(monkeypatch)
+    fake_ray = install_fake_ray(monkeypatch)
     fake_ray.data.range_blocks = [
         lazy.pd.DataFrame({"id": [0, 1]}),
         lazy.pd.DataFrame({"id": [2, 3]}),
@@ -388,7 +300,7 @@ def test_pandas_object_refs_preserve_schema_column_order(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    fake_ray = _install_fake_ray(monkeypatch)
+    fake_ray = install_fake_ray(monkeypatch)
     input_refs = [
         lazy.pd.DataFrame({"sku": ["sku-1"], "quantity": [2], "label": ["alpha"]}),
         lazy.pd.DataFrame({"sku": ["sku-2"], "quantity": [5], "label": ["beta"]}),
@@ -421,7 +333,7 @@ def test_arrow_object_refs_preserve_schema_column_order(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    fake_ray = _install_fake_ray(monkeypatch)
+    fake_ray = install_fake_ray(monkeypatch)
     input_refs = [
         lazy.pa.table({"label": ["alpha"], "sku": ["sku-1"], "quantity": [2]}),
         lazy.pa.table({"label": ["beta"], "sku": ["sku-2"], "quantity": [5]}),
@@ -455,7 +367,7 @@ def test_object_refs_preserve_supported_dtypes_and_nulls(
     stub_model_providers: Any,
     object_ref_format: str,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_refs: list[Any]
     if object_ref_format == "pandas":
         input_refs = [

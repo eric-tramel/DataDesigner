@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 import types
 from pathlib import Path
-from typing import Any
+
+import pytest
+from fake_ray_harness import FakeActorHandle
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
@@ -19,26 +21,7 @@ from data_designer.integrations.ray import (
 )
 from data_designer.integrations.ray import backend as ray_backend_module
 
-
-class FakeObjectRef:
-    def __init__(self, value: Any) -> None:
-        self.value = value
-
-
-class FakeRemoteMethod:
-    def __init__(self, method: Any) -> None:
-        self._method = method
-
-    def remote(self, *args: Any, **kwargs: Any) -> FakeObjectRef:
-        return FakeObjectRef(self._method(*args, **kwargs))
-
-
-class FakeActorHandle:
-    def __init__(self, actor: Any) -> None:
-        self._actor = actor
-
-    def __getattr__(self, name: str) -> FakeRemoteMethod:
-        return FakeRemoteMethod(getattr(self._actor, name))
+pytestmark = pytest.mark.ray_fake
 
 
 def test_ray_results_load_analysis_returns_profiles_traces_and_throttle(

@@ -29,6 +29,8 @@ from data_designer.interface.data_designer import DataDesigner
 REAL_RAY_SMOKE_ENV = "DATA_DESIGNER_RUN_REAL_RAY_SMOKE"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 
+pytestmark = pytest.mark.ray_real_smoke
+
 
 def test_real_ray_markdown_seed_recipe_arrow_refs_smoke(
     tmp_path: Path,
@@ -78,6 +80,7 @@ def test_real_ray_markdown_seed_recipe_arrow_refs_smoke(
         ray.shutdown()
 
 
+@pytest.mark.ray_live_provider
 def test_real_ray_text_to_python_openai_recipe_smoke(tmp_path: Path) -> None:
     ray = _require_real_ray()
     if not os.environ.get(OPENAI_API_KEY_ENV):

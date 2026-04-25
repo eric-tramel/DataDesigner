@@ -12,6 +12,8 @@ import pytest
 
 import data_designer.lazy_heavy_imports as lazy
 
+pytestmark = pytest.mark.ray_benchmark
+
 
 def _load_benchmark_module() -> Any:
     repo_root = Path(__file__).resolve().parents[5]
