@@ -166,7 +166,12 @@ backend = RayBackend(
     output="dataset",
     auto_init=False,
     block_planning=RayBlockPlanning(target_block_size=10_000, min_blocks=4),
-    execution_options=RayExecutionOptions(num_cpus=1, concurrency=8),
+    execution_options=RayExecutionOptions(
+        num_cpus=1,
+        use_actor_pool=True,
+        actor_pool_min_size=2,
+        actor_pool_max_size=8,
+    ),
 )
 ```
 
@@ -174,6 +179,10 @@ backend = RayBackend(
 Ray planning and execution kwargs such as `override_num_blocks`, `read_concurrency`, `num_cpus`, and
 `map_concurrency` are still accepted as compatibility shims, but do not combine them with `block_planning` or
 `execution_options`; effective mixed values raise a configuration error. Prefer the option objects for new code.
+For scaling map workers, prefer `RayExecutionOptions(use_actor_pool=True, actor_pool_min_size=...,
+actor_pool_max_size=...)` or an explicit Ray `compute` strategy. `RayExecutionOptions(concurrency=...)` and the legacy
+`map_concurrency=...` shim remain covered for compatibility with older RayBackend callers, but new examples should use
+actor-pool or compute controls so placement, autoscaling, and provider throttling are easier to reason about.
 
 When passing an existing Ray Dataset or ObjectRefs through `input_dataset`, use `RayInputRepartition` to retune input
 blocks before Data Designer maps generation over them:
