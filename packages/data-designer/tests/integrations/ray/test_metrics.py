@@ -80,6 +80,12 @@ def test_normalize_ray_worker_metrics_uses_serializable_mapping_defaults() -> No
     assert metrics == RayWorkerMetrics(total_rows=3, output_rows=3, blocks=1)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_normalize_ray_worker_metrics_rejects_non_finite_elapsed_seconds(value: float) -> None:
+    with pytest.raises(RayMetricsError, match="elapsed_seconds.*finite"):
+        normalize_ray_worker_metrics({"total_rows": 3, "elapsed_seconds": value})
+
+
 def test_aggregate_ray_metrics_sums_row_outcomes() -> None:
     metrics = aggregate_ray_metrics(
         [

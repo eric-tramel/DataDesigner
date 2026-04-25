@@ -48,6 +48,18 @@ def test_ray_execution_options_rejects_duplicate_explicit_remote_args() -> None:
         RayExecutionOptions(num_cpus=0.5, ray_remote_args={"num_cpus": 1})
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_ray_execution_options_rejects_non_finite_numeric_options(value: float) -> None:
+    with pytest.raises(RayBackendConfigurationError, match="num_cpus.*finite"):
+        RayExecutionOptions(num_cpus=value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_ray_execution_options_rejects_non_finite_resources(value: float) -> None:
+    with pytest.raises(RayBackendConfigurationError, match=r"resources\['gpu_slice'\].*finite"):
+        RayExecutionOptions(resources={"gpu_slice": value})
+
+
 def test_ray_execution_options_rejects_actor_pool_with_concurrency() -> None:
     with pytest.raises(RayBackendConfigurationError, match="use_actor_pool"):
         RayExecutionOptions(use_actor_pool=True, concurrency=2)

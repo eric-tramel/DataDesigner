@@ -15,9 +15,11 @@ from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.integrations.ray import (
     RayDatasetCreationResults,
     RayDatasetMetrics,
+    RayMetricsError,
     RayThrottleSnapshot,
     RayTraceEvent,
     RayWorkerProfile,
+    normalize_ray_trace_event,
 )
 from data_designer.integrations.ray import backend as ray_backend_module
 
@@ -109,3 +111,15 @@ def test_ray_results_load_analysis_returns_none_without_observability_payload(
     )
 
     assert results.load_analysis() is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_normalize_ray_trace_event_rejects_non_finite_timestamp_seconds(value: float) -> None:
+    with pytest.raises(RayMetricsError, match="timestamp_seconds.*finite"):
+        normalize_ray_trace_event(
+            {
+                "block_id": "block-a",
+                "event_type": "block_started",
+                "timestamp_seconds": value,
+            }
+        )

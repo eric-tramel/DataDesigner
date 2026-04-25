@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from data_designer.integrations.ray._validation import validate_finite_number
 from data_designer.integrations.ray.errors import RayBackendConfigurationError
 
 RayMapConcurrency = int | tuple[int, int] | tuple[int, int, int]
@@ -213,14 +214,20 @@ def _validate_optional_positive_int(field_name: str, value: int | None) -> None:
 def _validate_optional_non_negative_number(field_name: str, value: float | None) -> None:
     if value is None:
         return
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a non-negative number.")
+    validate_finite_number(field_name, value, error_type=RayBackendConfigurationError, error_label="Ray option")
+    if value < 0:
         raise RayBackendConfigurationError(f"Ray option {field_name} must be a non-negative number.")
 
 
 def _validate_optional_positive_number(field_name: str, value: float | None) -> None:
     if value is None:
         return
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RayBackendConfigurationError(f"Ray option {field_name} must be a positive number.")
+    validate_finite_number(field_name, value, error_type=RayBackendConfigurationError, error_label="Ray option")
+    if value <= 0:
         raise RayBackendConfigurationError(f"Ray option {field_name} must be a positive number.")
 
 
