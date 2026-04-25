@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import sys
-import types
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import pytest
+from fake_ray_harness import FakeRayDataset, install_fake_ray
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.base import ProcessorConfig
@@ -26,38 +25,7 @@ from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.integrations.ray.processor_policy import validate_ray_safe_processors
 from data_designer.interface.data_designer import DataDesigner
 
-
-class FakeRayDataset:
-    def __init__(self, blocks: list[lazy.pd.DataFrame]) -> None:
-        self.blocks = blocks
-        self.map_batches_kwargs: dict[str, Any] | None = None
-
-    def map_batches(self, fn: Any, **kwargs: Any) -> FakeRayDataset:
-        self.map_batches_kwargs = kwargs
-        return FakeRayDataset(_map_batches_blocks(fn, self.blocks, kwargs))
-
-    def to_pandas(self) -> lazy.pd.DataFrame:
-        return lazy.pd.concat(self.blocks, ignore_index=True)
-
-    def to_arrow_refs(self) -> list[str]:
-        return [f"arrow-ref-{index}" for index, _ in enumerate(self.blocks)]
-
-    def num_blocks(self) -> int:
-        return len(self.blocks)
-
-
-class FakeRayDataModule:
-    Dataset = FakeRayDataset
-
-    def range(self, num_records: int) -> FakeRayDataset:
-        return FakeRayDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
-
-
-def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
-    fn_kwargs = kwargs.get("fn_kwargs") or {}
-    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
-    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
-    return [map_fn(block, **fn_kwargs) for block in blocks]
+pytestmark = pytest.mark.ray_fake
 
 
 class MissingSafetyProcessorConfig(ProcessorConfig):
@@ -90,14 +58,6 @@ class LegacyRaySafeProcessorConfig(ProcessorConfig):
         side_effects=ProcessorSideEffect.NONE,
         reason="Uses legacy compatibility metadata.",
     )
-
-
-def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_ray = types.ModuleType("ray")
-    fake_ray.data = FakeRayDataModule()
-    fake_ray.is_initialized = lambda: True
-    fake_ray.init = lambda: None
-    monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
 
 def _managed_assets_path(tmp_path: Path) -> Path:
@@ -144,7 +104,7 @@ def test_ray_backend_allows_drop_columns_processor(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)
     config_builder.add_processor(DropColumnsProcessorConfig(name="drop-x-label", column_names=["x_label"]))
@@ -165,7 +125,7 @@ def test_ray_backend_rejects_schema_transform_processor_by_default(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)
     config_builder.add_processor(
@@ -193,7 +153,7 @@ def test_ray_backend_rejects_processor_without_distributed_safety_metadata(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)
     config_builder.add_processor(MissingSafetyProcessorConfig(name="custom-processor"))
@@ -212,7 +172,7 @@ def test_ray_backend_rejects_partition_unsafe_processor_metadata(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)
     config_builder.add_processor(PartitionUnsafeProcessorConfig(name="partition-unsafe-processor"))
@@ -231,7 +191,7 @@ def test_ray_backend_rejects_global_order_processor_metadata(
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)
     config_builder.add_processor(GlobalOrderProcessorConfig(name="global-order-processor"))
@@ -257,7 +217,7 @@ def test_ray_backend_allow_unsafe_processors_bypasses_schema_transform_preflight
     stub_model_configs: Any,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)
     config_builder.add_processor(

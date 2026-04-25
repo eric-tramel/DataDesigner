@@ -8,6 +8,8 @@ import pytest
 from data_designer.integrations.ray import RayDatasetMetrics, RayMetricsError, RayWorkerMetrics
 from data_designer.integrations.ray.metrics import aggregate_ray_metrics, normalize_ray_worker_metrics
 
+pytestmark = pytest.mark.ray_fake
+
 
 def test_aggregate_ray_metrics_sums_worker_metrics_and_model_usage() -> None:
     metrics = aggregate_ray_metrics(

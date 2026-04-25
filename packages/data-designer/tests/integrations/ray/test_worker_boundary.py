@@ -25,7 +25,11 @@ from data_designer.integrations.ray import RayBackend, RayBackendConfigurationEr
 from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.interface.data_designer import DataDesigner
 
+pytestmark = [pytest.mark.ray_fake, pytest.mark.ray_worker_boundary]
 
+
+# Intentionally local: this fake fails if mapping starts, so worker-boundary
+# tests can assert driver-side validation stops before Ray execution planning.
 class BoundaryRayDataset:
     def __init__(self, blocks: list[Any]) -> None:
         self.blocks = blocks

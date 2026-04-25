@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-import sys
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fake_ray_harness import FakeActorHandle, FakeRayDataset, install_fake_ray
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.config_builder import DataDesignerConfigBuilder
@@ -18,83 +18,7 @@ from data_designer.integrations.ray import backend as ray_backend_module
 from data_designer.integrations.ray.metrics import RayWorkerMetrics, aggregate_ray_metrics
 from data_designer.interface.data_designer import DataDesigner
 
-
-class FakeMetricDataset:
-    def __init__(
-        self,
-        blocks: list[lazy.pd.DataFrame],
-        *,
-        worker_metrics: list[dict[str, Any]] | None = None,
-    ) -> None:
-        self.blocks = blocks
-        self.worker_metrics = worker_metrics or []
-        self.map_batches_kwargs: dict[str, Any] | None = None
-
-    def map_batches(self, fn: Any, **kwargs: Any) -> FakeMetricDataset:
-        self.map_batches_kwargs = kwargs
-        return FakeMetricDataset(
-            _map_batches_blocks(fn, self.blocks, kwargs),
-            worker_metrics=self.worker_metrics,
-        )
-
-    def to_pandas(self) -> lazy.pd.DataFrame:
-        return lazy.pd.concat(self.blocks, ignore_index=True)
-
-    def num_blocks(self) -> int:
-        return len(self.blocks)
-
-
-class FakeRayDataModule:
-    Dataset = FakeMetricDataset
-
-    def range(self, num_records: int) -> FakeMetricDataset:
-        return FakeMetricDataset([lazy.pd.DataFrame({"id": list(range(num_records))})])
-
-
-def _map_batches_blocks(fn: Any, blocks: list[lazy.pd.DataFrame], kwargs: dict[str, Any]) -> list[lazy.pd.DataFrame]:
-    fn_kwargs = kwargs.get("fn_kwargs") or {}
-    fn_constructor_kwargs = kwargs.get("fn_constructor_kwargs") or {}
-    map_fn = fn(**fn_constructor_kwargs) if isinstance(fn, type) else fn
-    return [map_fn(block, **fn_kwargs) for block in blocks]
-
-
-class FakeObjectRef:
-    def __init__(self, value: Any) -> None:
-        self.value = value
-
-
-class FakeRemoteMethod:
-    def __init__(self, method: Any) -> None:
-        self._method = method
-
-    def remote(self, *args: Any, **kwargs: Any) -> FakeObjectRef:
-        return FakeObjectRef(self._method(*args, **kwargs))
-
-
-class FakeActorHandle:
-    def __init__(self, actor: Any) -> None:
-        self._actor = actor
-
-    def __getattr__(self, name: str) -> FakeRemoteMethod:
-        return FakeRemoteMethod(getattr(self._actor, name))
-
-
-class FakeRemoteClass:
-    def __init__(self, cls: type) -> None:
-        self._cls = cls
-
-    def remote(self, *args: Any, **kwargs: Any) -> FakeActorHandle:
-        return FakeActorHandle(self._cls(*args, **kwargs))
-
-
-def _install_fake_ray(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_ray = types.ModuleType("ray")
-    fake_ray.data = FakeRayDataModule()
-    fake_ray.is_initialized = lambda: True
-    fake_ray.init = lambda: None
-    fake_ray.remote = lambda cls: FakeRemoteClass(cls)
-    fake_ray.get = lambda ref: ref.value
-    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+pytestmark = pytest.mark.ray_fake
 
 
 def _managed_assets_path(tmp_path: Path) -> Path:
@@ -140,7 +64,7 @@ def test_ray_results_load_metrics_exposes_worker_aggregate(
     ]
     metrics = aggregate_ray_metrics(worker_metrics)
     results = RayDatasetCreationResults(
-        dataset=FakeMetricDataset([lazy.pd.DataFrame({"id": [0]})]),
+        dataset=FakeRayDataset([lazy.pd.DataFrame({"id": [0]})]),
         config_builder=stub_sampler_only_config_builder,
         metrics=metrics,
     )
@@ -173,7 +97,7 @@ def test_ray_results_load_metrics_preserves_zero_worker_total_rows(
         types.SimpleNamespace(snapshot=lambda: [{"total_rows": 0, "blocks": 1, "elapsed_seconds": 0.25}])
     )
     results = RayDatasetCreationResults(
-        dataset=FakeMetricDataset([lazy.pd.DataFrame({"id": [0, 1, 2, 3, 4]})]),
+        dataset=FakeRayDataset([lazy.pd.DataFrame({"id": [0, 1, 2, 3, 4]})]),
         config_builder=stub_sampler_only_config_builder,
         metrics=RayDatasetMetrics(total_rows=5, blocks=1, elapsed_seconds=10.0),
         ray=ray,
@@ -193,7 +117,7 @@ def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
     stub_sampler_only_config_builder: DataDesignerConfigBuilder,
     stub_model_providers: Any,
 ) -> None:
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch, with_remote=True)
     worker_metrics = [
         {
             "total_rows": 2,
@@ -226,12 +150,11 @@ def test_ray_backend_load_metrics_aggregates_worker_emitted_payloads(
             },
         },
     ]
-    input_dataset = FakeMetricDataset(
+    input_dataset = FakeRayDataset(
         [
             lazy.pd.DataFrame({"id": [0, 1]}),
             lazy.pd.DataFrame({"id": [2]}),
-        ],
-        worker_metrics=worker_metrics,
+        ]
     )
 
     def generate_batch(

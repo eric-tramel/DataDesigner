@@ -9,6 +9,8 @@ from types import ModuleType
 
 import pytest
 
+pytestmark = pytest.mark.ray_fake
+
 
 def _clear_modules(monkeypatch: pytest.MonkeyPatch, prefixes: tuple[str, ...]) -> None:
     for module_name in list(sys.modules):
