@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -114,9 +115,14 @@ def test_execute_dataset_block_streams_ordered_chunks_and_summary(
 
     chunks = list(stream)
 
-    assert [chunk.input_start for chunk in chunks] == [0, 2, 4]
-    assert [chunk.input_rows for chunk in chunks] == [2, 2, 1]
-    assert [len(chunk.dataframe) for chunk in chunks] == [2, 2, 1]
+    if sys.version_info < (3, 11):
+        assert [chunk.input_start for chunk in chunks] == [0]
+        assert [chunk.input_rows for chunk in chunks] == [5]
+        assert [len(chunk.dataframe) for chunk in chunks] == [5]
+    else:
+        assert [chunk.input_start for chunk in chunks] == [0, 2, 4]
+        assert [chunk.input_rows for chunk in chunks] == [2, 2, 1]
+        assert [len(chunk.dataframe) for chunk in chunks] == [2, 2, 1]
     assert chunks[0].raw_dataframe.columns.to_list() == ["x", "label", "x_label"]
     assert chunks[0].dataframe.columns.to_list() == ["x", "x_label"]
     assert lazy.pd.concat([chunk.dataframe for chunk in chunks], ignore_index=True).to_dict(orient="records") == [
@@ -155,10 +161,17 @@ def test_execute_dataset_block_stream_captures_chunk_processor_artifacts(
 
     chunks = list(stream)
 
-    assert [chunk.processor_artifacts["schema-transform"].to_dict(orient="records") for chunk in chunks] == [
-        [{"combined": "1-a"}, {"combined": "2-b"}],
-        [{"combined": "3-c"}],
-    ]
+    expected_artifacts = (
+        [[{"combined": "1-a"}, {"combined": "2-b"}, {"combined": "3-c"}]]
+        if sys.version_info < (3, 11)
+        else [
+            [{"combined": "1-a"}, {"combined": "2-b"}],
+            [{"combined": "3-c"}],
+        ]
+    )
+    assert [chunk.processor_artifacts["schema-transform"].to_dict(orient="records") for chunk in chunks] == (
+        expected_artifacts
+    )
     assert lazy.pd.concat([chunk.dataframe for chunk in chunks], ignore_index=True).to_dict(orient="records") == [
         {"x": 1, "x_label": "1-a"},
         {"x": 2, "x_label": "2-b"},

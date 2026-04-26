@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
@@ -154,6 +155,7 @@ def test_dataset_builder_creation_with_custom_registry(stub_resource_provider, s
     assert builder._registry == custom_registry
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="async engine requires Python 3.11+")
 def test_dataset_builder_explicit_use_async_overrides_env_false(
     stub_resource_provider,
     stub_test_config_builder,
@@ -205,7 +207,7 @@ def test_dataset_builder_explicit_sync_overrides_env_true(
     builder._run_batch.assert_called_once()
 
 
-def test_dataset_builder_explicit_use_async_requires_python_311(
+def test_dataset_builder_explicit_use_async_falls_back_before_python_311(
     stub_resource_provider,
     stub_test_config_builder,
     monkeypatch: pytest.MonkeyPatch,
@@ -221,12 +223,14 @@ def test_dataset_builder_explicit_use_async_requires_python_311(
 
     monkeypatch.setattr(builder_mod.sys, "version_info", VersionInfo((3, 10, 0)))
 
-    with pytest.raises(RuntimeError, match=r"requires Python 3\.11\+.*Current version: 3\.10"):
-        DatasetBuilder(
-            data_designer_config=stub_test_config_builder.build(),
-            resource_provider=stub_resource_provider,
-            use_async=True,
-        )
+    builder = DatasetBuilder(
+        data_designer_config=stub_test_config_builder.build(),
+        resource_provider=stub_resource_provider,
+        use_async=True,
+    )
+
+    assert builder._async_requested is True
+    assert builder._use_async is False
 
 
 def test_dataset_builder_artifact_storage_property(stub_dataset_builder, stub_resource_provider):

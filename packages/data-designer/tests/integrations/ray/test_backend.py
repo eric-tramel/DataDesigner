@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -394,7 +395,7 @@ def test_ray_backend_can_yield_output_chunks(
     assert input_dataset.map_batches_kwargs["udf_modifying_row_count"] is False
     execution_payload = input_dataset.map_batches_kwargs["fn_constructor_kwargs"]["execution_payload"]
     assert execution_payload.output_chunk_rows == 2
-    assert [len(block) for block in output_dataset.blocks] == [2, 2, 1]
+    assert [len(block) for block in output_dataset.blocks] == ([5] if sys.version_info < (3, 11) else [2, 2, 1])
     assert output_dataset.to_pandas().to_dict(orient="records") == [
         {"x": 1, "label": "a", "x_label": "1-a"},
         {"x": 2, "label": "b", "x_label": "2-b"},
@@ -570,21 +571,17 @@ def test_ray_backend_streams_artifact_chunks_with_fake_ray(
 
     metadata = artifact_storage.read_metadata()
     assert metadata["actual_num_records"] == 5
-    assert metadata["num_completed_batches"] == 3
+    expected_batches = 1 if sys.version_info < (3, 11) else 3
+    expected_batch_files = [f"batch_{batch_number:05d}.parquet" for batch_number in range(expected_batches)]
+    assert metadata["num_completed_batches"] == expected_batches
     assert metadata["file_paths"]["parquet-files"] == [
-        "parquet-files/batch_00000.parquet",
-        "parquet-files/batch_00001.parquet",
-        "parquet-files/batch_00002.parquet",
+        f"parquet-files/{batch_file}" for batch_file in expected_batch_files
     ]
     assert metadata["file_paths"]["dropped-columns-parquet-files"] == [
-        "dropped-columns-parquet-files/batch_00000.parquet",
-        "dropped-columns-parquet-files/batch_00001.parquet",
-        "dropped-columns-parquet-files/batch_00002.parquet",
+        f"dropped-columns-parquet-files/{batch_file}" for batch_file in expected_batch_files
     ]
     assert metadata["file_paths"]["processor-files"]["schema-transform"] == [
-        "processors-files/schema-transform/batch_00000.parquet",
-        "processors-files/schema-transform/batch_00001.parquet",
-        "processors-files/schema-transform/batch_00002.parquet",
+        f"processors-files/schema-transform/{batch_file}" for batch_file in expected_batch_files
     ]
 
 

@@ -87,6 +87,19 @@ DataDesignerRegistry().processors.register(
 )
 
 
+@pytest.fixture
+def registered_after_generation_processor(monkeypatch: pytest.MonkeyPatch) -> None:
+    processor_registry = DataDesignerRegistry().processors
+    monkeypatch.setitem(processor_registry._registry, "after_generation", AfterGenerationProcessor)
+    monkeypatch.setitem(processor_registry._reverse_registry, AfterGenerationProcessor, "after_generation")
+    monkeypatch.setitem(processor_registry._config_registry, "after_generation", AfterGenerationProcessorConfig)
+    monkeypatch.setitem(
+        processor_registry._reverse_config_registry,
+        AfterGenerationProcessorConfig,
+        "after_generation",
+    )
+
+
 def _managed_assets_path(tmp_path: Path) -> Path:
     path = tmp_path / "managed-assets"
     path.mkdir(parents=True, exist_ok=True)
@@ -252,7 +265,11 @@ def test_ray_processor_policy_allows_dataset_artifact_processors_when_artifact_w
     validate_ray_safe_processors(config_builder, allow_dataset_artifacts=True)
 
 
-def test_ray_processor_policy_rejects_after_generation_processor_implementation(stub_model_configs: Any) -> None:
+def test_ray_processor_policy_rejects_after_generation_processor_implementation(
+    stub_model_configs: Any,
+    registered_after_generation_processor: None,
+) -> None:
+    del registered_after_generation_processor
     config_builder = DataDesignerConfigBuilder(model_configs=stub_model_configs)
     config_builder.add_processor(AfterGenerationProcessorConfig(name="global-processor"))
 
@@ -267,7 +284,9 @@ def test_ray_backend_rejects_after_generation_processors_even_when_unsafe_proces
     tmp_path: Path,
     stub_model_configs: Any,
     stub_model_providers: Any,
+    registered_after_generation_processor: None,
 ) -> None:
+    del registered_after_generation_processor
     install_fake_ray(monkeypatch)
     input_dataset = FakeRayDataset([lazy.pd.DataFrame({"x": [1], "label": ["a"]})])
     config_builder = _input_expression_config_builder(stub_model_configs)

@@ -17,7 +17,11 @@ from data_designer.config.data_designer_config import DataDesignerConfig
 from data_designer.config.run_config import RunConfig
 from data_designer.config.seed import SeedConfig
 from data_designer.config.seed_source_dataframe import DataFrameSeedSource
-from data_designer.engine.dataset_builders.dataset_builder import DatasetBlockChunk, DatasetBuilder
+from data_designer.engine.dataset_builders.dataset_builder import (
+    DatasetBlockChunk,
+    DatasetBuilder,
+    is_async_engine_supported,
+)
 from data_designer.engine.dataset_builders.errors import DatasetGenerationError
 from data_designer.engine.errors import DataDesignerError
 from data_designer.engine.model_provider import resolve_model_provider_registry
@@ -307,8 +311,9 @@ def _execute_with_storage(
         raise ValueError("Provide exactly one of runtime_context or resource_provider.")
 
     start_time = time.perf_counter()
+    use_async = options.use_async and is_async_engine_supported()
     try:
-        with _async_engine_environment(options.use_async):
+        with _async_engine_environment(use_async):
             block_resource_provider = resource_provider or _create_resource_provider(
                 config_builder=config_builder,
                 data_designer_config=data_designer_config,
@@ -319,7 +324,7 @@ def _execute_with_storage(
             builder = DatasetBuilder(
                 data_designer_config=data_designer_config,
                 resource_provider=block_resource_provider,
-                use_async=options.use_async,
+                use_async=use_async,
             )
             raw_dataframe, dataframe = builder.build_block(
                 num_records=num_records,
@@ -369,8 +374,9 @@ def _execute_stream_with_storage(
 
     start_time = time.perf_counter()
     output_rows = 0
+    use_async = options.use_async and is_async_engine_supported()
     try:
-        with _async_engine_environment(options.use_async):
+        with _async_engine_environment(use_async):
             block_resource_provider = resource_provider or _create_resource_provider(
                 config_builder=config_builder,
                 data_designer_config=data_designer_config,
@@ -381,7 +387,7 @@ def _execute_stream_with_storage(
             builder = DatasetBuilder(
                 data_designer_config=data_designer_config,
                 resource_provider=block_resource_provider,
-                use_async=options.use_async,
+                use_async=use_async,
             )
             for chunk in builder.build_block_chunks(
                 num_records=num_records,
@@ -468,8 +474,7 @@ def _load_processor_artifacts(artifact_storage: ArtifactStorage) -> dict[str, pd
 @contextmanager
 def _async_engine_environment(enabled: bool) -> Iterator[None]:
     previous = os.environ.get("DATA_DESIGNER_ASYNC_ENGINE")
-    if enabled:
-        os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
+    os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1" if enabled else "0"
     try:
         yield
     finally:

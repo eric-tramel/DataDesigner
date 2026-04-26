@@ -256,7 +256,7 @@ def test_ray_batch_worker_delegates_to_engine_block_api(
         [{"x": 2, "label": "b"}, {"x": 3, "label": "c"}],
     ]
     assert all(call["runtime_context"] is worker._worker_options for call in calls)
-    assert all(call["options"].use_async is True for call in calls)
+    assert all(call["options"].use_async is (sys.version_info >= (3, 11)) for call in calls)
     assert all(call["data_designer_config"].seed_config is None for call in calls)
 
 

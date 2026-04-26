@@ -27,6 +27,7 @@ from data_designer.engine.dataset_builders.block_execution import (
     execute_dataset_block,
     execute_dataset_block_stream,
 )
+from data_designer.engine.dataset_builders.dataset_builder import is_async_engine_supported
 from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import SeedReader
 from data_designer.engine.secret_resolver import SecretResolver
@@ -185,7 +186,9 @@ class _RayWorkerGenerationPipeline:
         execute_block: _ExecuteDatasetBlock | None = None,
         execute_block_stream: _ExecuteDatasetBlockStream | None = None,
     ) -> None:
-        os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
+        self._use_async_engine = is_async_engine_supported()
+        if self._use_async_engine:
+            os.environ["DATA_DESIGNER_ASYNC_ENGINE"] = "1"
         self._execution_payload = execution_payload
         self._observability_options = observability_options or _RayObservabilityOptions()
         self._worker_options = _prepare_worker_options(
@@ -350,7 +353,7 @@ class _RayWorkerGenerationPipeline:
             runtime_context=self._worker_options,
             input_frame=input_frame,
             num_records=worker_batch.num_records,
-            options=BlockExecutionOptions(use_async=True, dataset_name="ray-block"),
+            options=BlockExecutionOptions(use_async=self._use_async_engine, dataset_name="ray-block"),
         )
         if block_result.all_rows_dropped:
             raise _RayWorkerAllRowsDroppedError(block_result)
@@ -384,7 +387,7 @@ class _RayWorkerGenerationPipeline:
             input_frame=input_frame,
             num_records=worker_batch.num_records,
             options=BlockExecutionOptions(
-                use_async=True,
+                use_async=self._use_async_engine,
                 dataset_name="ray-block",
                 capture_stream_artifacts=self._execution_payload.capture_artifacts,
             ),

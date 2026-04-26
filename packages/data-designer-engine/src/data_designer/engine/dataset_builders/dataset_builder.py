@@ -78,6 +78,11 @@ logger = logging.getLogger(__name__)
 DATA_DESIGNER_ASYNC_ENGINE = os.environ.get("DATA_DESIGNER_ASYNC_ENGINE", "0") == "1"
 
 
+def is_async_engine_supported() -> bool:
+    """Return whether this Python runtime can execute the async engine."""
+    return sys.version_info >= (3, 11)
+
+
 def _async_python_version_error() -> str:
     return (
         "DATA_DESIGNER_ASYNC_ENGINE requires Python 3.11+ (asyncio.TaskGroup). "
@@ -87,7 +92,7 @@ def _async_python_version_error() -> str:
 
 def _ensure_async_engine_available() -> None:
     """Import async engine helpers on demand."""
-    if sys.version_info < (3, 11):
+    if not is_async_engine_supported():
         raise RuntimeError(_async_python_version_error())
 
     global asyncio
@@ -164,8 +169,8 @@ class DatasetBuilder:
         self._registry = registry or DataDesignerRegistry()
         self._graph: ExecutionGraph | None = None
         self._async_requested: bool = DATA_DESIGNER_ASYNC_ENGINE if use_async is None else use_async
-        self._use_async: bool = self._async_requested
-        if self._async_requested:
+        self._use_async: bool = self._async_requested and is_async_engine_supported()
+        if self._use_async:
             _ensure_async_engine_available()
 
         self._data_designer_config = compile_data_designer_config(data_designer_config, resource_provider)
@@ -342,6 +347,9 @@ class DatasetBuilder:
     def _resolve_async_selection(self) -> bool:
         """Return whether this run should use async after compatibility checks."""
         if not self._async_requested:
+            return False
+        if not is_async_engine_supported():
+            logger.warning("DATA_DESIGNER_ASYNC_ENGINE requires Python 3.11+; falling back to the sync engine.")
             return False
         _ensure_async_engine_available()
         return self._resolve_async_compatibility()

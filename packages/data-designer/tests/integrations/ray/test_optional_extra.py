@@ -12,10 +12,34 @@ import pytest
 pytestmark = pytest.mark.ray_fake
 
 
+def _resolve_loaded_module(module_name: str) -> ModuleType | None:
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    current = sys.modules.get(module_name.split(".", maxsplit=1)[0])
+    if current is None:
+        return None
+    for part in module_name.split(".")[1:]:
+        current = getattr(current, part, None)
+        if current is None:
+            return None
+    return current if isinstance(current, ModuleType) else None
+
+
 def _clear_modules(monkeypatch: pytest.MonkeyPatch, prefixes: tuple[str, ...]) -> None:
-    for module_name in list(sys.modules):
-        if module_name in prefixes or module_name.startswith(tuple(f"{prefix}." for prefix in prefixes)):
-            monkeypatch.delitem(sys.modules, module_name, raising=False)
+    module_names = [
+        module_name
+        for module_name in list(sys.modules)
+        if module_name in prefixes or module_name.startswith(tuple(f"{prefix}." for prefix in prefixes))
+    ]
+    for module_name in sorted(module_names, key=lambda name: name.count("."), reverse=True):
+        parent_name, _, attr_name = module_name.rpartition(".")
+        parent = _resolve_loaded_module(parent_name) if parent_name else None
+        if parent is not None:
+            monkeypatch.delattr(parent, attr_name, raising=False)
+    for module_name in module_names:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
 
 
 def _block_ray_imports(monkeypatch: pytest.MonkeyPatch) -> list[str]:
