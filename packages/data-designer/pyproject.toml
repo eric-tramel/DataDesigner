@@ -19,6 +19,11 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
+[project.optional-dependencies]
+ray = [
+    "ray[data]>=2.54.0,<3",
+]
+
 [project.scripts]
 data-designer = "data_designer.cli.main:main"
 
@@ -55,6 +60,13 @@ extend = "../../pyproject.toml"
 testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "session"
 env = ["DISABLE_DATA_DESIGNER_PLUGINS=true"]
+markers = [
+    "ray_fake: fake-Ray and local-contract tests that do not require a real Ray runtime",
+    "ray_worker_boundary: direct worker/payload boundary tests for Ray execution internals",
+    "ray_real_smoke: opt-in smoke tests that require an installed real Ray runtime",
+    "ray_live_provider: opt-in Ray tests that call a live model provider",
+    "ray_benchmark: benchmark helper tests for Ray benchmark scripts",
+]
 
 [tool.uv]
 package = true

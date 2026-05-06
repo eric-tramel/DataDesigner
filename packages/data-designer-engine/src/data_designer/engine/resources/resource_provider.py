@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from data_designer.config.base import ConfigBase
 from data_designer.config.dataset_metadata import DatasetMetadata
@@ -25,6 +26,9 @@ from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import SeedReader, SeedReaderRegistry
 from data_designer.engine.secret_resolver import SecretResolver
 from data_designer.engine.storage.artifact_storage import ArtifactStorage
+
+if TYPE_CHECKING:
+    from data_designer.engine.models.clients.throttle_manager import ThrottleManagerLike
 
 
 class ResourceType(StrEnum):
@@ -90,6 +94,7 @@ def create_resource_provider(
     run_config: RunConfig | None = None,
     mcp_providers: list[MCPProviderT] | None = None,
     tool_configs: list[ToolConfig] | None = None,
+    throttle_manager: ThrottleManagerLike | None = None,
 ) -> ResourceProvider:
     """Factory function for creating a ResourceProvider instance.
 
@@ -151,6 +156,7 @@ def create_resource_provider(
             mcp_registry=mcp_registry,
             client_concurrency_mode=client_concurrency_mode,
             run_config=effective_run_config,
+            throttle_manager=throttle_manager,
         ),
         person_reader=person_reader,
         mcp_registry=mcp_registry,

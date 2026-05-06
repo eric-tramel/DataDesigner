@@ -4,7 +4,7 @@ The skills and workflows in this repository are for **developing** DataDesigner.
 
 ---
 
-This project uses agent-assisted development. Contributors are expected to use agents for investigation, planning, and implementation. The repository includes [skills and guidance](.agents/) that make agents effective contributors.
+This project uses agent-assisted development. Contributors are expected to use agents for investigation, planning, and implementation. The repository includes [skills and guidance](https://github.com/NVIDIA-NeMo/DataDesigner/tree/main/.agents) that make agents effective contributors.
 
 Agents accelerate work; humans stay accountable. People make design decisions and own quality — agents help get there faster.
 
@@ -12,8 +12,8 @@ Agents accelerate work; humans stay accountable. People make design decisions an
 
 1. **Open an issue** using the appropriate [issue template](https://github.com/NVIDIA-NeMo/DataDesigner/issues/new/choose).
 2. **Include investigation output.** If you used an agent, paste its diagnostics. If you didn't, include the troubleshooting you tried.
-3. **For non-trivial changes, create a plan document** at `plans/<issue-number>/` before building. Have your agent draft the plan — it should describe the approach, trade-offs considered, affected subsystems, and a delivery strategy. See existing plans in [`plans/`](plans/) for reference. Submit the plan in a PR for review.
-4. **Once the plan is approved, implement** using agent-assisted development. See [DEVELOPMENT.md](DEVELOPMENT.md) for local setup and workflow.
+3. **For non-trivial changes, create a plan document** at `plans/<issue-number>/` before building. Have your agent draft the plan — it should describe the approach, trade-offs considered, affected subsystems, and a delivery strategy. See existing plans in [`plans/`](https://github.com/NVIDIA-NeMo/DataDesigner/tree/main/plans) for reference. Submit the plan in a PR for review.
+4. **Once the plan is approved, implement** using agent-assisted development. See [DEVELOPMENT.md](https://github.com/NVIDIA-NeMo/DataDesigner/blob/main/DEVELOPMENT.md) for local setup and workflow.
 
 ## Before You Open an Issue
 
@@ -38,7 +38,7 @@ Agents accelerate work; humans stay accountable. People make design decisions an
 
 ## Development Skills
 
-The repository includes skills for common development tasks. These are located in [`.agents/skills/`](.agents/skills/) and are automatically discovered by agent harnesses.
+The repository includes skills for common development tasks. These are located in [`.agents/skills/`](https://github.com/NVIDIA-NeMo/DataDesigner/tree/main/.agents/skills) and are automatically discovered by agent harnesses.
 
 | Category      | Skills                             | Purpose                                |
 | ------------- | ---------------------------------- | -------------------------------------- |
@@ -91,16 +91,16 @@ Use `make update-license-headers` to add headers automatically.
 
 ## Signing Off on Your Work (DCO)
 
-When contributing, you must agree that you have authored 100% of the content, that you have the necessary rights to the content, and that the content you contribute may be provided under the project license. All contributors are asked to sign the [Developer Certificate of Origin (DCO)](DCO) when submitting their first pull request. The process is automated by a bot that will comment on the pull request.
+When contributing, you must agree that you have authored 100% of the content, that you have the necessary rights to the content, and that the content you contribute may be provided under the project license. All contributors are asked to sign the [Developer Certificate of Origin (DCO)](https://github.com/NVIDIA-NeMo/DataDesigner/blob/main/DCO) when submitting their first pull request. The process is automated by a bot that will comment on the pull request.
 
 ## Code of Conduct
 
-Data Designer follows the Contributor Covenant Code of Conduct. Please read our complete [Code of Conduct](CODE_OF_CONDUCT.md) for full details.
+Data Designer follows the Contributor Covenant Code of Conduct. Please read our complete [Code of Conduct](https://github.com/NVIDIA-NeMo/DataDesigner/blob/main/CODE_OF_CONDUCT.md) for full details.
 
 ---
 
 ## Reference
 
-- [AGENTS.md](AGENTS.md) — architecture, layering, design principles
-- [STYLEGUIDE.md](STYLEGUIDE.md) — code style, naming, imports, type annotations
-- [DEVELOPMENT.md](DEVELOPMENT.md) — local setup, testing, day-to-day workflow
+- [AGENTS.md](https://github.com/NVIDIA-NeMo/DataDesigner/blob/main/AGENTS.md) — architecture, layering, design principles
+- [STYLEGUIDE.md](https://github.com/NVIDIA-NeMo/DataDesigner/blob/main/STYLEGUIDE.md) — code style, naming, imports, type annotations
+- [DEVELOPMENT.md](https://github.com/NVIDIA-NeMo/DataDesigner/blob/main/DEVELOPMENT.md) — local setup, testing, day-to-day workflow

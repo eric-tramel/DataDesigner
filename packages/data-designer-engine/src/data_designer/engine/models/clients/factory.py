@@ -11,7 +11,7 @@ from data_designer.engine.models.clients.adapters.http_model_client import Clien
 from data_designer.engine.models.clients.adapters.openai_compatible import OpenAICompatibleClient
 from data_designer.engine.models.clients.base import ModelClient
 from data_designer.engine.models.clients.retry import RetryConfig
-from data_designer.engine.models.clients.throttle_manager import ThrottleManager
+from data_designer.engine.models.clients.throttle_manager import ThrottleManagerLike
 from data_designer.engine.models.clients.throttled import ThrottledModelClient
 from data_designer.engine.models.errors import FormattedLLMErrorMessage
 from data_designer.engine.secret_resolver import SecretResolver
@@ -26,7 +26,7 @@ def create_model_client(
     *,
     retry_config: RetryConfig | None = None,
     client_concurrency_mode: ClientConcurrencyMode = ClientConcurrencyMode.SYNC,
-    throttle_manager: ThrottleManager | None = None,
+    throttle_manager: ThrottleManagerLike | None = None,
 ) -> ModelClient:
     """Create a ``ModelClient`` for the given model configuration.
 

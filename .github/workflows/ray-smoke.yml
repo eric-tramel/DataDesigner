@@ -1,0 +1,37 @@
+name: Ray Smoke
+
+on:
+  schedule:
+    # Every Tuesday at 08:00 UTC
+    - cron: "0 8 * * 2"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  real-ray-smoke:
+    name: Real Ray Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "latest"
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install DataDesigner with Ray extra
+        run: uv sync --package data-designer --group dev --extra ray
+
+      - name: Run real-Ray smoke tests
+        env:
+          DATA_DESIGNER_RUN_REAL_RAY_SMOKE: "1"
+          OPENAI_API_KEY: ${{ secrets.TEST_OPENAI_API_KEY }}
+        run: |
+          uv run --package data-designer --group dev --extra ray \
+            pytest -q packages/data-designer/tests/integrations/ray/test_real_smoke.py

@@ -6,7 +6,7 @@ For more information on how they are used, see below:
 
 - **[Model Providers](../concepts/models/model-providers.md)**
 - **[Model Configs](../concepts/models/model-configs.md)**
-- **[Image Context](../notebooks/4-providing-images-as-context.ipynb)**
-- **[Generating Images](../notebooks/5-generating-images.ipynb)**
+- **[Image Context](../colab_notebooks/4-providing-images-as-context.ipynb)**
+- **[Generating Images](../colab_notebooks/5-generating-images.ipynb)**
 
 ::: data_designer.config.models

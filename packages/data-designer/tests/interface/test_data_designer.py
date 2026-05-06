@@ -18,6 +18,7 @@ import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import ExpressionColumnConfig, SamplerColumnConfig
 from data_designer.config.config_builder import DataDesignerConfigBuilder
 from data_designer.config.errors import InvalidConfigError
+from data_designer.config.mcp import LocalStdioMCPProvider
 from data_designer.config.models import ModelProvider
 from data_designer.config.processors import DropColumnsProcessorConfig
 from data_designer.config.run_config import JinjaRenderingEngine, RunConfig
@@ -30,14 +31,18 @@ from data_designer.config.seed_source import (
     FileContentsSeedSource,
     HuggingFaceSeedSource,
 )
+from data_designer.engine.resources.person_reader import PersonReader
 from data_designer.engine.resources.seed_reader import (
+    DataFrameSeedReader,
     FileSystemSeedReader,
     SeedReaderError,
     SeedReaderFileSystemContext,
 )
 from data_designer.engine.secret_resolver import CompositeResolver, EnvironmentResolver, PlaintextResolver
+from data_designer.engine.storage.artifact_storage import ArtifactStorage
 from data_designer.engine.testing.seed_readers import LineFanoutDirectorySeedReader
 from data_designer.engine.testing.stubs import StubHuggingFaceSeedReader
+from data_designer.interface.backends import BackendRuntimeContext, DataDesignerRuntimeContext
 from data_designer.interface.data_designer import DataDesigner
 from data_designer.interface.errors import DataDesignerGenerationError, DataDesignerProfilingError
 
@@ -71,6 +76,30 @@ class CustomDirectorySeedReader(FileSystemSeedReader[DirectorySeedSource]):
             "file_name": str(manifest_row["file_name"]),
             "decorated_path": f"custom::{manifest_row['relative_path']}",
         }
+
+
+class CapturingBackend:
+    def __init__(self) -> None:
+        self.runtime_context: BackendRuntimeContext | None = None
+        self.create_kwargs: dict[str, Any] | None = None
+
+    def create(
+        self,
+        *,
+        runtime_context: BackendRuntimeContext,
+        config_builder: DataDesignerConfigBuilder,
+        num_records: int,
+        dataset_name: str,
+        input_dataset: Any | None = None,
+    ) -> dict[str, Any]:
+        self.runtime_context = runtime_context
+        self.create_kwargs = {
+            "config_builder": config_builder,
+            "num_records": num_records,
+            "dataset_name": dataset_name,
+            "input_dataset": input_dataset,
+        }
+        return {"backend": "captured"}
 
 
 def _add_irrelevant_sampler_column(builder: DataDesignerConfigBuilder) -> None:
@@ -521,6 +550,66 @@ def test_create_dataset_e2e_using_only_sampler_columns(
 
     # display report with no errors
     analysis.to_report()
+
+
+def test_create_passes_backend_runtime_context(
+    stub_artifact_path: Path,
+    stub_model_providers: list[ModelProvider],
+    stub_managed_assets_path: Path,
+) -> None:
+    secret_resolver = PlaintextResolver()
+    run_config = RunConfig(buffer_size=17)
+    seed_reader = DataFrameSeedReader()
+    person_reader = MagicMock(spec=PersonReader)
+    mcp_provider = LocalStdioMCPProvider(name="local-tools", command="python")
+    backend = CapturingBackend()
+    config_builder = DataDesignerConfigBuilder(model_configs=[])
+    input_dataset = object()
+    data_designer = DataDesigner(
+        artifact_path=stub_artifact_path,
+        model_providers=stub_model_providers,
+        secret_resolver=secret_resolver,
+        seed_readers=[seed_reader],
+        managed_assets_path=stub_managed_assets_path,
+        person_reader=person_reader,
+        mcp_providers=[mcp_provider],
+        backend=backend,
+    )
+    data_designer.set_run_config(run_config)
+
+    result = data_designer.create(
+        config_builder,
+        num_records=3,
+        dataset_name="backend-context-test",
+        input_dataset=input_dataset,
+    )
+
+    assert result == {"backend": "captured"}
+    assert backend.create_kwargs == {
+        "config_builder": config_builder,
+        "num_records": 3,
+        "dataset_name": "backend-context-test",
+        "input_dataset": input_dataset,
+    }
+    context = backend.runtime_context
+    assert isinstance(context, DataDesignerRuntimeContext)
+    assert context.model_providers == tuple(stub_model_providers)
+    assert context.default_provider_name == context.model_provider_registry.get_default_provider_name()
+    assert context.secret_resolver is secret_resolver
+    assert context.seed_readers == (seed_reader,)
+    assert context.managed_assets_path == stub_managed_assets_path
+    assert context.resolve_person_reader() is person_reader
+    assert context.mcp_providers == (mcp_provider,)
+    assert context.run_config is run_config
+
+    context_artifact_path = stub_artifact_path / "context-resource-provider"
+    ArtifactStorage.mkdir_if_needed(context_artifact_path)
+    resource_provider = context.create_resource_provider(
+        artifact_storage=ArtifactStorage(artifact_path=context_artifact_path, dataset_name="context"),
+        model_configs=[],
+    )
+    assert resource_provider.person_reader is person_reader
+    assert resource_provider.run_config is run_config
 
 
 def test_create_raises_error_when_builder_fails(

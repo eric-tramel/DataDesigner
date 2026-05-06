@@ -13,7 +13,7 @@ from data_designer.engine.models.clients.errors import (
 )
 from data_designer.engine.models.clients.factory import create_model_client
 from data_designer.engine.models.clients.retry import RetryConfig
-from data_designer.engine.models.clients.throttle_manager import ThrottleDomain, ThrottleManager
+from data_designer.engine.models.clients.throttle_manager import ThrottleDomain, ThrottleManager, ThrottleManagerLike
 from data_designer.engine.models.clients.throttled import ThrottledModelClient
 from data_designer.engine.models.clients.types import (
     AssistantMessage,
@@ -46,6 +46,7 @@ __all__ = [
     "RetryConfig",
     "ThrottleDomain",
     "ThrottleManager",
+    "ThrottleManagerLike",
     "ThrottledModelClient",
     "ToolCall",
     "Usage",

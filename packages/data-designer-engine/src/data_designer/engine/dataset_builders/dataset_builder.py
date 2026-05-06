@@ -7,11 +7,14 @@ import contextlib
 import functools
 import logging
 import os
+import queue
+import sys
 import time
 import uuid
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import data_designer.lazy_heavy_imports as lazy
 from data_designer.config.column_configs import CustomColumnConfig
@@ -53,7 +56,11 @@ from data_designer.engine.processing.processors.base import Processor
 from data_designer.engine.processing.processors.drop_columns import DropColumnsProcessor
 from data_designer.engine.registry.data_designer_registry import DataDesignerRegistry
 from data_designer.engine.resources.resource_provider import ResourceProvider
-from data_designer.engine.storage.artifact_storage import SDG_CONFIG_FILENAME, ArtifactStorage
+from data_designer.engine.storage.artifact_storage import (
+    BATCH_FILE_NAME_FORMAT,
+    SDG_CONFIG_FILENAME,
+    ArtifactStorage,
+)
 from data_designer.engine.storage.media_storage import StorageMode
 
 if TYPE_CHECKING:
@@ -61,6 +68,8 @@ if TYPE_CHECKING:
 
     from data_designer.config.run_config import RunConfig
     from data_designer.engine.column_generators.generators.base import ColumnGeneratorWithModelRegistry
+    from data_designer.engine.dataset_builders.async_scheduler import AsyncTaskScheduler
+    from data_designer.engine.dataset_builders.utils.row_group_buffer import RowGroupBufferManager
     from data_designer.engine.dataset_builders.utils.task_model import TaskTrace
     from data_designer.engine.models.usage import ModelUsageStats
 
@@ -68,15 +77,38 @@ logger = logging.getLogger(__name__)
 
 DATA_DESIGNER_ASYNC_ENGINE = os.environ.get("DATA_DESIGNER_ASYNC_ENGINE", "0") == "1"
 
-if DATA_DESIGNER_ASYNC_ENGINE:
-    import asyncio
-    import sys
 
-    if sys.version_info < (3, 11):
-        raise RuntimeError(
-            "DATA_DESIGNER_ASYNC_ENGINE requires Python 3.11+ (asyncio.TaskGroup). "
-            f"Current version: {sys.version_info.major}.{sys.version_info.minor}"
-        )
+def is_async_engine_supported() -> bool:
+    """Return whether this Python runtime can execute the async engine."""
+    return sys.version_info >= (3, 11)
+
+
+def _async_python_version_error() -> str:
+    return (
+        "DATA_DESIGNER_ASYNC_ENGINE requires Python 3.11+ (asyncio.TaskGroup). "
+        f"Current version: {sys.version_info.major}.{sys.version_info.minor}"
+    )
+
+
+def _ensure_async_engine_available() -> None:
+    """Import async engine helpers on demand."""
+    if not is_async_engine_supported():
+        raise RuntimeError(_async_python_version_error())
+
+    global asyncio
+    global DEFAULT_TASK_POOL_SIZE
+    global LLM_WAIT_POOL_MULTIPLIER
+    global AsyncTaskScheduler
+    global AsyncConcurrentExecutor
+    global ensure_async_engine_loop
+    global CompletionTracker
+    global RowGroupBufferManager
+
+    if "AsyncTaskScheduler" in globals():
+        return
+
+    import asyncio
+
     from data_designer.engine.dataset_builders.async_scheduler import (
         DEFAULT_TASK_POOL_SIZE,
         LLM_WAIT_POOL_MULTIPLIER,
@@ -93,8 +125,31 @@ if DATA_DESIGNER_ASYNC_ENGINE:
 _CLIENT_VERSION: str = get_library_version()
 
 
+@dataclass(frozen=True)
+class DatasetBlockChunk:
+    """One generated block chunk emitted by the engine streaming path."""
+
+    raw_dataframe: pd.DataFrame
+    dataframe: pd.DataFrame
+    row_group: int
+    input_start: int
+    input_rows: int
+    processor_artifacts: dict[str, pd.DataFrame] = field(default_factory=dict)
+
+
 def _is_async_trace_enabled(settings: RunConfig) -> bool:
     return settings.async_trace or os.environ.get("DATA_DESIGNER_ASYNC_TRACE", "0") == "1"
+
+
+def _row_group_batch_number(
+    *,
+    current_batch_number: int | None,
+    row_group: int,
+    capture_artifacts: bool,
+) -> int | None:
+    if not capture_artifacts:
+        return current_batch_number
+    return (current_batch_number or 0) + row_group
 
 
 class DatasetBuilder:
@@ -103,6 +158,7 @@ class DatasetBuilder:
         data_designer_config: DataDesignerConfig,
         resource_provider: ResourceProvider,
         registry: DataDesignerRegistry | None = None,
+        use_async: bool | None = None,
     ):
         self.batch_manager = DatasetBatchManager(resource_provider.artifact_storage)
         self._resource_provider = resource_provider
@@ -112,7 +168,10 @@ class DatasetBuilder:
         self._task_traces: list[TaskTrace] = []
         self._registry = registry or DataDesignerRegistry()
         self._graph: ExecutionGraph | None = None
-        self._use_async: bool = DATA_DESIGNER_ASYNC_ENGINE
+        self._async_requested: bool = DATA_DESIGNER_ASYNC_ENGINE if use_async is None else use_async
+        self._use_async: bool = self._async_requested and is_async_engine_supported()
+        if self._use_async:
+            _ensure_async_engine_available()
 
         self._data_designer_config = compile_data_designer_config(data_designer_config, resource_provider)
         self._column_configs = compile_dataset_builder_column_configs(self._data_designer_config)
@@ -192,7 +251,7 @@ class DatasetBuilder:
         start_time = time.perf_counter()
         buffer_size = self._resource_provider.run_config.buffer_size
 
-        self._use_async = DATA_DESIGNER_ASYNC_ENGINE and self._resolve_async_compatibility()
+        self._use_async = self._resolve_async_selection()
         if self._use_async:
             self._build_async(generators, num_records, buffer_size, on_batch_complete)
         else:
@@ -225,7 +284,7 @@ class DatasetBuilder:
         generators, self._graph = self._initialize_generators_and_graph()
         start_time = time.perf_counter()
 
-        self._use_async = DATA_DESIGNER_ASYNC_ENGINE and self._resolve_async_compatibility()
+        self._use_async = self._resolve_async_selection()
         if self._use_async:
             dataset = self._build_async_preview(generators, num_records)
         else:
@@ -284,6 +343,16 @@ class DatasetBuilder:
             warnings.warn(msg, DeprecationWarning, stacklevel=4)
             return False
         return True
+
+    def _resolve_async_selection(self) -> bool:
+        """Return whether this run should use async after compatibility checks."""
+        if not self._async_requested:
+            return False
+        if not is_async_engine_supported():
+            logger.warning("DATA_DESIGNER_ASYNC_ENGINE requires Python 3.11+; falling back to the sync engine.")
+            return False
+        _ensure_async_engine_available()
+        return self._resolve_async_compatibility()
 
     def _build_async(
         self,
@@ -443,8 +512,224 @@ class DatasetBuilder:
         return scheduler, buffer_manager
 
     def process_preview(self, dataset: pd.DataFrame) -> pd.DataFrame:
-        df = self._processor_runner.run_post_batch(dataset.copy(), current_batch_number=None)
+        return self.process_block(dataset, current_batch_number=None)
+
+    def build_block(
+        self, *, num_records: int, current_batch_number: int | None = None
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Build one in-memory execution block and run block-level processors."""
+        raw_dataset = self.build_preview(num_records=num_records)
+        return raw_dataset, self.process_block(raw_dataset, current_batch_number=current_batch_number)
+
+    def build_block_chunks(
+        self,
+        *,
+        num_records: int,
+        rows_per_chunk: int,
+        current_batch_number: int | None = None,
+        capture_artifacts: bool = False,
+    ) -> Iterator[DatasetBlockChunk]:
+        """Build one block as ordered chunks when the async engine can stream row groups.
+
+        If global after-generation processors or sync-only compatibility constraints
+        prevent row-group streaming, this falls back to the existing materialized
+        block path so processor semantics stay identical.
+        """
+        if isinstance(rows_per_chunk, bool) or rows_per_chunk <= 0:
+            raise ValueError("rows_per_chunk must be a positive integer.")
+
+        if self._processor_runner.has_processors_for(ProcessorStage.AFTER_GENERATION):
+            row_group_batch_number = _row_group_batch_number(
+                current_batch_number=current_batch_number,
+                row_group=0,
+                capture_artifacts=capture_artifacts,
+            )
+            raw_dataset, dataset = self.build_block(
+                num_records=num_records,
+                current_batch_number=row_group_batch_number,
+            )
+            yield DatasetBlockChunk(
+                raw_dataframe=raw_dataset,
+                dataframe=dataset,
+                row_group=0,
+                input_start=0,
+                input_rows=num_records,
+                processor_artifacts=self._load_processor_artifacts_for_row_group(row_group_batch_number),
+            )
+            return
+
+        self._run_model_health_check_if_needed()
+        self._run_mcp_tool_check_if_needed()
+
+        if self._has_image_columns():
+            self.artifact_storage.set_media_storage_mode(StorageMode.DATAFRAME)
+
+        generators, self._graph = self._initialize_generators_and_graph()
+        self._use_async = self._resolve_async_selection()
+        if not self._use_async:
+            row_group_batch_number = _row_group_batch_number(
+                current_batch_number=current_batch_number,
+                row_group=0,
+                capture_artifacts=capture_artifacts,
+            )
+            raw_dataset, dataset = self._build_sync_block_with_initialized_generators(
+                generators=generators,
+                num_records=num_records,
+                current_batch_number=row_group_batch_number,
+            )
+            yield DatasetBlockChunk(
+                raw_dataframe=raw_dataset,
+                dataframe=dataset,
+                row_group=0,
+                input_start=0,
+                input_rows=num_records,
+                processor_artifacts=self._load_processor_artifacts_for_row_group(row_group_batch_number),
+            )
+            return
+
+        yield from self._build_async_block_chunks(
+            generators,
+            num_records=num_records,
+            rows_per_chunk=rows_per_chunk,
+            current_batch_number=current_batch_number,
+            capture_artifacts=capture_artifacts,
+        )
+
+    def process_block(self, dataset: pd.DataFrame, *, current_batch_number: int | None = None) -> pd.DataFrame:
+        """Run post-batch and after-generation processors for an in-memory block."""
+        df = self._processor_runner.run_post_batch(dataset.copy(), current_batch_number=current_batch_number)
         return self._processor_runner.run_after_generation_on_df(df)
+
+    def _build_sync_block_with_initialized_generators(
+        self,
+        *,
+        generators: list[ColumnGenerator],
+        num_records: int,
+        current_batch_number: int | None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Run the sync preview path after callers have initialized generators."""
+        group_id = uuid.uuid4().hex
+        start_time = time.perf_counter()
+        self.batch_manager.start(num_records=num_records, buffer_size=num_records)
+        self._run_batch(generators, batch_mode="preview", save_partial_results=False, group_id=group_id)
+        raw_dataset = self.batch_manager.get_current_batch(as_dataframe=True)
+        self.batch_manager.reset()
+        self._resource_provider.model_registry.log_model_usage(time.perf_counter() - start_time)
+        return raw_dataset, self.process_block(raw_dataset, current_batch_number=current_batch_number)
+
+    def _build_async_block_chunks(
+        self,
+        generators: list[ColumnGenerator],
+        *,
+        num_records: int,
+        rows_per_chunk: int,
+        current_batch_number: int | None,
+        capture_artifacts: bool,
+    ) -> Iterator[DatasetBlockChunk]:
+        """Async block path that emits row groups as soon as they finalize."""
+        if num_records == 0:
+            return
+
+        logger.info("⚡ DATA_DESIGNER_ASYNC_ENGINE is enabled - using async task-queue block streaming")
+
+        settings = self._resource_provider.run_config
+        trace_enabled = _is_async_trace_enabled(settings)
+        start_time = time.perf_counter()
+        chunk_queue: queue.Queue[DatasetBlockChunk | BaseException] = queue.Queue()
+        row_group_count = (num_records + rows_per_chunk - 1) // rows_per_chunk
+
+        def finalize_row_group(rg_id: int) -> None:
+            try:
+                raw_df = buffer_manager.get_dataframe(rg_id)
+                row_group_batch_number = _row_group_batch_number(
+                    current_batch_number=current_batch_number,
+                    row_group=rg_id,
+                    capture_artifacts=capture_artifacts,
+                )
+                processed_df = self._processor_runner.run_post_batch(
+                    raw_df.copy(),
+                    current_batch_number=row_group_batch_number,
+                )
+                chunk_queue.put(
+                    DatasetBlockChunk(
+                        raw_dataframe=raw_df,
+                        dataframe=processed_df,
+                        row_group=rg_id,
+                        input_start=rg_id * rows_per_chunk,
+                        input_rows=min(rows_per_chunk, num_records - rg_id * rows_per_chunk),
+                        processor_artifacts=self._load_processor_artifacts_for_row_group(row_group_batch_number),
+                    )
+                )
+            except DatasetGenerationError as exc:
+                chunk_queue.put(exc)
+                raise
+            except Exception as exc:
+                wrapped = DatasetGenerationError(f"Post-batch processor failed for row group {rg_id}: {exc}")
+                chunk_queue.put(wrapped)
+                raise wrapped from exc
+            finally:
+                buffer_manager.free_row_group(rg_id)
+
+        scheduler, buffer_manager = self._prepare_async_run(
+            generators,
+            num_records,
+            rows_per_chunk,
+            on_finalize_row_group=finalize_row_group,
+            run_post_batch_in_scheduler=False,
+            shutdown_error_rate=settings.shutdown_error_rate,
+            shutdown_error_window=settings.shutdown_error_window,
+            disable_early_shutdown=settings.disable_early_shutdown,
+            trace=trace_enabled,
+        )
+
+        loop = ensure_async_engine_loop()
+        future = asyncio.run_coroutine_threadsafe(scheduler.run(), loop)
+        pending: dict[int, DatasetBlockChunk] = {}
+        next_row_group = 0
+        try:
+            while next_row_group < row_group_count:
+                if next_row_group in pending:
+                    yield pending.pop(next_row_group)
+                    next_row_group += 1
+                    continue
+
+                if future.done() and chunk_queue.empty():
+                    future.result()
+                    next_row_group += 1
+                    continue
+
+                try:
+                    item = chunk_queue.get(timeout=0.05)
+                except queue.Empty:
+                    if future.done():
+                        future.result()
+                    continue
+
+                if isinstance(item, BaseException):
+                    raise item
+                if item.row_group == next_row_group:
+                    yield item
+                    next_row_group += 1
+                else:
+                    pending[item.row_group] = item
+
+            future.result()
+            self._task_traces = scheduler.traces
+            self._resource_provider.model_registry.log_model_usage(time.perf_counter() - start_time)
+        finally:
+            if not future.done():
+                future.cancel()
+
+    def _load_processor_artifacts_for_row_group(self, batch_number: int | None) -> dict[str, pd.DataFrame]:
+        if batch_number is None:
+            return {}
+        parquet_file_name = BATCH_FILE_NAME_FORMAT.format(batch_number=batch_number)
+        artifacts: dict[str, pd.DataFrame] = {}
+        for processor_name in self.artifact_storage.list_processor_names():
+            file_path = self.artifact_storage.processors_outputs_path / processor_name / parquet_file_name
+            if file_path.is_file():
+                artifacts[processor_name] = lazy.pd.read_parquet(file_path)
+        return artifacts
 
     def _has_image_columns(self) -> bool:
         """Check if config has any image generation columns."""
@@ -694,7 +979,8 @@ class DatasetBuilder:
         if not model_aliases:
             return
 
-        if DATA_DESIGNER_ASYNC_ENGINE:
+        if self._async_requested:
+            _ensure_async_engine_available()
             loop = ensure_async_engine_loop()
             future = asyncio.run_coroutine_threadsafe(
                 self._resource_provider.model_registry.arun_health_check(list(model_aliases)),

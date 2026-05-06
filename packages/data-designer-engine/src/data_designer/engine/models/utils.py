@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -50,7 +51,7 @@ class ChatMessage:
             result["tool_calls"] = self.tool_calls
         if self.tool_call_id:
             result["tool_call_id"] = self.tool_call_id
-        return result
+        return _to_json_safe(result)
 
     @classmethod
     def as_user(cls, content: str | list[dict[str, Any]]) -> ChatMessage:
@@ -128,3 +129,29 @@ def _text_block(value: Any) -> dict[str, Any]:
     else:
         text_value = str(value)
     return {"type": "text", "text": text_value}
+
+
+def _to_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(item) for item in value]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _to_json_safe(getattr(value, field.name)) for field in dataclasses.fields(value)}
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _to_json_safe(model_dump(mode="json"))
+        except TypeError:
+            return _to_json_safe(model_dump())
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _to_json_safe(to_dict())
+
+    return str(value)

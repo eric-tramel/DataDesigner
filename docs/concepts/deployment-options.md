@@ -145,6 +145,86 @@ When users can submit configs containing Jinja templates to a shared engine, tem
 
 ---
 
+## Ray Backend Trusted-Cluster Boundary
+
+The optional Ray backend is a library scaling mode for trusted Ray clusters. It serializes the job configuration,
+model provider definitions, secret resolver state, seed-reader state, MCP provider definitions, and runtime settings
+to Ray workers so each worker can construct its local generation engine.
+
+Use option objects for Ray-specific planning and execution controls, while keeping common constructor arguments direct:
+
+```python
+from data_designer.integrations.ray import (
+    RayBackend,
+    RayBlockPlanning,
+    RayExecutionOptions,
+    RayInputRepartition,
+)
+
+backend = RayBackend(
+    batch_size=128,
+    output="dataset",
+    auto_init=False,
+    block_planning=RayBlockPlanning(target_block_size=10_000, min_blocks=4),
+    execution_options=RayExecutionOptions(
+        num_cpus=1,
+        use_actor_pool=True,
+        actor_pool_min_size=2,
+        actor_pool_max_size=8,
+    ),
+)
+```
+
+`batch_size`, `output`, and `auto_init` remain the direct constructor controls for common use. Older individual
+Ray planning and execution kwargs such as `override_num_blocks`, `read_concurrency`, `num_cpus`, and
+`map_concurrency` are still accepted as compatibility shims, but do not combine them with `block_planning` or
+`execution_options`; effective mixed values raise a configuration error. Prefer the option objects for new code.
+For scaling map workers, prefer `RayExecutionOptions(use_actor_pool=True, actor_pool_min_size=...,
+actor_pool_max_size=...)` or an explicit Ray `compute` strategy. `RayExecutionOptions(concurrency=...)` and the legacy
+`map_concurrency=...` shim remain covered for compatibility with older RayBackend callers, but new examples should use
+actor-pool or compute controls so placement, autoscaling, and provider throttling are easier to reason about.
+
+When passing an existing Ray Dataset or ObjectRefs through `input_dataset`, use `RayInputRepartition` to retune input
+blocks before Data Designer maps generation over them:
+
+```python
+backend = RayBackend(
+    batch_size=512,
+    input_repartition=RayInputRepartition(num_blocks=64),
+)
+
+results = dd.create(config_builder, input_dataset=ray_dataset)
+```
+
+Use `num_blocks` when downstream file or task parallelism needs an exact block count. Use
+`target_num_rows_per_block` when large input blocks should be split with Ray's streaming repartitioning. These controls
+are only for existing `input_dataset` inputs; for from-scratch generation, keep using `RayBlockPlanning`. If an upstream
+Ray pipeline already performs domain-specific partitioning, prefer repartitioning there and leave
+`input_repartition` unset so Data Designer preserves the upstream block layout.
+
+Ray observability is bounded on the metrics actor. `profile_workers=True` is enabled by default and computes
+per-block worker summaries before retaining up to `max_worker_profiles=1000` profiles. Trace events are retained up
+to `max_trace_events=1000` when `trace_enabled=True`, and worker-local provider throttle snapshots are retained up to
+`max_throttle_snapshots=1000`. Very large jobs should disable `profile_workers` or lower these limits when driver-side
+diagnostics are less important than profiling overhead and metrics actor memory. `RayDatasetAnalysis` reports dropped
+profile, trace, and throttle snapshot counts when limits are exceeded.
+
+Use Ray only when the driver and workers are inside the same trusted operational boundary, such as a single-tenant
+cluster or a managed cluster with equivalent isolation. A Ray worker may receive provider endpoint configuration and
+may be able to resolve API keys through the configured `SecretResolver` or worker environment. Treat every Ray worker
+that can run the job as trusted with the same access level as the driver process.
+
+Avoid running the Ray backend on shared clusters where untrusted users can inspect task payloads, object-store data,
+worker logs, runtime environments, or process environment variables. If you must use shared infrastructure, add
+platform controls outside Data Designer: tenant-isolated Ray clusters, scoped service accounts, restricted dashboard
+and log access, network policies around provider endpoints, and secret management that grants only the workers for a
+single job access to the required keys.
+
+The Ray backend does not turn Data Designer into a multi-tenant service boundary. For shared service deployments,
+prefer a service architecture with explicit authentication, authorization, audit logging, and request validation.
+
+---
+
 ## 🧭 Decision Flowchart
 
 ```

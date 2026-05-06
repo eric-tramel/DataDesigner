@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
@@ -152,6 +153,84 @@ def test_dataset_builder_creation_with_custom_registry(stub_resource_provider, s
     )
 
     assert builder._registry == custom_registry
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="async engine requires Python 3.11+")
+def test_dataset_builder_explicit_use_async_overrides_env_false(
+    stub_resource_provider,
+    stub_test_config_builder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(builder_mod, "DATA_DESIGNER_ASYNC_ENGINE", False)
+    builder = DatasetBuilder(
+        data_designer_config=stub_test_config_builder.build(),
+        resource_provider=stub_resource_provider,
+        use_async=True,
+    )
+    result_df = lazy.pd.DataFrame({"test_column": ["async"]})
+
+    monkeypatch.setattr(builder, "_run_model_health_check_if_needed", Mock())
+    monkeypatch.setattr(builder, "_run_mcp_tool_check_if_needed", Mock())
+    monkeypatch.setattr(builder, "_initialize_generators_and_graph", Mock(return_value=([], Mock())))
+    monkeypatch.setattr(builder, "_resolve_async_compatibility", Mock(return_value=True))
+    monkeypatch.setattr(builder, "_build_async_preview", Mock(return_value=result_df))
+    monkeypatch.setattr(builder, "_run_batch", Mock())
+
+    assert builder.build_preview(num_records=1).equals(result_df)
+    builder._build_async_preview.assert_called_once_with([], 1)
+    builder._run_batch.assert_not_called()
+
+
+def test_dataset_builder_explicit_sync_overrides_env_true(
+    stub_resource_provider,
+    stub_test_config_builder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(builder_mod, "DATA_DESIGNER_ASYNC_ENGINE", True)
+    builder = DatasetBuilder(
+        data_designer_config=stub_test_config_builder.build(),
+        resource_provider=stub_resource_provider,
+        use_async=False,
+    )
+    result_df = lazy.pd.DataFrame({"test_column": ["sync"]})
+    builder.batch_manager = Mock()
+    builder.batch_manager.get_current_batch.return_value = result_df
+
+    monkeypatch.setattr(builder, "_run_model_health_check_if_needed", Mock())
+    monkeypatch.setattr(builder, "_run_mcp_tool_check_if_needed", Mock())
+    monkeypatch.setattr(builder, "_initialize_generators_and_graph", Mock(return_value=([], Mock())))
+    monkeypatch.setattr(builder, "_build_async_preview", Mock())
+    monkeypatch.setattr(builder, "_run_batch", Mock())
+
+    assert builder.build_preview(num_records=1).equals(result_df)
+    builder._build_async_preview.assert_not_called()
+    builder._run_batch.assert_called_once()
+
+
+def test_dataset_builder_explicit_use_async_falls_back_before_python_311(
+    stub_resource_provider,
+    stub_test_config_builder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VersionInfo(tuple):
+        @property
+        def major(self) -> int:
+            return self[0]
+
+        @property
+        def minor(self) -> int:
+            return self[1]
+
+    monkeypatch.setattr(builder_mod.sys, "version_info", VersionInfo((3, 10, 0)))
+
+    builder = DatasetBuilder(
+        data_designer_config=stub_test_config_builder.build(),
+        resource_provider=stub_resource_provider,
+        use_async=True,
+    )
+
+    assert builder._async_requested is True
+    assert builder._use_async is False
 
 
 def test_dataset_builder_artifact_storage_property(stub_dataset_builder, stub_resource_provider):

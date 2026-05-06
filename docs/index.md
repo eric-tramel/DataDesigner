@@ -82,7 +82,7 @@ results.display_sample_record()
 
 <div class="grid cards" markdown>
 
--   :material-book-open-variant: **[Tutorials](notebooks/README.md)**
+-   :material-book-open-variant: **[Tutorials](colab_notebooks/README.md)**
 
     Step-by-step notebooks covering core features
 
