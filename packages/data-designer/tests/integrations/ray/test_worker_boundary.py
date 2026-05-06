@@ -25,6 +25,7 @@ from data_designer.engine.dataset_builders.block_execution import (
     BlockExecutionResult,
     BlockExecutionStreamSummary,
 )
+from data_designer.engine.dataset_builders.utils.task_model import TaskTrace
 from data_designer.engine.resources.seed_reader import DataFrameSeedReader
 from data_designer.engine.secret_resolver import PlaintextResolver
 from data_designer.integrations.ray import RayBackend, RayBackendConfigurationError, RayDatasetGenerationError
@@ -178,13 +179,19 @@ def test_worker_options_and_map_payload_are_cloudpickle_serializable_when_availa
     assert DataDesignerConfig.model_validate_json(round_tripped.config_json).seed_config is None
 
 
-def _block_result(*, dataframe: Any, input_rows: int, model_usage: dict[str, dict[str, Any]] | None = None) -> Any:
+def _block_result(
+    *,
+    dataframe: Any,
+    input_rows: int,
+    model_usage: dict[str, dict[str, Any]] | None = None,
+    task_traces: list[TaskTrace] | None = None,
+) -> Any:
     output_rows = len(dataframe)
     dropped_rows = max(input_rows - output_rows, 0)
     return BlockExecutionResult(
         dataframe=dataframe,
         raw_dataframe=dataframe.copy(),
-        task_traces=[],
+        task_traces=task_traces or [],
         model_usage_stats=model_usage or {},
         model_usage_deltas={},
         processor_artifacts={},
@@ -493,17 +500,34 @@ def test_ray_batch_worker_fails_all_row_drop_blocks(
         worker_options=_worker_options_from_designer(designer),
         use_input_dataset=True,
     )
+    task_traces = [
+        TaskTrace(
+            column="draft_instruction",
+            row_group=0,
+            row_index=1,
+            task_type="cell",
+            status="error",
+            error="template missing required value",
+        )
+    ]
 
     def execute_dataset_block(**_: Any) -> BlockExecutionResult:
-        return _block_result(dataframe=lazy.pd.DataFrame({"row": []}), input_rows=2)
+        return _block_result(
+            dataframe=lazy.pd.DataFrame({"row": []}),
+            input_rows=2,
+            task_traces=task_traces,
+        )
 
     monkeypatch.setattr(ray_backend_module, "execute_dataset_block", execute_dataset_block)
 
-    with pytest.raises(RayDatasetGenerationError, match="all input rows were dropped"):
+    with pytest.raises(RayDatasetGenerationError, match="all input rows were dropped") as exc_info:
         ray_backend_module._RayBatchWorker(execution_payload=payload, metrics_collector=collector)(
             lazy.pd.DataFrame({"x": [1, 2], "label": ["a", "b"]})
         )
 
+    message = str(exc_info.value)
+    assert "draft_instruction[rg=0, row=1, task=cell]" in message
+    assert "template missing required value" in message
     metrics = fake_ray.get(collector.snapshot.remote())[0]
     assert metrics["input_rows"] == 2
     assert metrics["output_rows"] == 0

@@ -764,7 +764,9 @@ class AsyncTaskScheduler:
             retryable = self._is_retryable(exc)
             if not retryable and self._reporter:
                 self._reporter.record_failure(task.column)
-            if self._trace and trace:
+            if trace is None and not retryable:
+                trace = TaskTrace.from_task(task)
+            if trace:
                 trace.status = "error"
                 trace.error = str(exc)
 
@@ -783,7 +785,7 @@ class AsyncTaskScheduler:
                 )
 
         finally:
-            if self._trace and trace:
+            if trace:
                 trace.completed_at = time.perf_counter()
                 self.traces.append(trace)
 

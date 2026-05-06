@@ -112,10 +112,47 @@ class _RayWorkerGenerationResult:
 
 class _RayWorkerAllRowsDroppedError(Exception):
     def __init__(self, block_result: BlockExecutionOutcome) -> None:
+        task_errors = _format_block_task_errors(block_result)
+        detail = f"; task errors: {task_errors}" if task_errors else ""
         super().__init__(
-            f"all input rows were dropped during block execution (input_rows={block_result.input_rows}, output_rows=0)"
+            "all input rows were dropped during block execution "
+            f"(input_rows={block_result.input_rows}, output_rows=0){detail}"
         )
         self.block_result = block_result
+
+
+def _format_block_task_errors(block_result: BlockExecutionOutcome, *, limit: int = 5) -> str:
+    task_traces = getattr(block_result, "task_traces", None) or []
+    error_parts: list[str] = []
+    for trace in task_traces:
+        if getattr(trace, "status", None) != "error" or not getattr(trace, "error", None):
+            continue
+        row_index = getattr(trace, "row_index", None)
+        row_label = "*" if row_index is None else str(row_index)
+        error = " ".join(str(trace.error).split())
+        if len(error) > 240:
+            error = f"{error[:237]}..."
+        error_parts.append(
+            f"{trace.column}[rg={trace.row_group}, row={row_label}, task={trace.task_type}]: {error}"
+        )
+        if len(error_parts) >= limit:
+            break
+    remaining = sum(
+        1
+        for trace in task_traces
+        if getattr(trace, "status", None) == "error" and getattr(trace, "error", None)
+    ) - len(error_parts)
+    if remaining > 0:
+        error_parts.append(f"... {remaining} more task error(s)")
+    return "; ".join(error_parts)
+
+
+def _count_block_task_errors(block_result: BlockExecutionOutcome) -> int:
+    return sum(
+        1
+        for trace in getattr(block_result, "task_traces", None) or []
+        if getattr(trace, "status", None) == "error" and getattr(trace, "error", None)
+    )
 
 
 @dataclass
@@ -596,6 +633,24 @@ class _RayWorkerBatchObserver:
     def record_all_rows_dropped(self, worker_batch: _RayWorkerBatch, block_result: BlockExecutionOutcome) -> None:
         elapsed_seconds = time.perf_counter() - worker_batch.start_time
         if self._observability_options.trace_enabled:
+            task_errors = _format_block_task_errors(block_result)
+            details = {
+                "error_type": "AllRowsDropped",
+                "error": "all input rows were dropped",
+                "input_rows": block_result.input_rows,
+                "output_rows": block_result.output_rows,
+                "dropped_rows": block_result.dropped_rows,
+                "task_error_count": _count_block_task_errors(block_result),
+            }
+            if task_errors:
+                details["task_errors"] = task_errors
+            self._trace_events.extend(
+                _task_traces_to_events(
+                    block_result.task_traces,
+                    block_id=worker_batch.block_id,
+                    worker_context=worker_batch.worker_context,
+                )
+            )
             self._trace_events.append(
                 _create_trace_event(
                     worker_batch.block_id,
@@ -603,13 +658,7 @@ class _RayWorkerBatchObserver:
                     worker_batch.start_time,
                     row_count=worker_batch.num_records,
                     worker_context=worker_batch.worker_context,
-                    details={
-                        "error_type": "AllRowsDropped",
-                        "error": "all input rows were dropped",
-                        "input_rows": block_result.input_rows,
-                        "output_rows": block_result.output_rows,
-                        "dropped_rows": block_result.dropped_rows,
-                    },
+                    details=details,
                 )
             )
         _record_worker_metrics(
